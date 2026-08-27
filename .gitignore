@@ -1,0 +1,18 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+.env
+.env.*
+!.env.example
+
+# Local sessions and traces may contain source code or command output.
+.coding-agent/
