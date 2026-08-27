@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from coding_agent.errors import CodedError
 from coding_agent.models import ToolCall
 from coding_agent.tools import BaseTool, ToolError, ToolOutput, ToolRegistry
 
@@ -58,6 +59,16 @@ class BlankSummaryTool(BaseTool[TextArgs]):
 
     def run(self, arguments: TextArgs) -> ToolOutput:
         return ToolOutput(content=arguments.text, summary="   ")
+
+
+class MissingWorkspacePathTool(BaseTool[TextArgs]):
+    name = "missing_workspace_path"
+    description = "Raise a stable error from another project-owned boundary."
+    args_model = TextArgs
+
+    def run(self, arguments: TextArgs) -> ToolOutput:
+        del arguments
+        raise CodedError("not_found", "path not found: missing.py")
 
 
 def test_tool_schema_and_runtime_both_reject_extra_arguments() -> None:
@@ -145,3 +156,17 @@ def test_blank_tool_summary_becomes_an_invalid_output_result() -> None:
     assert execution.ok is False
     assert execution.error_code == "invalid_output"
     assert execution.error_message == "tool blank_summary returned an empty summary"
+
+
+def test_project_owned_coded_errors_keep_their_semantics_at_registry_boundary() -> None:
+    execution = ToolRegistry([MissingWorkspacePathTool()]).execute(
+        ToolCall(
+            id="missing-workspace-path-1",
+            name="missing_workspace_path",
+            arguments={"text": "unused"},
+        )
+    )
+
+    assert execution.ok is False
+    assert execution.error_code == "not_found"
+    assert execution.error_message == "path not found: missing.py"

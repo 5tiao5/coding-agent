@@ -9,18 +9,17 @@ from typing import Any, Generic, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from coding_agent.errors import CodedError
 from coding_agent.models import ToolCall, ToolExecution, ToolOutput, ToolSpec
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
 
 
-class ToolError(Exception):
+class ToolError(CodedError):
     """Expected tool failure that can be reported to the model safely."""
 
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code.strip() or "tool_error"
-        self.message = message.strip() or "tool failed"
+        super().__init__(code.strip() or "tool_error", message.strip() or "tool failed")
 
 
 class ToolDispatcher(Protocol):
@@ -109,7 +108,7 @@ class ToolRegistry:
                 )
         except ValidationError as exc:
             return self._failure(call, "invalid_arguments", str(exc), started)
-        except ToolError as exc:
+        except CodedError as exc:
             return self._failure(call, exc.code, exc.message, started)
         except Exception as exc:  # noqa: BLE001 - tool failures become model observations.
             return self._failure(
