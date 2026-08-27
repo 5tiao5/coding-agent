@@ -14,7 +14,7 @@ from coding_agent.models import (
     StopReason,
     ToolCall,
 )
-from coding_agent.tools import BaseTool, ToolRegistry
+from coding_agent.tools import BaseTool, ToolOutput, ToolRegistry
 
 _TOOL_PAYLOAD_ADAPTER = TypeAdapter(dict[str, object])
 
@@ -32,9 +32,10 @@ class EchoTool(BaseTool[EchoArgs]):
     def __init__(self) -> None:
         self.calls: list[EchoArgs] = []
 
-    def run(self, arguments: EchoArgs) -> str:
+    def run(self, arguments: EchoArgs) -> ToolOutput:
         self.calls.append(arguments)
-        return arguments.text.upper() if arguments.uppercase else arguments.text
+        content = arguments.text.upper() if arguments.uppercase else arguments.text
+        return ToolOutput(content=content, summary="Echoed test text")
 
 
 def _tool_payload(model: ScriptedModel, request_index: int = 1) -> dict[str, object]:
@@ -138,11 +139,17 @@ def test_unknown_tool_failure_is_returned_to_the_model_as_an_observation() -> No
     }
     finished = [event for event in events.events if event.kind is EventKind.TOOL_FINISHED]
     assert len(finished) == 1
-    assert finished[0].data == {
+    assert isinstance(finished[0].data["duration_ms"], float)
+    event_data = dict(finished[0].data)
+    event_data.pop("duration_ms")
+    assert event_data == {
         "call_id": "missing-1",
         "tool_name": "not_registered",
         "ok": False,
         "error_code": "unknown_tool",
+        "output_chars": 0,
+        "truncated": False,
+        "summary": None,
     }
 
 
@@ -246,7 +253,7 @@ class InterruptingTool(BaseTool[EchoArgs]):
     description = "Simulate a user interrupt during local tool execution."
     args_model = EchoArgs
 
-    def run(self, arguments: EchoArgs) -> str:
+    def run(self, arguments: EchoArgs) -> ToolOutput:
         del arguments
         raise KeyboardInterrupt
 

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from typing import Any, Generic, TypeVar
+from collections.abc import Iterable, Sequence
+from time import perf_counter
+from typing import Any, Generic, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from coding_agent.models import ToolCall, ToolExecution, ToolSpec
+from coding_agent.models import ToolCall, ToolExecution, ToolOutput, ToolSpec
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
 
@@ -20,6 +21,16 @@ class ToolError(Exception):
         super().__init__(message)
         self.code = code.strip() or "tool_error"
         self.message = message.strip() or "tool failed"
+
+
+class ToolDispatcher(Protocol):
+    """The minimal tool boundary consumed by the agent loop."""
+
+    def specs(self) -> Sequence[ToolSpec]:
+        """Describe tools exposed to the model."""
+
+    def execute(self, call: ToolCall) -> ToolExecution:
+        """Execute one validated tool call."""
 
 
 class BaseTool(ABC, Generic[ArgsT]):
@@ -37,7 +48,7 @@ class BaseTool(ABC, Generic[ArgsT]):
             input_schema=input_schema,
         )
 
-    def invoke(self, arguments: dict[str, object]) -> str:
+    def invoke(self, arguments: dict[str, object]) -> ToolOutput:
         unexpected = sorted(set(arguments).difference(self.args_model.model_fields))
         if unexpected:
             joined = ", ".join(unexpected)
@@ -46,8 +57,8 @@ class BaseTool(ABC, Generic[ArgsT]):
         return self.run(parsed)
 
     @abstractmethod
-    def run(self, arguments: ArgsT) -> str:
-        """Execute the tool locally and return bounded textual output."""
+    def run(self, arguments: ArgsT) -> ToolOutput:
+        """Execute the tool locally and return bounded, observable output."""
 
 
 class ToolRegistry:
@@ -73,59 +84,78 @@ class ToolRegistry:
         return tuple(tool.spec for tool in self._tools.values())
 
     def execute(self, call: ToolCall) -> ToolExecution:
+        started = perf_counter()
         tool = self._tools.get(call.name)
         if tool is None:
-            return ToolExecution(
-                call_id=call.id,
-                tool_name=call.name,
-                ok=False,
-                error_code="unknown_tool",
-                error_message=self._bounded(f"unknown tool: {call.name}"),
+            return self._failure(
+                call,
+                "unknown_tool",
+                f"unknown tool: {call.name}",
+                started,
             )
 
         try:
-            output = tool.invoke(call.arguments)
-            if not isinstance(output, str):
+            result = tool.invoke(call.arguments)
+            if not isinstance(result, ToolOutput):
                 raise ToolError(
                     "invalid_output",
-                    f"tool {call.name} returned {type(output).__name__}; expected str",
+                    f"tool {call.name} returned {type(result).__name__}; expected ToolOutput",
+                )
+            summary = " ".join(result.summary.split())
+            if not summary:
+                raise ToolError(
+                    "invalid_output",
+                    f"tool {call.name} returned an empty summary",
                 )
         except ValidationError as exc:
-            return ToolExecution(
-                call_id=call.id,
-                tool_name=call.name,
-                ok=False,
-                error_code="invalid_arguments",
-                error_message=self._bounded(str(exc)),
-            )
+            return self._failure(call, "invalid_arguments", str(exc), started)
         except ToolError as exc:
-            return ToolExecution(
-                call_id=call.id,
-                tool_name=call.name,
-                ok=False,
-                error_code=exc.code,
-                error_message=self._bounded(exc.message or type(exc).__name__),
-            )
+            return self._failure(call, exc.code, exc.message, started)
         except Exception as exc:  # noqa: BLE001 - tool failures become model observations.
-            return ToolExecution(
-                call_id=call.id,
-                tool_name=call.name,
-                ok=False,
-                error_code="tool_error",
-                error_message=self._bounded(str(exc).strip() or type(exc).__name__),
+            return self._failure(
+                call,
+                "tool_error",
+                str(exc).strip() or type(exc).__name__,
+                started,
             )
 
+        output, hard_truncated = self._bounded(result.content)
         return ToolExecution(
             call_id=call.id,
             tool_name=call.name,
             ok=True,
-            output=self._bounded(output),
+            output=output,
+            summary=summary,
+            metadata=result.metadata,
+            truncated=result.truncated or hard_truncated,
+            duration_ms=self._elapsed_ms(started),
         )
 
-    def _bounded(self, text: str) -> str:
+    def _failure(
+        self,
+        call: ToolCall,
+        code: str,
+        message: str,
+        started: float,
+    ) -> ToolExecution:
+        bounded_message, _ = self._bounded(message)
+        return ToolExecution(
+            call_id=call.id,
+            tool_name=call.name,
+            ok=False,
+            error_code=code,
+            error_message=bounded_message,
+            duration_ms=self._elapsed_ms(started),
+        )
+
+    def _bounded(self, text: str) -> tuple[str, bool]:
         if len(text) <= self._max_output_chars:
-            return text
+            return text, False
         suffix = "\n...[truncated]"
         if self._max_output_chars <= len(suffix):
-            return text[: self._max_output_chars]
-        return text[: self._max_output_chars - len(suffix)] + suffix
+            return text[: self._max_output_chars], True
+        return text[: self._max_output_chars - len(suffix)] + suffix, True
+
+    @staticmethod
+    def _elapsed_ms(started: float) -> float:
+        return round((perf_counter() - started) * 1000, 3)

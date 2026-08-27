@@ -14,7 +14,7 @@ from coding_agent.models import (
     MessageRole,
     StopReason,
 )
-from coding_agent.tools import ToolRegistry
+from coding_agent.tools import ToolDispatcher
 
 DEFAULT_SYSTEM_PROMPT = """You are a coding agent. Use the available local tools when needed.
 Return a concise final answer only when the task is complete or you cannot make further progress."""
@@ -40,7 +40,7 @@ class AgentRunner:
     def __init__(
         self,
         model: ModelAdapter,
-        tools: ToolRegistry,
+        tools: ToolDispatcher,
         *,
         event_sink: EventSink | None = None,
         max_steps: int = 20,
@@ -175,6 +175,10 @@ class AgentRunner:
                             "tool_name": call.name,
                             "ok": execution.ok,
                             "error_code": execution.error_code,
+                            "duration_ms": execution.duration_ms,
+                            "output_chars": len(execution.output or ""),
+                            "truncated": execution.truncated,
+                            "summary": execution.summary,
                         },
                     )
                 continue

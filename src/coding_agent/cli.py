@@ -11,7 +11,7 @@ from coding_agent import __version__
 from coding_agent.agent import AgentRunner
 from coding_agent.model import ScriptedModel
 from coding_agent.models import ModelResponse, ToolCall
-from coding_agent.tools import BaseTool, ToolRegistry
+from coding_agent.tools import BaseTool, ToolOutput, ToolRegistry
 from coding_agent.ui import ConsoleEventSink, console_safe
 
 app = typer.Typer(
@@ -31,8 +31,11 @@ class EchoTool(BaseTool[EchoArguments]):
     description = "Echo text locally for the offline agent-loop demo."
     args_model = EchoArguments
 
-    def run(self, arguments: EchoArguments) -> str:
-        return arguments.text
+    def run(self, arguments: EchoArguments) -> ToolOutput:
+        return ToolOutput(
+            content=arguments.text,
+            summary="Echoed local demo text",
+        )
 
 
 def _version_callback(value: bool) -> None:

@@ -90,8 +90,20 @@ def test_core_models_require_non_empty_identifiers_and_outputs() -> None:
 
 
 def test_tool_execution_enforces_success_and_failure_invariants() -> None:
-    success = ToolExecution(call_id="call-1", tool_name="echo", ok=True, output="hello")
-    empty_success = ToolExecution(call_id="call-empty", tool_name="echo", ok=True, output="")
+    success = ToolExecution(
+        call_id="call-1",
+        tool_name="echo",
+        ok=True,
+        output="hello",
+        summary="Echoed text",
+    )
+    empty_success = ToolExecution(
+        call_id="call-empty",
+        tool_name="echo",
+        ok=True,
+        output="",
+        summary="Read an empty file",
+    )
     failure = ToolExecution(
         call_id="call-2",
         tool_name="echo",
@@ -111,6 +123,7 @@ def test_tool_execution_enforces_success_and_failure_invariants() -> None:
             call_id="call-3",
             tool_name="echo",
             ok=True,
+            summary="Impossible result",
             error_code="impossible",
         )
     with pytest.raises(
@@ -129,6 +142,7 @@ def test_tool_execution_enforces_success_and_failure_invariants() -> None:
             tool_name="echo",
             ok=True,
             output="hello",
+            summary="Contradictory result",
             error_message="success cannot also be an error",
         ),
         lambda: ToolExecution(

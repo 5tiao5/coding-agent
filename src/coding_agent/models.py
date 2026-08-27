@@ -75,6 +75,18 @@ class ToolSpec(FrozenModel):
     input_schema: dict[str, Any]
 
 
+ToolMetadataValue = str | int | float | bool | None
+
+
+class ToolOutput(FrozenModel):
+    """A tool result split into model content and a safe observable summary."""
+
+    content: str
+    summary: str = Field(min_length=1, max_length=500)
+    metadata: dict[str, ToolMetadataValue] = Field(default_factory=dict)
+    truncated: bool = False
+
+
 class ModelResponse(FrozenModel):
     content: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
@@ -91,23 +103,34 @@ class ToolExecution(FrozenModel):
     tool_name: str = Field(min_length=1)
     ok: bool
     output: str | None = None
+    summary: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    metadata: dict[str, ToolMetadataValue] = Field(default_factory=dict)
+    truncated: bool = False
+    duration_ms: float = Field(default=0.0, ge=0)
 
     @model_validator(mode="after")
     def validate_outcome(self) -> ToolExecution:
         if self.ok and (self.error_code is not None or self.error_message is not None):
             raise ValueError("successful tool executions cannot contain an error")
-        if self.ok and self.output is None:
-            raise ValueError("successful tool executions require output")
+        if self.ok and (self.output is None or not self.summary):
+            raise ValueError("successful tool executions require output and summary")
         if not self.ok and (not self.error_code or not self.error_message):
             raise ValueError("failed tool executions require an error code and message")
-        if not self.ok and self.output is not None:
-            raise ValueError("failed tool executions cannot contain output")
+        if not self.ok and (
+            self.output is not None or self.summary is not None or self.metadata or self.truncated
+        ):
+            raise ValueError("failed tool executions cannot contain result data")
         return self
 
     def as_message_content(self) -> str:
-        return self.model_dump_json(exclude_none=True)
+        # Timing and the sanitized UI summary are observability data, not model context.
+        return self.model_dump_json(
+            exclude={"duration_ms", "summary"},
+            exclude_defaults=True,
+            exclude_none=True,
+        )
 
 
 class AgentResult(FrozenModel):
