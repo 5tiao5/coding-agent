@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from time import perf_counter
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from coding_agent.errors import CodedError, ErrorMetadataValue
 from coding_agent.models import ToolCall, ToolExecution, ToolOutput, ToolSpec
+from coding_agent.tooling import ToolDispatcher as ToolDispatcher
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
 
@@ -30,16 +31,6 @@ class ToolError(CodedError):
             message.strip() or "tool failed",
             metadata=metadata,
         )
-
-
-class ToolDispatcher(Protocol):
-    """The minimal tool boundary consumed by the agent loop."""
-
-    def specs(self) -> Sequence[ToolSpec]:
-        """Describe tools exposed to the model."""
-
-    def execute(self, call: ToolCall) -> ToolExecution:
-        """Execute one validated tool call."""
 
 
 class BaseTool(ABC, Generic[ArgsT]):

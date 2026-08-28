@@ -14,7 +14,7 @@ from coding_agent.models import (
     MessageRole,
     StopReason,
 )
-from coding_agent.tools import ToolDispatcher
+from coding_agent.tooling import ToolDispatcher
 
 DEFAULT_SYSTEM_PROMPT = """You are a coding agent. Use the available local tools when needed.
 Return a concise final answer only when the task is complete or you cannot make further progress."""

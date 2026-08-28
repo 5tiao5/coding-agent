@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
@@ -17,6 +20,28 @@ from coding_agent.models import (
 from coding_agent.tools import BaseTool, ToolOutput, ToolRegistry
 
 _TOOL_PAYLOAD_ADAPTER = TypeAdapter(dict[str, object])
+
+
+def test_importing_agent_does_not_load_concrete_tool_adapters() -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import coding_agent.agent; "
+                "forbidden={'coding_agent.tools', 'coding_agent.tools.filesystem', "
+                "'coding_agent.tools.mutation', 'coding_agent.mutation', "
+                "'coding_agent.workspace'}; "
+                "loaded=sorted(forbidden.intersection(sys.modules)); "
+                "print(','.join(loaded)); raise SystemExit(bool(loaded))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
 
 
 class EchoArgs(BaseModel):
