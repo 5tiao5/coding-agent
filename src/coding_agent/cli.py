@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -13,7 +14,16 @@ from coding_agent import __version__
 from coding_agent.agent import AgentRunner
 from coding_agent.model import ScriptedModel
 from coding_agent.models import ModelResponse, ToolCall
-from coding_agent.tools import ListFilesTool, ReadFileTool, SearchTextTool, ToolRegistry
+from coding_agent.mutation import MutationSession
+from coding_agent.tools import (
+    ListFilesTool,
+    ReadFileTool,
+    ReplaceTextTool,
+    SearchTextTool,
+    ToolRegistry,
+    UndoChangeTool,
+    WriteFileTool,
+)
 from coding_agent.ui import ConsoleEventSink, console_safe
 from coding_agent.workspace import Workspace
 
@@ -23,6 +33,17 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+_DEMO_SOURCE_BEFORE = (
+    b"def calculate_total(subtotal: int, discount: int) -> int:\n"
+    b"    discounted = subtotal - discount\n"
+    b"    return discounted - discount\n"
+)
+_DEMO_SOURCE_AFTER = (
+    b"def calculate_total(subtotal: int, discount: int) -> int:\n"
+    b"    discounted = subtotal - discount\n"
+    b"    return discounted\n"
+)
 
 
 def _version_callback(value: bool) -> None:
@@ -47,28 +68,34 @@ def main(
 
 @app.command()
 def demo() -> None:
-    """Run deterministic, offline repository reconnaissance through the real agent loop."""
+    """Run a deterministic offline read-edit-verify loop against a temporary repository."""
     with TemporaryDirectory(prefix="coding-agent-demo-") as temporary_directory:
         demo_root = Path(temporary_directory)
         _write_demo_project(demo_root)
         workspace = Workspace(demo_root)
+        mutation_session = MutationSession(workspace)
         model = _repository_demo_model()
         tools = ToolRegistry(
             [
                 ListFilesTool(workspace),
                 ReadFileTool(workspace),
                 SearchTextTool(workspace),
+                WriteFileTool(mutation_session),
+                ReplaceTextTool(mutation_session),
+                UndoChangeTool(mutation_session),
             ]
         )
-        runner = AgentRunner(model, tools, event_sink=ConsoleEventSink(console), max_steps=5)
+        runner = AgentRunner(model, tools, event_sink=ConsoleEventSink(console), max_steps=7)
         result = runner.run(
-            "Inspect this repository and identify the defect in calculate_total "
-            "without editing files."
+            "Inspect this repository, fix the duplicate discount in calculate_total, "
+            "and read the file again to verify the edit."
         )
+        demo_verified = demo_root.joinpath("src/pricing.py").read_bytes() == _DEMO_SOURCE_AFTER
 
     if result.final_text:
         final_text = console_safe(result.final_text, console)
-        console.print(Panel.fit(final_text, title="Reconnaissance report", border_style="yellow"))
+        title = "Repair report · post-read confirmed" if demo_verified else "Repair report"
+        console.print(Panel.fit(final_text, title=title, border_style="green"))
     if result.error:
         error = console_safe(result.error, console)
         console.print(Panel.fit(error, title="Failed", border_style="red"))
@@ -109,9 +136,34 @@ def _repository_demo_model() -> ScriptedModel:
                 ),
             ),
             ModelResponse(
+                content="The second subtraction is the defect; I will apply one exact edit.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-replace-1",
+                        name="replace_text",
+                        arguments={
+                            "path": "src/pricing.py",
+                            "old_text": "return discounted - discount",
+                            "new_text": "return discounted",
+                            "expected_sha256": sha256(_DEMO_SOURCE_BEFORE).hexdigest(),
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="The diff was applied; I will re-read the file as post-change evidence.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-read-2",
+                        name="read_file",
+                        arguments={"path": "src/pricing.py", "start_line": 1, "line_count": 40},
+                    ),
+                ),
+            ),
+            ModelResponse(
                 content=(
-                    "The defect is in src/pricing.py: calculate_total subtracts the discount "
-                    "twice. Repository reconnaissance completed without modifying the workspace."
+                    "Fixed src/pricing.py: calculate_total now applies the discount exactly once. "
+                    "The post-change read matches the intended implementation."
                 )
             ),
         ]
@@ -123,12 +175,7 @@ def _write_demo_project(root: Path) -> None:
     test = root / "tests" / "test_pricing.py"
     source.parent.mkdir(parents=True)
     test.parent.mkdir(parents=True)
-    source.write_text(
-        "def calculate_total(subtotal: int, discount: int) -> int:\n"
-        "    discounted = subtotal - discount\n"
-        "    return discounted - discount\n",
-        encoding="utf-8",
-    )
+    source.write_bytes(_DEMO_SOURCE_BEFORE)
     test.write_text(
         "from src.pricing import calculate_total\n\n"
         "def test_discount_is_applied_once() -> None:\n"
