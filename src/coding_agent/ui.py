@@ -32,6 +32,13 @@ class ConsoleEventSink:
         if event.step:
             line.append(f"[{event.step}] ", style="dim")
         line.append(console_safe(event.message, self._console), style=style)
+        if event.kind is EventKind.TOOL_FINISHED and event.data.get("summary"):
+            summary = console_safe(str(event.data["summary"]), self._console)
+            line.append(f" - {summary}", style="dim")
+        if event.kind is EventKind.TOOL_FINISHED and isinstance(
+            event.data.get("duration_ms"), int | float
+        ):
+            line.append(f" ({event.data['duration_ms']:.1f} ms)", style="dim")
         self._console.print(line)
 
 
