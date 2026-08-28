@@ -69,7 +69,32 @@ class MissingWorkspacePathTool(BaseTool[TextArgs]):
 
     def run(self, arguments: TextArgs) -> ToolOutput:
         del arguments
-        raise CodedError("not_found", "path not found: missing.py")
+        raise CodedError(
+            "not_found",
+            "path not found: missing.py",
+            metadata={"path": "missing.py", "recovery": "choose_another_path"},
+        )
+
+
+class RevisionConflictTool(BaseTool[TextArgs]):
+    name = "revision_conflict"
+    description = "Raise a recoverable write conflict with safe metadata."
+    args_model = TextArgs
+
+    def run(self, arguments: TextArgs) -> ToolOutput:
+        del arguments
+        raise ToolError(
+            "revision_conflict",
+            "file changed after it was read",
+            metadata={
+                "path": "src/example.py",
+                "expected_sha256": "a" * 64,
+                "current_sha256": "b" * 64,
+                "actual_occurrences": 2,
+                "recoverable": True,
+                "detail": None,
+            },
+        )
 
 
 class InvalidStructuredOutputTool(BaseTool[TextArgs]):
@@ -186,6 +211,54 @@ def test_project_owned_coded_errors_keep_their_semantics_at_registry_boundary() 
     assert execution.ok is False
     assert execution.error_code == "not_found"
     assert execution.error_message == "path not found: missing.py"
+    assert execution.metadata == {
+        "path": "missing.py",
+        "recovery": "choose_another_path",
+    }
+
+
+def test_tool_error_metadata_reaches_the_model_as_safe_structured_context() -> None:
+    execution = ToolRegistry([RevisionConflictTool()]).execute(
+        ToolCall(
+            id="revision-conflict-1",
+            name="revision_conflict",
+            arguments={"text": "unused"},
+        )
+    )
+
+    assert execution.ok is False
+    assert execution.output is None
+    assert execution.summary is None
+    assert execution.truncated is False
+    assert execution.error_code == "revision_conflict"
+    assert execution.metadata == {
+        "path": "src/example.py",
+        "expected_sha256": "a" * 64,
+        "current_sha256": "b" * 64,
+        "actual_occurrences": 2,
+        "recoverable": True,
+        "detail": None,
+    }
+    assert '"metadata"' in execution.as_message_content()
+
+
+def test_coded_error_rejects_non_scalar_or_non_finite_metadata() -> None:
+    with pytest.raises(TypeError, match="non-empty strings"):
+        CodedError(
+            "unsafe_metadata",
+            "bad metadata",
+            metadata={"": "missing key"},
+        )
+
+    with pytest.raises(TypeError, match="safe scalar"):
+        CodedError(
+            "unsafe_metadata",
+            "bad metadata",
+            metadata={"nested": ["not", "safe"]},  # type: ignore[dict-item]
+        )
+
+    with pytest.raises(TypeError, match="finite"):
+        CodedError("unsafe_metadata", "bad metadata", metadata={"ratio": float("nan")})
 
 
 def test_output_model_validation_is_not_misreported_as_bad_arguments() -> None:

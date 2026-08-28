@@ -118,10 +118,8 @@ class ToolExecution(FrozenModel):
             raise ValueError("successful tool executions require output and summary")
         if not self.ok and (not self.error_code or not self.error_message):
             raise ValueError("failed tool executions require an error code and message")
-        if not self.ok and (
-            self.output is not None or self.summary is not None or self.metadata or self.truncated
-        ):
-            raise ValueError("failed tool executions cannot contain result data")
+        if not self.ok and (self.output is not None or self.summary is not None or self.truncated):
+            raise ValueError("failed tool executions cannot contain output, summary, or truncation")
         return self
 
     def as_message_content(self) -> str:

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from coding_agent.errors import CodedError
+from coding_agent.errors import CodedError, ErrorMetadataValue
 from coding_agent.models import ToolCall, ToolExecution, ToolOutput, ToolSpec
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
@@ -18,8 +18,18 @@ ArgsT = TypeVar("ArgsT", bound=BaseModel)
 class ToolError(CodedError):
     """Expected tool failure that can be reported to the model safely."""
 
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(code.strip() or "tool_error", message.strip() or "tool failed")
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        metadata: Mapping[str, ErrorMetadataValue] | None = None,
+    ) -> None:
+        super().__init__(
+            code.strip() or "tool_error",
+            message.strip() or "tool failed",
+            metadata=metadata,
+        )
 
 
 class ToolDispatcher(Protocol):
@@ -126,7 +136,13 @@ class ToolRegistry:
                 started,
             )
         except CodedError as exc:
-            return self._failure(call, exc.code, exc.message, started)
+            return self._failure(
+                call,
+                exc.code,
+                exc.message,
+                started,
+                metadata=exc.metadata,
+            )
         except Exception as exc:  # noqa: BLE001 - tool failures become model observations.
             return self._failure(
                 call,
@@ -153,6 +169,8 @@ class ToolRegistry:
         code: str,
         message: str,
         started: float,
+        *,
+        metadata: Mapping[str, ErrorMetadataValue] | None = None,
     ) -> ToolExecution:
         bounded_message, _ = self._bounded(message)
         return ToolExecution(
@@ -161,6 +179,7 @@ class ToolRegistry:
             ok=False,
             error_code=code,
             error_message=bounded_message,
+            metadata=dict(metadata or {}),
             duration_ms=self._elapsed_ms(started),
         )
 

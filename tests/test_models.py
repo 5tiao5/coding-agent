@@ -110,6 +110,7 @@ def test_tool_execution_enforces_success_and_failure_invariants() -> None:
         ok=False,
         error_code="invalid_arguments",
         error_message="text is required",
+        metadata={"field": "text", "recoverable": True},
     )
 
     assert success.as_message_content() == (
@@ -117,6 +118,7 @@ def test_tool_execution_enforces_success_and_failure_invariants() -> None:
     )
     assert empty_success.output == ""
     assert "invalid_arguments" in failure.as_message_content()
+    assert failure.metadata == {"field": "text", "recoverable": True}
 
     with pytest.raises(ValidationError, match="successful tool executions cannot contain an error"):
         ToolExecution(
@@ -153,8 +155,32 @@ def test_tool_execution_enforces_success_and_failure_invariants() -> None:
             error_code="tool_error",
             error_message="failed",
         ),
+        lambda: ToolExecution(
+            call_id="call-1",
+            tool_name="echo",
+            ok=False,
+            summary="Partial result",
+            error_code="tool_error",
+            error_message="failed",
+            metadata={"recoverable": True},
+        ),
+        lambda: ToolExecution(
+            call_id="call-1",
+            tool_name="echo",
+            ok=False,
+            error_code="tool_error",
+            error_message="failed",
+            metadata={"recoverable": True},
+            truncated=True,
+        ),
     ],
-    ids=["success-without-output", "success-with-error-message", "failure-with-output"],
+    ids=[
+        "success-without-output",
+        "success-with-error-message",
+        "failure-with-output",
+        "failure-with-summary",
+        "failure-with-truncation",
+    ],
 )
 def test_tool_execution_rejects_ambiguous_outcomes(execution: object) -> None:
     with pytest.raises(ValidationError):
