@@ -5,18 +5,22 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from unicodedata import category
 
 from pydantic import BaseModel, Field, field_validator
 
 from coding_agent.errors import CodedError
 from coding_agent.models import ToolOutput
 from coding_agent.text import TextDocument, TextDocumentError, decode_utf8_document
+from coding_agent.tools._rendering import (
+    clip_with_ellipsis,
+    is_display_control,
+    render_visible_text,
+    summarize_path,
+)
 from coding_agent.tools.base import BaseTool, ToolError
 from coding_agent.workspace import Workspace, WorkspaceError, WorkspacePath
 
 _OUTPUT_TRUNCATION_MARKER = "...[output truncated; narrow the path or request]"
-_SUMMARY_PATH_CHARS = 180
 _EXPECTED_UNSEARCHABLE_CODES = frozenset({"binary_file", "unsupported_encoding"})
 
 
@@ -95,7 +99,7 @@ class SearchTextArguments(BaseModel):
     def validate_query(cls, value: str) -> str:
         if value.isspace():
             raise ValueError("query cannot contain only whitespace")
-        if any(_is_display_control(character) for character in value):
+        if any(is_display_control(character) for character in value):
             raise ValueError("query must be a single printable line")
         return value
 
@@ -190,7 +194,7 @@ class ListFilesTool(BaseTool[ListFilesArguments]):
             content=content,
             summary=(
                 f"Listed {returned_entries} of {len(rendered_entries)} discovered entries "
-                f"under {_summary_path(start.relative)}"
+                f"under {summarize_path(start.relative)}"
             ),
             metadata={
                 "path": start.relative,
@@ -257,7 +261,7 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
             )
             return ToolOutput(
                 content=content,
-                summary=f"Read empty file {_summary_path(target.relative)}",
+                summary=f"Read empty file {summarize_path(target.relative)}",
                 metadata={
                     "path": target.relative,
                     **self._document_metadata(document),
@@ -287,7 +291,7 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
         rendered: list[str] = []
         clipped_line = False
         for line_number, line in enumerate(selected, start=arguments.start_line):
-            visible = _visible_text(line)
+            visible = render_visible_text(line)
             if len(visible) > self._max_line_chars:
                 visible = visible[: self._max_line_chars] + "...[line truncated]"
                 clipped_line = True
@@ -307,7 +311,7 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
         end_line = arguments.start_line + returned_line_count - 1
         has_more = end_line < len(lines)
         truncated = has_more or clipped_line or content_truncated
-        summary_path = _summary_path(target.relative)
+        summary_path = summarize_path(target.relative)
 
         summary = f"Read {summary_path} lines {arguments.start_line}-{end_line} of {len(lines)}"
 
@@ -493,7 +497,7 @@ class SearchTextTool(BaseTool[SearchTextArguments]):
             content=content,
             summary=(
                 f"Found {count_label} matches and showed {returned_matches} "
-                f"from {files_scanned} files under {_summary_path(start.relative)}"
+                f"from {files_scanned} files under {summarize_path(start.relative)}"
             ),
             metadata={
                 "path": start.relative,
@@ -598,20 +602,13 @@ def _decode_searchable_text(data: bytes, target: WorkspacePath) -> str:
         ) from exc
 
 
-def _visible_text(text: str) -> str:
-    rendered: list[str] = []
-    for character in text:
-        rendered.append(_escaped_character(character))
-    return "".join(rendered)
-
-
 def _search_snippet(line: str, match_start: int, max_chars: int) -> str:
-    visible = _visible_text(line)
-    visible_match_start = len(_visible_text(line[:match_start]))
+    visible = render_visible_text(line)
+    visible_match_start = len(render_visible_text(line[:match_start]))
     if len(visible) <= max_chars:
         return visible
     if max_chars <= 6:
-        return _clip_rendered_line(visible[visible_match_start:], max_chars)
+        return clip_with_ellipsis(visible[visible_match_start:], max_chars)
 
     window_chars = max_chars - 6
     left = max(0, visible_match_start - window_chars // 3)
@@ -661,27 +658,6 @@ def _file_identity(path: Path) -> tuple[int, int] | Path:
     return path
 
 
-def _escaped_character(character: str) -> str:
-    if not _is_display_control(character):
-        return character
-    codepoint = ord(character)
-    if codepoint <= 0xFF:
-        return f"\\x{codepoint:02x}"
-    if codepoint <= 0xFFFF:
-        return f"\\u{codepoint:04x}"
-    return f"\\U{codepoint:08x}"
-
-
-def _is_display_control(character: str) -> bool:
-    return category(character) in {"Cc", "Cf", "Zl", "Zp"}
-
-
-def _summary_path(path: str) -> str:
-    if len(path) <= _SUMMARY_PATH_CHARS:
-        return path
-    return "..." + path[-(_SUMMARY_PATH_CHARS - 3) :]
-
-
 def _truncation_reason(**reasons: bool) -> str | None:
     active = [name for name, enabled in reasons.items() if enabled]
     return ",".join(active) or None
@@ -715,7 +691,7 @@ def _bounded_document(
             content_clipped = included < len(body)
             return "\n".join(parts) + suffix, included, content_clipped, False
 
-    clipped_line = _clip_rendered_line(body[0], prefix_budget)
+    clipped_line = clip_with_ellipsis(body[0], prefix_budget)
     return clipped_line + suffix, 1, True, clipped_line != body[0]
 
 
@@ -723,11 +699,3 @@ def _validate_output_budget(max_output_chars: int) -> None:
     minimum = len(_OUTPUT_TRUNCATION_MARKER) + 1 + 8
     if max_output_chars < minimum:
         raise ValueError("max_output_chars is too small for a marker and visible progress")
-
-
-def _clip_rendered_line(line: str, max_chars: int) -> str:
-    if len(line) <= max_chars:
-        return line
-    if max_chars <= 3:
-        return line[:max_chars]
-    return line[: max_chars - 3] + "..."

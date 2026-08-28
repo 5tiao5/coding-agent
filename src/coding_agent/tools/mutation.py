@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal
-from unicodedata import category
 
 from pydantic import BaseModel, Field, StringConstraints
 
 from coding_agent.models import ToolOutput
 from coding_agent.mutation import MutationResult, MutationSession
+from coding_agent.tools._rendering import (
+    clip_at_escape_boundary,
+    render_visible_text,
+    summarize_path,
+)
 from coding_agent.tools.base import BaseTool
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 _DIFF_TRUNCATION_MARKER = "...[diff preview truncated; file change was applied completely]"
-_SUMMARY_PATH_CHARS = 180
 
 
 class WriteFileArguments(BaseModel):
@@ -156,13 +159,13 @@ def _render_result(result: MutationResult, revision: int, max_chars: int) -> Too
         [result.diff_truncation_reason] if result.diff_truncation_reason is not None else []
     )
     if result.diff:
-        visible_diff = "\n".join(_visible_line(line) for line in result.diff.split("\n"))
+        visible_diff = "\n".join(render_visible_text(line) for line in result.diff.split("\n"))
         content = f"{headline}\nDiff preview:\n{visible_diff}"
     else:
         content = headline
     if len(content) > max_chars:
         keep = max_chars - len(_DIFF_TRUNCATION_MARKER) - 1
-        content = _safe_visible_prefix(content, keep) + "\n" + _DIFF_TRUNCATION_MARKER
+        content = clip_at_escape_boundary(content, keep) + "\n" + _DIFF_TRUNCATION_MARKER
         diff_complete = False
         truncation_reasons.append("diff_output_limit")
 
@@ -174,7 +177,7 @@ def _render_result(result: MutationResult, revision: int, max_chars: int) -> Too
         "replay": "Replayed",
     }[result.change_kind]
     summary = (
-        f"{action} {_summary_path(result.path)} "
+        f"{action} {summarize_path(result.path)} "
         f"(+{result.added_lines}/-{result.removed_lines}, change {result.change_id or 'none'})"
     )
     return ToolOutput(
@@ -205,48 +208,6 @@ def _render_result(result: MutationResult, revision: int, max_chars: int) -> Too
         },
         truncated=not diff_complete,
     )
-
-
-def _visible_line(text: str) -> str:
-    rendered: list[str] = []
-    for character in text:
-        if category(character) not in {"Cc", "Cf", "Zl", "Zp"}:
-            rendered.append(character)
-            continue
-        codepoint = ord(character)
-        if codepoint <= 0xFF:
-            rendered.append(f"\\x{codepoint:02x}")
-        elif codepoint <= 0xFFFF:
-            rendered.append(f"\\u{codepoint:04x}")
-        else:
-            rendered.append(f"\\U{codepoint:08x}")
-    return "".join(rendered)
-
-
-def _summary_path(path: str) -> str:
-    if len(path) <= _SUMMARY_PATH_CHARS:
-        return path
-    return "..." + path[-(_SUMMARY_PATH_CHARS - 3) :]
-
-
-def _safe_visible_prefix(text: str, max_chars: int) -> str:
-    """Clip text without splitting one of our rendered control escape tokens."""
-    index = 0
-    while index < len(text):
-        token_length = 1
-        if text[index] == "\\" and index + 1 < len(text):
-            widths = {"x": 4, "u": 6, "U": 10}
-            candidate_length = widths.get(text[index + 1])
-            if candidate_length is not None:
-                candidate = text[index + 2 : index + candidate_length]
-                if len(candidate) == candidate_length - 2 and all(
-                    character in "0123456789abcdef" for character in candidate
-                ):
-                    token_length = candidate_length
-        if index + token_length > max_chars:
-            break
-        index += token_length
-    return text[:index]
 
 
 def _validate_output_budget(max_output_chars: int) -> None:
