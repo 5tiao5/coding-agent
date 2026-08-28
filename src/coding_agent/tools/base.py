@@ -36,6 +36,7 @@ class BaseTool(ABC, Generic[ArgsT]):
     name: str
     description: str
     args_model: type[ArgsT]
+    output_budget_chars: int | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -52,7 +53,10 @@ class BaseTool(ABC, Generic[ArgsT]):
         if unexpected:
             joined = ", ".join(unexpected)
             raise ToolError("invalid_arguments", f"unexpected argument(s): {joined}")
-        parsed = self.args_model.model_validate(arguments)
+        try:
+            parsed = self.args_model.model_validate(arguments)
+        except ValidationError as exc:
+            raise ToolError("invalid_arguments", str(exc)) from exc
         return self.run(parsed)
 
     @abstractmethod
@@ -77,6 +81,14 @@ class ToolRegistry:
     def register(self, tool: BaseTool[Any]) -> None:
         if tool.name in self._tools:
             raise ValueError(f"duplicate tool name: {tool.name}")
+        if (
+            tool.output_budget_chars is not None
+            and tool.output_budget_chars > self._max_output_chars
+        ):
+            raise ValueError(
+                f"tool {tool.name} output budget ({tool.output_budget_chars}) exceeds "
+                f"registry budget ({self._max_output_chars})"
+            )
         self._tools[tool.name] = tool
 
     def specs(self) -> tuple[ToolSpec, ...]:
@@ -107,7 +119,12 @@ class ToolRegistry:
                     f"tool {call.name} returned an empty summary",
                 )
         except ValidationError as exc:
-            return self._failure(call, "invalid_arguments", str(exc), started)
+            return self._failure(
+                call,
+                "invalid_output",
+                f"tool {call.name} produced invalid structured output: {exc}",
+                started,
+            )
         except CodedError as exc:
             return self._failure(call, exc.code, exc.message, started)
         except Exception as exc:  # noqa: BLE001 - tool failures become model observations.

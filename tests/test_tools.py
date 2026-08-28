@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from pydantic import BaseModel
 
 from coding_agent.errors import CodedError
@@ -69,6 +70,21 @@ class MissingWorkspacePathTool(BaseTool[TextArgs]):
     def run(self, arguments: TextArgs) -> ToolOutput:
         del arguments
         raise CodedError("not_found", "path not found: missing.py")
+
+
+class InvalidStructuredOutputTool(BaseTool[TextArgs]):
+    name = "invalid_structured_output"
+    description = "Raise validation while constructing a structured result."
+    args_model = TextArgs
+
+    def run(self, arguments: TextArgs) -> ToolOutput:
+        del arguments
+        return ToolOutput(content="hello", summary="")
+
+
+class BudgetedTextTool(TextTool):
+    name = "budgeted_text"
+    output_budget_chars = 100
 
 
 def test_tool_schema_and_runtime_both_reject_extra_arguments() -> None:
@@ -170,3 +186,22 @@ def test_project_owned_coded_errors_keep_their_semantics_at_registry_boundary() 
     assert execution.ok is False
     assert execution.error_code == "not_found"
     assert execution.error_message == "path not found: missing.py"
+
+
+def test_output_model_validation_is_not_misreported_as_bad_arguments() -> None:
+    execution = ToolRegistry([InvalidStructuredOutputTool()]).execute(
+        ToolCall(
+            id="invalid-structured-output-1",
+            name="invalid_structured_output",
+            arguments={"text": "unused"},
+        )
+    )
+
+    assert execution.ok is False
+    assert execution.error_code == "invalid_output"
+    assert "structured output" in str(execution.error_message)
+
+
+def test_registry_rejects_a_tool_whose_semantic_budget_exceeds_its_hard_cap() -> None:
+    with pytest.raises(ValueError, match="output budget .* exceeds registry budget"):
+        ToolRegistry([BudgetedTextTool()], max_output_chars=99)
