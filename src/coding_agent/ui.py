@@ -9,11 +9,18 @@ from coding_agent.events import EventKind, RunEvent
 
 _STYLE: dict[EventKind, tuple[str, str]] = {
     EventKind.RUN_STARTED: ("RUN", "bold cyan"),
+    EventKind.RUN_RESUMED: ("RUN", "bold cyan"),
     EventKind.STATE_CHANGED: ("...", "dim"),
     EventKind.MODEL_REQUESTED: ("MODEL", "cyan"),
     EventKind.MODEL_RESPONDED: ("MODEL", "cyan"),
+    EventKind.CONTEXT_COMPACTED: ("CTX", "magenta"),
     EventKind.TOOL_STARTED: ("TOOL", "yellow"),
     EventKind.TOOL_FINISHED: ("OK", "green"),
+    EventKind.VERIFICATION_INVALIDATED: ("VERIFY", "yellow"),
+    EventKind.VERIFICATION_RECORDED: ("VERIFY", "cyan"),
+    EventKind.VERIFICATION_EVALUATED: ("VERIFY", "bold green"),
+    EventKind.SESSION_CHECKPOINTED: ("SAVE", "blue"),
+    EventKind.SESSION_CHECKPOINT_FAILED: ("SAVE", "yellow"),
     EventKind.RUN_FINISHED: ("DONE", "bold green"),
     EventKind.RUN_FAILED: ("FAIL", "bold red"),
 }
@@ -27,6 +34,10 @@ class ConsoleEventSink:
         symbol, style = _STYLE[event.kind]
         if event.kind is EventKind.TOOL_FINISHED and not event.data.get("ok", True):
             symbol, style = "FAIL", "red"
+        if event.kind is EventKind.VERIFICATION_RECORDED and not event.data.get("passed", False):
+            symbol, style = "VERIFY", "red"
+        if event.kind is EventKind.VERIFICATION_EVALUATED and not event.data.get("verified", False):
+            symbol, style = "VERIFY", "yellow"
         line = Text()
         line.append(f"[{symbol}] ", style=style)
         if event.step:

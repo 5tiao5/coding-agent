@@ -13,11 +13,18 @@ from coding_agent.models import FrozenModel
 
 class EventKind(StrEnum):
     RUN_STARTED = "run_started"
+    RUN_RESUMED = "run_resumed"
     STATE_CHANGED = "state_changed"
     MODEL_REQUESTED = "model_requested"
     MODEL_RESPONDED = "model_responded"
+    CONTEXT_COMPACTED = "context_compacted"
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
+    VERIFICATION_INVALIDATED = "verification_invalidated"
+    VERIFICATION_RECORDED = "verification_recorded"
+    VERIFICATION_EVALUATED = "verification_evaluated"
+    SESSION_CHECKPOINTED = "session_checkpointed"
+    SESSION_CHECKPOINT_FAILED = "session_checkpoint_failed"
     RUN_FINISHED = "run_finished"
     RUN_FAILED = "run_failed"
 
