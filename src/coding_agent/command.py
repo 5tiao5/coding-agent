@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from threading import Lock, Thread
 from typing import Protocol
@@ -45,6 +46,29 @@ _SECRET_ENV_MARKERS = (
     "SECRET",
     "TOKEN",
 )
+_SENSITIVE_ENV_NAMES = frozenset(
+    {
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "BOTO_CONFIG",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "DATABASE_URL",
+        "DB_URL",
+        "DOCKER_AUTH_CONFIG",
+        "DOCKER_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GPG_AGENT_INFO",
+        "KUBECONFIG",
+        "MONGODB_URI",
+        "MYSQL_PWD",
+        "NETRC",
+        "PGPASSFILE",
+        "PGPASSWORD",
+        "PGSERVICEFILE",
+        "REDIS_URL",
+        "SSH_AGENT_PID",
+        "SSH_AUTH_SOCK",
+    }
+)
 _PROMPT_ENV_NAMES = frozenset(
     {
         "GIT_ASKPASS",
@@ -53,6 +77,38 @@ _PROMPT_ENV_NAMES = frozenset(
         "PYTHONSTARTUP",
         "SSH_ASKPASS",
         "SUDO_ASKPASS",
+    }
+)
+_VERIFIER_ENV_NAMES = frozenset(
+    {
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
+        "PATH",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "PROGRAMDATA",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USERPROFILE",
+        "VIRTUAL_ENV",
+        "WINDIR",
     }
 )
 
@@ -116,6 +172,13 @@ class CommandPermissionMode(StrEnum):
     AUTO = "auto"
 
 
+class CommandEnvironmentProfile(StrEnum):
+    """How much ambient host state an already-authorized command may inherit."""
+
+    SANITIZED = "sanitized"
+    VERIFIER = "verifier"
+
+
 class CommandStatus(StrEnum):
     """Observable process outcome; non-zero exit is still a completed observation."""
 
@@ -151,6 +214,7 @@ class VerificationCommandSpec:
     cwd: str
     kind: VerificationKind
     label: str
+    workspace_executable_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.argv:
@@ -162,6 +226,16 @@ class VerificationCommandSpec:
             raise ValueError("verification command cwd must be workspace-relative")
         if not self.label.strip() or len(self.label) > 120:
             raise ValueError("verification command label must contain 1-120 characters")
+        if self.workspace_executable_sha256 is not None and (
+            len(self.workspace_executable_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.workspace_executable_sha256
+            )
+        ):
+            raise ValueError(
+                "workspace executable SHA-256 must be 64 lowercase hexadecimal characters"
+            )
         if any(
             ord(character) < 32 or ord(character) == 127
             for value in (*self.argv, self.cwd, self.label)
@@ -175,6 +249,11 @@ class CommandRequest:
     argv: tuple[str, ...]
     cwd: Path
     timeout_seconds: float
+    environment_profile: CommandEnvironmentProfile = CommandEnvironmentProfile.SANITIZED
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.environment_profile, CommandEnvironmentProfile):
+            raise ValueError("command environment profile must be host-owned")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +307,7 @@ class CommandPolicy:
         *,
         cwd: str = ".",
         workspace_root: Path | None = None,
+        approved: bool = False,
     ) -> CommandClassification:
         if not argv:
             raise CommandError("invalid_command", "command argument vector cannot be empty")
@@ -261,26 +341,33 @@ class CommandPolicy:
                     metadata={"reason": "destructive_git_operation"},
                 )
         if _is_non_verifying_invocation(executable, arguments):
-            return self._general_or_require_approval()
+            return self._general_or_require_approval(approved=approved)
 
         requested_argv = tuple(argv)
         for spec in self._verification_commands:
             if spec.argv == requested_argv and spec.cwd == cwd:
                 if _recognized_verification_kind(executable, arguments) is not spec.kind:
-                    return self._general_or_require_approval()
-                if workspace_root is not None and _is_within_workspace(
-                    Path(requested_argv[0]), workspace_root
+                    return self._general_or_require_approval(approved=approved)
+                if (
+                    workspace_root is not None
+                    and _is_within_workspace(Path(requested_argv[0]), workspace_root)
+                    and (
+                        spec.workspace_executable_sha256 is None
+                        or not _matches_sha256(
+                            Path(requested_argv[0]), spec.workspace_executable_sha256
+                        )
+                    )
                 ):
-                    return self._general_or_require_approval()
+                    return self._general_or_require_approval(approved=approved)
                 return CommandClassification(
                     command_class=CommandClass.VERIFIER,
                     verification_kind=spec.kind,
                     verification_label=spec.label,
                 )
-        return self._general_or_require_approval()
+        return self._general_or_require_approval(approved=approved)
 
-    def _general_or_require_approval(self) -> CommandClassification:
-        if self._mode is CommandPermissionMode.SAFE:
+    def _general_or_require_approval(self, *, approved: bool) -> CommandClassification:
+        if self._mode is CommandPermissionMode.SAFE and not approved:
             raise CommandError(
                 "command_approval_required",
                 "general command requires explicit approval in safe mode",
@@ -440,7 +527,11 @@ class LocalCommandRunner:
         self,
         request: CommandRequest,
     ) -> tuple[subprocess.Popen[bytes], ProcessContainment]:
-        environment = _sanitized_environment(self._environment)
+        environment = (
+            _verification_environment(self._environment)
+            if request.environment_profile is CommandEnvironmentProfile.VERIFIER
+            else _sanitized_environment(self._environment)
+        )
         try:
             return start_contained_process(
                 request.argv,
@@ -590,14 +681,37 @@ def _sanitized_environment(source: Mapping[str, str]) -> dict[str, str]:
     return environment
 
 
+def _verification_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Build a small host-owned environment for a command that can issue evidence."""
+
+    sanitized = _sanitized_environment(source)
+    environment = {
+        key: value for key, value in sanitized.items() if key.upper() in _VERIFIER_ENV_NAMES
+    }
+    environment.update(
+        {
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "NO_COLOR": "1",
+            "PAGER": "cat",
+            "PIP_NO_INPUT": "1",
+        }
+    )
+    return environment
+
+
 def _is_sensitive_environment_name(name: str) -> bool:
     normalized = name.upper()
-    return normalized in _PROMPT_ENV_NAMES or any(
-        normalized == marker
-        or normalized.startswith(marker + "_")
-        or normalized.endswith("_" + marker)
-        or f"_{marker}_" in normalized
-        for marker in _SECRET_ENV_MARKERS
+    return (
+        normalized in _PROMPT_ENV_NAMES
+        or normalized in _SENSITIVE_ENV_NAMES
+        or any(
+            normalized == marker
+            or normalized.startswith(marker + "_")
+            or normalized.endswith("_" + marker)
+            or f"_{marker}_" in normalized
+            for marker in _SECRET_ENV_MARKERS
+        )
     )
 
 
@@ -756,3 +870,22 @@ def _is_within_workspace(executable: Path, workspace_root: Path) -> bool:
     except (OSError, RuntimeError):
         return True
     return resolved_executable == resolved_root or resolved_root in resolved_executable.parents
+
+
+def executable_sha256(executable: Path) -> str:
+    """Hash one host-selected executable without trusting its workspace path."""
+    digest = sha256()
+    try:
+        with executable.resolve(strict=True).open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("verification executable could not be hashed") from exc
+    return digest.hexdigest()
+
+
+def _matches_sha256(executable: Path, expected: str) -> bool:
+    try:
+        return executable_sha256(executable) == expected
+    except ValueError:
+        return False

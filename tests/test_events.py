@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from coding_agent.events import CompositeEventSink, EventKind, MemoryEventSink, RunEvent
+from coding_agent.events import (
+    BestEffortEventSink,
+    CompositeEventSink,
+    EventKind,
+    MemoryEventSink,
+    RunEvent,
+)
 
 
 class MutatingSink:
@@ -46,3 +52,25 @@ def test_memory_sink_records_a_deep_snapshot() -> None:
     source.data["details"]["status"] = "changed later"
 
     assert recording.events[0].data["details"]["status"] == "original"
+
+
+def test_best_effort_sink_disables_a_broken_renderer_without_raising() -> None:
+    class BrokenSink:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def emit(self, event: RunEvent) -> None:
+            del event
+            self.calls += 1
+            raise RuntimeError("terminal renderer failed")
+
+    broken = BrokenSink()
+    guarded = BestEffortEventSink(broken)
+    event = RunEvent(run_id="run-1", kind=EventKind.RUN_STARTED, message="started")
+
+    guarded.emit(event)
+    guarded.emit(event)
+
+    assert guarded.disabled is True
+    assert guarded.failure_count == 1
+    assert broken.calls == 1

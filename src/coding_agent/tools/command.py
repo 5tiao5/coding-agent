@@ -6,9 +6,12 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 
+from coding_agent.approval import CommandApprovalRequest, CommandApprover
 from coding_agent.command import (
     CommandClass,
     CommandClassification,
+    CommandEnvironmentProfile,
+    CommandError,
     CommandPolicy,
     CommandRequest,
     CommandResult,
@@ -87,6 +90,7 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         *,
         runner: CommandRunner | None = None,
         policy: CommandPolicy | None = None,
+        approver: CommandApprover | None = None,
         max_output_chars: int = 16_000,
     ) -> None:
         minimum = 512
@@ -95,22 +99,55 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         self._workspace = workspace
         self._runner = runner or LocalCommandRunner()
         self._policy = policy or CommandPolicy()
+        self._approver = approver
         self._max_output_chars = max_output_chars
         self.output_budget_chars = max_output_chars
 
     def run(self, arguments: RunCommandArguments) -> ToolOutput:
         argv = tuple(arguments.argv)
         cwd = self._workspace.resolve(arguments.cwd, expected="directory")
-        classification = self._policy.classify(
-            argv,
-            cwd=cwd.relative,
-            workspace_root=self._workspace.root,
-        )
+        try:
+            classification = self._policy.classify(
+                argv,
+                cwd=cwd.relative,
+                workspace_root=self._workspace.root,
+            )
+        except CommandError as exc:
+            if exc.code != "command_approval_required" or self._approver is None:
+                raise
+            try:
+                approved = self._approver.approve(
+                    CommandApprovalRequest(argv=argv, cwd=cwd.relative)
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as approval_error:
+                raise CommandError(
+                    "command_approval_failed",
+                    "command approval could not be obtained safely",
+                ) from approval_error
+            if not approved:
+                raise CommandError(
+                    "command_denied",
+                    "command was denied by the user",
+                    metadata={"reason": "user_denied"},
+                ) from None
+            classification = self._policy.classify(
+                argv,
+                cwd=cwd.relative,
+                workspace_root=self._workspace.root,
+                approved=True,
+            )
         result = self._runner.run(
             CommandRequest(
                 argv=argv,
                 cwd=cwd.path,
                 timeout_seconds=arguments.timeout_seconds,
+                environment_profile=(
+                    CommandEnvironmentProfile.VERIFIER
+                    if classification.command_class is CommandClass.VERIFIER
+                    else CommandEnvironmentProfile.SANITIZED
+                ),
             )
         )
         return self._render_result(

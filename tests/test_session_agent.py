@@ -48,6 +48,22 @@ class CountingVerifyTool(BaseTool[VerifyArguments]):
         )
 
 
+def test_initial_checkpoint_makes_a_first_model_failure_resumable(tmp_path: Path) -> None:
+    store = SessionStore((tmp_path / "state").resolve())
+
+    failed = AgentRunner(
+        ScriptedModel([]),
+        ToolRegistry(),
+        session_store=store,
+    ).run("Survive a provider outage")
+
+    assert failed.state is AgentState.FAILED
+    loaded = store.load(failed.run_id)
+    assert loaded.checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert loaded.checkpoint.completed_steps == 0
+    assert loaded.checkpoint.completed_tool_calls == 0
+
+
 def test_resume_never_replays_tools_and_requires_fresh_verification(tmp_path: Path) -> None:
     store = SessionStore((tmp_path / "state").resolve())
     initial_tool = CountingVerifyTool()
@@ -89,12 +105,17 @@ def test_resume_never_replays_tools_and_requires_fresh_verification(tmp_path: Pa
 
 def test_terminal_checkpoint_cannot_be_resumed(tmp_path: Path) -> None:
     store = SessionStore((tmp_path / "state").resolve())
+    events = MemoryEventSink()
     result = AgentRunner(
         ScriptedModel([ModelResponse(content="Done without tools.")]),
         ToolRegistry(),
         session_store=store,
+        event_sink=events,
     ).run("Finish and save")
     loaded = store.load(result.run_id)
+
+    assert events.events[-2].kind is EventKind.SESSION_CHECKPOINTED
+    assert events.events[-1].kind is EventKind.RUN_FINISHED
 
     runner = AgentRunner(ScriptedModel([]), ToolRegistry())
 

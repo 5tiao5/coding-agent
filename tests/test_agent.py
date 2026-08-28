@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
@@ -167,6 +168,23 @@ def test_scripted_model_completes_a_multi_turn_tool_loop() -> None:
         "evidence_count": 0,
         "evidence_labels": [],
     }
+
+
+def test_host_can_inject_a_safe_run_id_before_starting_the_runner() -> None:
+    events = MemoryEventSink()
+    result = AgentRunner(
+        ScriptedModel([ModelResponse(content="Done under a host-owned run ID.")]),
+        ToolRegistry(),
+        event_sink=events,
+    ).run("Use the leased run ID", run_id="host-run")
+
+    assert result.run_id == "host-run"
+    assert {event.run_id for event in events.events} == {"host-run"}
+
+    invalid_model = ScriptedModel([ModelResponse(content="must not be requested")])
+    with pytest.raises(ValueError, match="run_id must be"):
+        AgentRunner(invalid_model, ToolRegistry()).run("Reject the ID", run_id="UPPERCASE")
+    assert invalid_model.requests == []
 
 
 def test_unknown_tool_failure_is_returned_to_the_model_as_an_observation() -> None:
@@ -663,6 +681,29 @@ def test_per_step_tool_call_limit_rejects_the_whole_batch_before_execution() -> 
     ]
     assert EventKind.TOOL_STARTED not in [event.kind for event in events.events]
     assert events.events[-1].data == {"stop_reason": StopReason.TOOL_LIMIT.value}
+
+
+def test_duplicate_tool_call_id_is_rejected_before_a_second_side_effect() -> None:
+    tool = EchoTool()
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="echo-reused", name="echo", arguments={"text": "first"}),)
+            ),
+            ModelResponse(
+                tool_calls=(ToolCall(id="echo-reused", name="echo", arguments={"text": "second"}),)
+            ),
+        ]
+    )
+
+    result = AgentRunner(model, ToolRegistry([tool])).run("Never repeat a call ID")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.error == "Model returned a duplicate tool call ID"
+    assert [call.text for call in tool.calls] == ["first"]
+    assert result.messages[-1].role is MessageRole.TOOL
+    assert result.messages[-1].tool_call_id == "echo-reused"
 
 
 def test_total_tool_call_limit_counts_successful_batches_across_steps() -> None:

@@ -67,3 +67,29 @@ class CompositeEventSink:
             # A sink is an integration boundary. Give each sink its own snapshot so
             # one renderer cannot mutate what a later recorder observes.
             sink.emit(event.model_copy(deep=True))
+
+
+class BestEffortEventSink:
+    """Disable a presentation sink after its first failure without stopping the run."""
+
+    def __init__(self, sink: EventSink) -> None:
+        self._sink = sink
+        self._disabled = False
+        self._failure_count = 0
+
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
+    @property
+    def failure_count(self) -> int:
+        return self._failure_count
+
+    def emit(self, event: RunEvent) -> None:
+        if self._disabled:
+            return
+        try:
+            self._sink.emit(event)
+        except Exception:  # noqa: BLE001 - presentation must not become control flow.
+            self._disabled = True
+            self._failure_count += 1

@@ -14,6 +14,7 @@ import stat
 from collections.abc import Sequence
 from contextlib import suppress
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Self
 from uuid import uuid4
@@ -22,19 +23,11 @@ from pydantic import ConfigDict, Field, ValidationError, field_validator, model_
 
 from coding_agent.errors import CodedError
 from coding_agent.models import ChatMessage, FrozenModel, MessageRole, StopReason
+from coding_agent.run_id import require_run_id
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 DEFAULT_MAX_CHECKPOINT_BYTES = 2_000_000
 
-_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
-}
 _FORBIDDEN_FIELD_NAMES = {
     "accesstoken",
     "analysis",
@@ -83,8 +76,12 @@ class SessionCheckpoint(FrozenModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     run_id: str = Field(min_length=1, max_length=64)
+    workspace_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     task: str = Field(min_length=1)
     system_prompt: str = Field(min_length=1)
     messages: tuple[ChatMessage, ...] = Field(min_length=2)
@@ -166,12 +163,19 @@ class SessionStore:
 
         self._state_dir = raw_state_dir.resolve(strict=False)
         self._max_checkpoint_bytes = max_checkpoint_bytes
+        self._workspace_fingerprint: str | None = None
         if workspace_root is not None:
-            resolved_workspace = Path(workspace_root).resolve(strict=False)
+            try:
+                resolved_workspace = Path(workspace_root).resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError("workspace_root must identify an accessible directory") from exc
+            if not resolved_workspace.is_dir():
+                raise ValueError("workspace_root must identify an accessible directory")
             if self._state_dir == resolved_workspace or self._state_dir.is_relative_to(
                 resolved_workspace
             ):
                 raise ValueError("state_dir must be outside the workspace")
+            self._workspace_fingerprint = workspace_fingerprint(resolved_workspace)
 
     @property
     def state_dir(self) -> Path:
@@ -181,8 +185,15 @@ class SessionStore:
     def max_checkpoint_bytes(self) -> int:
         return self._max_checkpoint_bytes
 
+    @property
+    def workspace_fingerprint(self) -> str | None:
+        """Opaque identity required when this store is bound to one workspace."""
+        return self._workspace_fingerprint
+
     def save(self, checkpoint: SessionCheckpoint) -> Path:
         """Atomically replace one checkpoint after validating its safe JSON payload."""
+
+        self._require_matching_workspace(checkpoint)
 
         payload_object = checkpoint.model_dump(mode="json", exclude_none=True)
         _reject_unsafe_payload(payload_object)
@@ -227,7 +238,7 @@ class SessionStore:
         try:
             text = raw.decode("utf-8")
             decoded = json.loads(text, object_pairs_hook=_unique_object)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
             raise SessionError("checkpoint_corrupt", "checkpoint is not valid JSON") from exc
         if not isinstance(decoded, dict):
             raise SessionError("checkpoint_corrupt", "checkpoint root must be a JSON object")
@@ -248,7 +259,21 @@ class SessionStore:
                 "checkpoint_corrupt",
                 "checkpoint does not satisfy the session schema",
             ) from exc
+        if checkpoint.run_id != run_id:
+            raise SessionError(
+                "checkpoint_corrupt",
+                "checkpoint run ID does not match its filename",
+            )
+        self._require_matching_workspace(checkpoint)
         return LoadedSession(checkpoint=checkpoint)
+
+    def _require_matching_workspace(self, checkpoint: SessionCheckpoint) -> None:
+        expected = self._workspace_fingerprint
+        if expected is not None and checkpoint.workspace_fingerprint != expected:
+            raise SessionError(
+                "checkpoint_workspace_mismatch",
+                "checkpoint belongs to a different workspace",
+            )
 
     def _checkpoint_path(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
@@ -267,6 +292,8 @@ class SessionStore:
 
     def _read_bounded(self, target: Path) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if target.is_symlink():
+            raise SessionError("unsafe_checkpoint", "checkpoint cannot be a symbolic link")
         try:
             descriptor = os.open(target, flags)
         except FileNotFoundError as exc:
@@ -337,11 +364,35 @@ def _validate_closed_turns(messages: Sequence[ChatMessage]) -> tuple[int, int]:
 
 
 def _require_safe_run_id(run_id: str) -> None:
-    if not _RUN_ID_PATTERN.fullmatch(run_id) or run_id.upper() in _WINDOWS_RESERVED_NAMES:
+    try:
+        require_run_id(run_id)
+    except ValueError:
         raise SessionError(
             "invalid_run_id",
-            "run_id must be a safe 1-64 character file identifier",
-        )
+            "run_id must be a lowercase safe 1-64 character file identifier",
+        ) from None
+
+
+def workspace_fingerprint(root: Path) -> str:
+    """Bind a checkpoint to one resolved directory without persisting its raw path."""
+    try:
+        resolved = Path(root).resolve(strict=True)
+        identity = resolved.stat()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("workspace root is not accessible") from exc
+    if not resolved.is_dir():
+        raise ValueError("workspace root must be a directory")
+    payload = json.dumps(
+        {
+            "device": identity.st_dev,
+            "inode": identity.st_ino,
+            "path": os.path.normcase(str(resolved)),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

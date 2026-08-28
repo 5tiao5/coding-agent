@@ -111,4 +111,7 @@ def test_agent_reads_replaces_verifies_and_reports_a_real_change(tmp_path: Path)
         "replace_text",
         "read_file",
     ]
-    assert all("subtotal - discount" not in str(event.data) for event in finished)
+    assert "subtotal - discount" not in str(finished[0].data)
+    assert "subtotal - discount" not in str(finished[2].data)
+    assert "-    return subtotal - discount - discount" in str(finished[1].data["preview"])
+    assert "+    return subtotal - discount" in str(finished[1].data["preview"])

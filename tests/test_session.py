@@ -73,14 +73,23 @@ def test_checkpoint_round_trip_is_passive_and_requires_fresh_verification(tmp_pa
     assert loaded.requires_reverification is True
     assert loaded.auto_replay_tool_calls is False
     payload = json.loads(saved.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert "verification" not in saved.read_text(encoding="utf-8")
     assert "environment" not in payload
 
 
 @pytest.mark.parametrize(
     "run_id",
-    ["../escape", "nested/run", r"nested\run", ".hidden", "run.json", "CON", "x" * 65],
+    [
+        "../escape",
+        "nested/run",
+        r"nested\run",
+        ".hidden",
+        "run.json",
+        "CON",
+        "Uppercase",
+        "x" * 65,
+    ],
 )
 def test_run_id_cannot_escape_or_abuse_the_state_directory(
     tmp_path: Path,
@@ -228,7 +237,7 @@ def test_store_rejects_corrupt_duplicate_and_unsupported_json(tmp_path: Path) ->
     store = SessionStore(state)
     cases = {
         "corrupt": (b"{not-json", "checkpoint_corrupt"),
-        "duplicate": (b'{"schema_version":1,"schema_version":1}', "checkpoint_corrupt"),
+        "duplicate": (b'{"schema_version":2,"schema_version":2}', "checkpoint_corrupt"),
         "boolean-version": (b'{"schema_version":true}', "checkpoint_version"),
         "future": (b'{"schema_version":99}', "checkpoint_version"),
     }
@@ -238,6 +247,23 @@ def test_store_rejects_corrupt_duplicate_and_unsupported_json(tmp_path: Path) ->
         with pytest.raises(SessionError) as raised:
             store.load(run_id)
         assert raised.value.code == code
+
+
+def test_store_normalizes_json_recursion_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "nested.json").write_text("{}", encoding="utf-8")
+
+    def raise_recursion(*args: object, **kwargs: object) -> object:
+        raise RecursionError("malicious nesting")
+
+    monkeypatch.setattr("coding_agent.session.json.loads", raise_recursion)
+
+    with pytest.raises(SessionError) as raised:
+        SessionStore(state).load("nested")
+    assert raised.value.code == "checkpoint_corrupt"
 
 
 def test_store_rejects_missing_non_object_and_schema_invalid_checkpoints(tmp_path: Path) -> None:
@@ -343,7 +369,7 @@ def test_secret_environment_reasoning_and_credential_data_are_rejected(tmp_path:
     credential_messages = list(_tool_transcript())
     credential_messages[1] = ChatMessage(
         role=MessageRole.USER,
-        content="Use sk-abcdefghijklmnopqrstuvwxyz123456 for the request",
+        content="Use " + "sk-" + "abcdefghijklmnopqrstuvwxyz123456 for the request",
     )
     assert credential_messages[1].content is not None
     credential_checkpoint = _checkpoint(
@@ -385,6 +411,34 @@ def test_state_directory_is_absolute_and_outside_the_workspace(tmp_path: Path) -
     assert external.max_checkpoint_bytes > 0
 
 
+def test_workspace_bound_checkpoint_fails_closed_for_another_repository(
+    tmp_path: Path,
+) -> None:
+    first_workspace = tmp_path / "first-workspace"
+    second_workspace = tmp_path / "second-workspace"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    state = tmp_path / "external"
+    first_store = SessionStore(state, workspace_root=first_workspace)
+    assert first_store.workspace_fingerprint is not None
+    checkpoint = _checkpoint().model_copy(
+        update={"workspace_fingerprint": first_store.workspace_fingerprint}
+    )
+    first_store.save(checkpoint)
+
+    loaded = first_store.load(checkpoint.run_id)
+    assert loaded.checkpoint.workspace_fingerprint == first_store.workspace_fingerprint
+
+    second_store = SessionStore(state, workspace_root=second_workspace)
+    with pytest.raises(SessionError) as mismatch:
+        second_store.load(checkpoint.run_id)
+    assert mismatch.value.code == "checkpoint_workspace_mismatch"
+
+    with pytest.raises(SessionError) as unstamped:
+        first_store.save(_checkpoint(run_id="unstamped"))
+    assert unstamped.value.code == "checkpoint_workspace_mismatch"
+
+
 def test_store_rejects_non_directory_state_and_hardlinked_checkpoint(tmp_path: Path) -> None:
     state_file = tmp_path / "not-a-directory"
     state_file.write_text("occupied", encoding="utf-8")
@@ -399,3 +453,32 @@ def test_store_rejects_non_directory_state_and_hardlinked_checkpoint(tmp_path: P
     with pytest.raises(SessionError) as link_error:
         store.load("linked")
     assert link_error.value.code == "unsafe_checkpoint"
+
+
+def test_load_rejects_a_symlinked_checkpoint(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    store = SessionStore(state)
+    checkpoint_path = store.save(_checkpoint(run_id="source"))
+
+    alias = state / "alias.json"
+    try:
+        alias.symlink_to(checkpoint_path)
+    except OSError:
+        pytest.skip("checkpoint symlinks are unavailable on this platform")
+    with pytest.raises(SessionError) as symlink_error:
+        store.load("alias")
+    assert symlink_error.value.code == "unsafe_checkpoint"
+
+
+def test_load_rejects_a_checkpoint_whose_run_id_does_not_match_its_filename(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    store = SessionStore(state)
+    checkpoint_path = store.save(_checkpoint(run_id="source"))
+    alias = state / "alias.json"
+    alias.write_bytes(checkpoint_path.read_bytes())
+
+    with pytest.raises(SessionError) as mismatch_error:
+        store.load("alias")
+    assert mismatch_error.value.code == "checkpoint_corrupt"

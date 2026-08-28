@@ -1,0 +1,661 @@
+"""Deterministic tests for the passive Rich dashboard projection."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from io import BytesIO, StringIO, TextIOWrapper
+from typing import ClassVar
+
+import pytest
+from rich.console import Console
+
+import coding_agent.dashboard as dashboard_module
+from coding_agent.dashboard import DashboardEventSink, DashboardProjection
+from coding_agent.events import EventKind, RunEvent
+
+_START = datetime(2026, 8, 28, 4, 0, tzinfo=UTC)
+
+
+def _event(
+    kind: EventKind,
+    *,
+    run_id: str = "run-1",
+    step: int = 0,
+    seconds: float = 0,
+    message: str = "event message must not be rendered",
+    data: dict[str, object] | None = None,
+) -> RunEvent:
+    return RunEvent(
+        run_id=run_id,
+        kind=kind,
+        message=message,
+        step=step,
+        timestamp=_START + timedelta(seconds=seconds),
+        data=data or {},
+    )
+
+
+def _plain_console(stream: StringIO, *, width: int = 100) -> Console:
+    return Console(file=stream, force_terminal=False, color_system=None, width=width)
+
+
+def test_projection_folds_a_verified_run_without_agent_internals() -> None:
+    projection = DashboardProjection(task_label="Repair discount bug", max_timeline=20)
+    events = [
+        _event(EventKind.RUN_STARTED, data={"task_chars": 500}),
+        _event(
+            EventKind.STATE_CHANGED,
+            step=1,
+            seconds=0.1,
+            data={"previous": "planning", "current": "acting"},
+        ),
+        _event(EventKind.MODEL_REQUESTED, step=1, seconds=0.2),
+        _event(
+            EventKind.MODEL_RESPONDED,
+            step=1,
+            seconds=0.3,
+            data={"tool_count": 1, "has_content": False},
+        ),
+        _event(
+            EventKind.TOOL_STARTED,
+            step=1,
+            seconds=0.4,
+            data={"call_id": "call-1", "tool_name": "update_plan"},
+        ),
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            seconds=0.7,
+            data={
+                "call_id": "call-1",
+                "tool_name": "update_plan",
+                "ok": True,
+                "summary": "Plan now has three steps",
+                "duration_ms": 300.0,
+                "preview": {
+                    "plan": [
+                        {"status": "completed", "step": "Inspect failure"},
+                        {"status": "in_progress", "step": "Apply repair"},
+                    ]
+                },
+                "raw_output": "must remain hidden",
+            },
+        ),
+        _event(EventKind.VERIFICATION_INVALIDATED, step=1, seconds=0.8),
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=2,
+            seconds=1.2,
+            data={"passed": True, "kind": "test", "label": "pytest -q"},
+        ),
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=2,
+            seconds=1.3,
+            data={"passed": True, "kind": "test", "label": "pytest -q"},
+        ),
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=3,
+            seconds=1.5,
+            data={"verified": True, "status": "verified"},
+        ),
+        _event(
+            EventKind.SESSION_CHECKPOINTED,
+            step=3,
+            seconds=1.7,
+            data={"boundary": "terminal"},
+        ),
+        _event(
+            EventKind.RUN_FINISHED,
+            step=3,
+            seconds=2,
+            data={"verified": True, "status": "verified"},
+        ),
+    ]
+
+    for event in events:
+        projection.apply(event)
+
+    snapshot = projection.snapshot
+    assert snapshot.run_id == "run-1"
+    assert snapshot.task_label == "Repair discount bug"
+    assert snapshot.phase == "COMPLETED"
+    assert snapshot.current_step == 3
+    assert snapshot.tools_started == 1
+    assert snapshot.tools_finished == 1
+    assert snapshot.tools_failed == 0
+    assert snapshot.active_tools == ()
+    assert snapshot.verification_status == "verified"
+    assert snapshot.verification_labels == ("pytest -q",)
+    assert snapshot.elapsed_seconds == 2
+    assert snapshot.terminal is True
+    assert snapshot.run_failed is False
+    assert snapshot.outcome == "VERIFIED"
+    assert snapshot.latest_change is None
+    tool_result = next(
+        item
+        for item in snapshot.timeline
+        if item.category == "TOOL" and item.headline.endswith("completed")
+    )
+    assert tool_result.preview == (
+        "[COMPLETED] Inspect failure",
+        "[IN PROGRESS] Apply repair",
+    )
+    assert tool_result.duration_ms == 300
+    assert all("must remain hidden" not in str(item) for item in snapshot.timeline)
+
+
+def test_projection_covers_resume_failure_and_safe_fallbacks() -> None:
+    projection = DashboardProjection(max_timeline=20)
+    events = [
+        _event(
+            EventKind.RUN_RESUMED,
+            data={"completed_steps": 2, "completed_tool_calls": 4},
+        ),
+        _event(
+            EventKind.MODEL_RESPONDED,
+            step=3,
+            seconds=0.1,
+            data={"tool_count": 0, "has_content": True},
+        ),
+        _event(
+            EventKind.CONTEXT_COMPACTED,
+            step=3,
+            seconds=0.2,
+            data={"compacted_blocks": 2},
+        ),
+        _event(EventKind.TOOL_STARTED, step=3, seconds=0.3),
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=3,
+            seconds=0.4,
+            data={
+                "ok": False,
+                "error_code": "permission_denied",
+                "duration_ms": float("nan"),
+            },
+        ),
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=3,
+            seconds=0.5,
+            data={"passed": False},
+        ),
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=3,
+            seconds=0.6,
+            data={"verified": False, "status": "failed"},
+        ),
+        _event(
+            EventKind.SESSION_CHECKPOINT_FAILED,
+            step=3,
+            seconds=0.7,
+            data={"error_code": "checkpoint_too_large"},
+        ),
+        _event(
+            EventKind.RUN_FAILED,
+            step=3,
+            seconds=0.8,
+            message='{"private_reasoning":"never render me"}',
+            data={"stop_reason": "model_error"},
+        ),
+    ]
+
+    for event in events:
+        projection.apply(event)
+
+    snapshot = projection.snapshot
+    assert snapshot.phase == "FAILED"
+    assert snapshot.outcome == "UNVERIFIED"
+    assert snapshot.run_failed is True
+    assert snapshot.tools_started == snapshot.tools_finished == 1
+    assert snapshot.tools_failed == 1
+    assert snapshot.verification_status == "failed"
+    assert snapshot.elapsed_seconds == pytest.approx(0.8)
+    assert snapshot.timeline[-1].headline == "Checkpoint not saved"
+    assert snapshot.timeline[-1].detail == "CHECKPOINT TOO LARGE"
+    assert all("private_reasoning" not in str(item) for item in snapshot.timeline)
+
+
+def test_projection_bounds_timeline_and_rejects_mixed_runs() -> None:
+    projection = DashboardProjection(task_label="\n", max_timeline=2)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(_event(EventKind.MODEL_REQUESTED, step=1, seconds=1))
+    projection.apply(_event(EventKind.MODEL_RESPONDED, step=1, seconds=2))
+
+    assert projection.snapshot.task_label == "Coding task"
+    assert len(projection.snapshot.timeline) == 2
+    assert projection.snapshot.timeline[0].headline == "Selecting the next action"
+    with pytest.raises(ValueError, match="only contain one run"):
+        projection.apply(_event(EventKind.RUN_STARTED, run_id="run-2"))
+    with pytest.raises(ValueError, match="at least 1"):
+        DashboardProjection(max_timeline=0)
+
+
+def test_projection_handles_missing_and_unknown_verification_status() -> None:
+    missing = DashboardProjection()
+    missing.apply(_event(EventKind.RUN_STARTED))
+    missing.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=1,
+            seconds=1,
+            data={"verified": False, "status": "missing"},
+        )
+    )
+    missing.apply(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            seconds=2,
+            data={"verified": False, "status": "missing"},
+        )
+    )
+    assert missing.snapshot.outcome == "UNVERIFIED"
+    assert missing.snapshot.verification_status == "missing"
+
+    unknown = DashboardProjection()
+    unknown.apply(_event(EventKind.RUN_STARTED))
+    unknown.apply(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            data={"verified": False, "status": "invented"},
+        )
+    )
+    assert unknown.snapshot.verification_status == "unverified"
+
+
+def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
+    stream = StringIO()
+    sink = DashboardEventSink(
+        _plain_console(stream),
+        live=False,
+        task_label="Repair [bold] safely",
+        max_timeline=20,
+    )
+    sink.emit(_event(EventKind.RUN_STARTED, message="SECRET START MESSAGE"))
+    sink.emit(_event(EventKind.MODEL_REQUESTED, step=1, message="SECRET MODEL REQUEST"))
+    sink.emit(
+        _event(
+            EventKind.MODEL_RESPONDED,
+            step=1,
+            message="SECRET MODEL RESPONSE",
+            data={"tool_count": 1, "has_content": True},
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.TOOL_STARTED,
+            step=1,
+            seconds=0.1,
+            data={"call_id": "write-1", "tool_name": "replace_text"},
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            seconds=0.2,
+            message="SECRET TOOL OUTPUT",
+            data={
+                "call_id": "write-1",
+                "tool_name": "replace_text",
+                "ok": True,
+                "summary": "Changed one file",
+                "duration_ms": 12.5,
+                "preview": ["- old line", "+ new line"],
+                "output": "SECRET RAW OUTPUT",
+            },
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=2,
+            seconds=0.5,
+            data={"passed": True, "kind": "test", "label": "pytest"},
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=2,
+            seconds=1,
+            message='{"private":"SECRET FINAL"}',
+            data={"verified": True, "status": "verified"},
+        )
+    )
+
+    output = stream.getvalue()
+    assert "[INFO]" in output
+    assert "[PASS]" in output
+    assert "replace_text completed" in output
+    assert "- old line" in output
+    assert "+ new line" in output
+    assert "FINAL RESULT" in output
+    assert "VERIFIED" in output
+    assert "Evidence: pytest" in output
+    assert "Selecting the next action" not in output
+    assert "Action selected" not in output
+    assert "SECRET" not in output
+    assert "\x1b" not in output
+    assert sink.snapshot.outcome == "VERIFIED"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("missing", "No current trusted verification evidence"),
+        ("failed", "latest trusted verification evidence failed"),
+        ("stale", "workspace changed after the latest passing evidence"),
+    ],
+)
+def test_final_card_explains_each_unverified_status(status: str, expected: str) -> None:
+    stream = StringIO()
+    sink = DashboardEventSink(_plain_console(stream), live=False)
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            seconds=1,
+            data={"verified": False, "status": status},
+        )
+    )
+
+    assert expected in stream.getvalue()
+    assert sink.snapshot.outcome == "UNVERIFIED"
+
+
+def test_failed_run_card_is_unverified_and_does_not_repeat() -> None:
+    stream = StringIO()
+    sink = DashboardEventSink(_plain_console(stream), live=False)
+    sink.emit(_event(EventKind.RUN_STARTED))
+    failure = _event(EventKind.RUN_FAILED, step=1, seconds=1)
+    sink.emit(failure)
+    sink.emit(failure)
+
+    output = stream.getvalue()
+    assert output.count("FINAL RESULT") == 1
+    assert "UNVERIFIED" in output
+    assert "Run state: FAILED" in output
+    assert "stopped before trustworthy completion" in output
+
+
+def test_full_dashboard_render_has_header_timeline_and_gate() -> None:
+    stream = StringIO()
+    console = _plain_console(stream, width=120)
+    sink = DashboardEventSink(console, live=False, task_label="Demo repair")
+    console.print(sink.render())
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.STATE_CHANGED,
+            step=1,
+            data={"current": "acting"},
+        )
+    )
+    console.print(sink.render())
+
+    output = stream.getvalue()
+    assert "CODING AGENT" in output
+    assert "ACTIVITY TIMELINE" in output
+    assert "LATEST CHANGE" in output
+    assert "No workspace mutation recorded yet" in output
+    assert "VERIFICATION GATE" in output
+    assert "Waiting for the first runtime event" in output
+    assert "Demo repair" in output
+    assert "Step 1 active" in output
+    assert "TASK" in output
+
+
+def test_latest_change_survives_timeline_eviction_and_renders_modified_lines() -> None:
+    stream = StringIO()
+    console = _plain_console(stream, width=120)
+    sink = DashboardEventSink(console, live=False, max_timeline=2)
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "call_id": "change-1",
+                "tool_name": "replace_text",
+                "ok": True,
+                "summary": "Changed pricing.py",
+                "preview": (
+                    "Change chg_1 was applied.\nDiff preview:\n"
+                    "--- a/pricing.py\n+++ b/pricing.py\n@@ -1 +1 @@\n"
+                    "-return discounted - discount\n+return discounted\n"
+                ),
+            },
+        )
+    )
+    for step in range(2, 6):
+        sink.emit(_event(EventKind.MODEL_REQUESTED, step=step, seconds=step))
+
+    snapshot = sink.snapshot
+    assert len(snapshot.timeline) == 2
+    assert all(entry.category == "MODEL" for entry in snapshot.timeline)
+    assert snapshot.latest_change is not None
+    assert snapshot.latest_change.preview[-2:] == (
+        "-return discounted - discount",
+        "+return discounted",
+    )
+    console.print(sink.render())
+    output = stream.getvalue()
+    assert "LATEST CHANGE" in output
+    assert "-return discounted - discount" in output
+    assert "+return discounted" in output
+
+
+def test_host_can_delay_final_card_until_all_other_output_is_complete() -> None:
+    stream = StringIO()
+    console = _plain_console(stream)
+    sink = DashboardEventSink(console, live=False, auto_final_card=False)
+
+    assert sink.print_final_card() is False
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            seconds=1,
+            data={"verified": True, "status": "verified"},
+        )
+    )
+    assert "FINAL RESULT" not in stream.getvalue()
+
+    console.print("HOST RESPONSE")
+    assert sink.print_final_card() is True
+    assert sink.print_final_card() is False
+    output = stream.getvalue()
+    assert output.count("FINAL RESULT") == 1
+    assert output.index("HOST RESPONSE") < output.index("FINAL RESULT")
+
+
+def test_dashboard_output_is_safe_for_an_ascii_console() -> None:
+    raw_stream = BytesIO()
+    ascii_stream = TextIOWrapper(raw_stream, encoding="ascii")
+    console = Console(file=ascii_stream, force_terminal=False, color_system=None, width=100)
+    sink = DashboardEventSink(console, live=False, task_label="Fix Ω")
+
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "read_file",
+                "ok": True,
+                "summary": "Read emoji 🚀",
+                "preview": "Ω preview",
+            },
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            data={"verified": False, "status": "missing"},
+        )
+    )
+    ascii_stream.flush()
+
+    output = raw_stream.getvalue().decode("ascii")
+    assert "?" in output
+    assert "FINAL RESULT" in output
+
+
+def test_preview_is_bounded_and_mappings_are_never_dumped_as_json() -> None:
+    projection = DashboardProjection(max_timeline=20)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    previews: list[object] = [
+        {"lines": ["line 1", "line 2"]},
+        {"status": "pending", "path": "src/app.py"},
+        {"secret": "must-not-render"},
+        ["one", 2, {"status": "done", "summary": "three"}, "four\nfive\nsix\nseven"],
+        "single\x00 control",
+    ]
+    for index, preview in enumerate(previews, start=1):
+        projection.apply(
+            _event(
+                EventKind.TOOL_FINISHED,
+                step=index,
+                seconds=index,
+                data={
+                    "tool_name": "tool",
+                    "ok": True,
+                    "summary": "safe",
+                    "preview": preview,
+                },
+            )
+        )
+
+    result_previews = [entry.preview for entry in projection.snapshot.timeline if entry.preview]
+    assert result_previews[0] == ("line 1", "line 2")
+    assert result_previews[1] == ("[PENDING] src/app.py",)
+    assert result_previews[2] == ("one", "[DONE] three", "four", "five", "six", "seven")
+    assert result_previews[3] == ("single control",)
+    assert "must-not-render" not in str(result_previews)
+
+
+def test_mutation_preview_prioritizes_the_actual_changed_lines() -> None:
+    projection = DashboardProjection(max_timeline=5)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "replace_text",
+                "ok": True,
+                "summary": "Changed pricing.py",
+                "preview": (
+                    "Change chg_1 was applied.\nDiff preview:\n"
+                    "--- a/pricing.py\n+++ b/pricing.py\n@@ -1 +1 @@\n"
+                    " context\n-old total\n+new total\n"
+                ),
+            },
+        )
+    )
+
+    preview = projection.snapshot.timeline[-1].preview
+    assert preview == (
+        "--- a/pricing.py",
+        "+++ b/pricing.py",
+        "@@ -1 +1 @@",
+        "-old total",
+        "+new total",
+    )
+
+
+class FakeLive:
+    instances: ClassVar[list[FakeLive]] = []
+
+    def __init__(self, renderable: object, **kwargs: object) -> None:
+        self.renderable = renderable
+        self.kwargs = kwargs
+        self.started = 0
+        self.updated = 0
+        self.stopped = 0
+        self.__class__.instances.append(self)
+
+    def start(self, *, refresh: bool = False) -> None:
+        assert refresh is True
+        self.started += 1
+
+    def update(self, renderable: object, *, refresh: bool = False) -> None:
+        assert refresh is True
+        self.renderable = renderable
+        self.updated += 1
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+
+def test_live_mode_starts_updates_stops_and_context_manager_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeLive.instances.clear()
+    monkeypatch.setattr(dashboard_module, "Live", FakeLive)
+    stream = StringIO()
+    sink = DashboardEventSink(_plain_console(stream), live=True, refresh_per_second=5)
+
+    with sink as opened:
+        assert opened is sink
+        sink.emit(_event(EventKind.RUN_STARTED))
+        sink.emit(_event(EventKind.MODEL_REQUESTED, step=1))
+        sink.emit(
+            _event(
+                EventKind.RUN_FINISHED,
+                step=1,
+                data={"verified": False, "status": "missing"},
+            )
+        )
+
+    live = FakeLive.instances[0]
+    assert live.started == 1
+    assert live.updated == 2
+    assert live.stopped == 1
+    assert live.kwargs["auto_refresh"] is False
+    assert live.kwargs["refresh_per_second"] == 5
+    assert "FINAL RESULT" in stream.getvalue()
+
+
+def test_auto_live_selection_and_constructor_validation() -> None:
+    terminal_console = Console(file=StringIO(), force_terminal=True)
+    recording_console = Console(file=StringIO(), force_terminal=False)
+
+    assert DashboardEventSink(terminal_console).uses_live_rendering is True
+    assert DashboardEventSink(recording_console).uses_live_rendering is False
+    with pytest.raises(ValueError, match="positive"):
+        DashboardEventSink(recording_console, refresh_per_second=0)
+
+
+def test_sink_resets_cleanly_for_a_second_run() -> None:
+    stream = StringIO()
+    sink = DashboardEventSink(_plain_console(stream), live=False)
+    sink.emit(_event(EventKind.RUN_STARTED, run_id="first"))
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            run_id="first",
+            data={"verified": False, "status": "missing"},
+        )
+    )
+    sink.emit(_event(EventKind.RUN_STARTED, run_id="second"))
+    sink.emit(
+        _event(
+            EventKind.RUN_FINISHED,
+            run_id="second",
+            data={"verified": True, "status": "verified"},
+        )
+    )
+
+    assert sink.snapshot.run_id == "second"
+    assert sink.snapshot.outcome == "VERIFIED"
+    assert stream.getvalue().count("FINAL RESULT") == 2

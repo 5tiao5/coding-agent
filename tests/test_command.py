@@ -15,9 +15,11 @@ from pydantic import TypeAdapter
 
 import coding_agent._command_process as process_module
 import coding_agent.command as command_module
+from coding_agent.approval import CommandApprovalRequest, CommandApprover
 from coding_agent.command import (
     CommandClass,
     CommandClassification,
+    CommandEnvironmentProfile,
     CommandPermissionMode,
     CommandPolicy,
     CommandRequest,
@@ -26,6 +28,7 @@ from coding_agent.command import (
     LocalCommandRunner,
     VerificationCommandSpec,
     decode_command_output,
+    executable_sha256,
 )
 from coding_agent.models import ToolCall, ToolExecution, VerificationKind, VerificationSignal
 from coding_agent.tools.base import ToolRegistry
@@ -43,6 +46,16 @@ class RecordingRunner:
     def run(self, request: CommandRequest) -> CommandResult:
         self.requests.append(request)
         return self.result
+
+
+class RecordingApprover:
+    def __init__(self, decision: bool) -> None:
+        self.decision = decision
+        self.requests: list[CommandApprovalRequest] = []
+
+    def approve(self, request: CommandApprovalRequest) -> bool:
+        self.requests.append(request)
+        return self.decision
 
 
 class InterruptingProcess:
@@ -123,6 +136,7 @@ def _execute(
     runner: RecordingRunner | LocalCommandRunner,
     permission_mode: CommandPermissionMode = CommandPermissionMode.SAFE,
     verification_commands: tuple[VerificationCommandSpec, ...] = (),
+    approver: CommandApprover | None = None,
     max_output_chars: int = 16_000,
 ) -> ToolExecution:
     tool = RunCommandTool(
@@ -132,6 +146,7 @@ def _execute(
             permission_mode,
             verification_commands=verification_commands,
         ),
+        approver=approver,
         max_output_chars=max_output_chars,
     )
     return ToolRegistry([tool]).execute(
@@ -248,6 +263,51 @@ def test_unregistered_commands_never_receive_trusted_or_read_only_status(
     assert classification.verification_kind is None
 
 
+def test_safe_policy_accepts_only_a_host_owned_one_call_approval() -> None:
+    policy = CommandPolicy()
+
+    approved = policy.classify(["git", "status"], approved=True)
+
+    assert approved.command_class is CommandClass.GENERAL
+    with pytest.raises(command_module.CommandError) as raised:
+        policy.classify(["git", "status"])
+    assert raised.value.code == "command_approval_required"
+
+
+def test_interactive_approval_runs_the_exact_general_command(repository: Path) -> None:
+    runner = RecordingRunner(_result())
+    approver = RecordingApprover(True)
+
+    execution = _execute(
+        repository,
+        {"argv": ["git", "status"], "cwd": "src"},
+        runner=runner,
+        approver=approver,
+    )
+
+    assert execution.ok is True
+    assert execution.control.invalidates_verification is True
+    assert approver.requests == [CommandApprovalRequest(argv=("git", "status"), cwd="src")]
+    assert runner.requests[0].argv == ("git", "status")
+
+
+def test_denied_general_command_never_reaches_the_runner(repository: Path) -> None:
+    runner = RecordingRunner(_result())
+    approver = RecordingApprover(False)
+
+    execution = _execute(
+        repository,
+        {"argv": ["git", "status"]},
+        runner=runner,
+        approver=approver,
+    )
+
+    assert execution.ok is False
+    assert execution.error_code == "command_denied"
+    assert approver.requests == [CommandApprovalRequest(argv=("git", "status"), cwd=".")]
+    assert runner.requests == []
+
+
 def test_verification_capability_binds_working_directory_and_exact_arguments() -> None:
     spec = _trusted_spec(["pytest", "-q"], VerificationKind.TEST, "pytest")
     policy = CommandPolicy(
@@ -298,6 +358,30 @@ def test_workspace_owned_executable_cannot_issue_verification(repository: Path) 
 
     assert classification.command_class is CommandClass.GENERAL
     assert classification.verification_kind is None
+
+
+def test_hash_bound_workspace_verifier_is_valid_only_while_unchanged(repository: Path) -> None:
+    executable = repository / ("pytest.exe" if os.name == "nt" else "pytest")
+    executable.write_bytes(b"trusted launcher")
+    spec = VerificationCommandSpec(
+        argv=(str(executable), "-q"),
+        cwd=".",
+        kind=VerificationKind.TEST,
+        label="workspace pytest",
+        workspace_executable_sha256=executable_sha256(executable),
+    )
+    policy = CommandPolicy(
+        CommandPermissionMode.AUTO,
+        verification_commands=(spec,),
+    )
+
+    assert (
+        policy.classify(spec.argv, workspace_root=repository).command_class is CommandClass.VERIFIER
+    )
+
+    executable.write_bytes(b"rewritten launcher")
+    classification = policy.classify(spec.argv, workspace_root=repository)
+    assert classification.command_class is CommandClass.GENERAL
 
 
 def test_verification_capability_requires_an_absolute_executable() -> None:
@@ -550,6 +634,12 @@ def test_command_control_facts_come_from_policy_and_exit_status(
     )
 
     assert execution.ok is True
+    expected_profile = (
+        CommandEnvironmentProfile.VERIFIER
+        if verification is not None
+        else CommandEnvironmentProfile.SANITIZED
+    )
+    assert runner.requests[0].environment_profile is expected_profile
     assert execution.control.verification is verification
     assert execution.control.invalidates_verification is invalidates
     if verification is None:
@@ -665,10 +755,14 @@ def test_local_runner_uses_direct_argv_and_combines_stdout_and_stderr(repository
 def test_local_runner_strips_secret_environment_variables(repository: Path) -> None:
     environment = dict(os.environ)
     environment["OPENAI_API_KEY"] = "must-not-reach-child"
+    environment["PGPASSWORD"] = "must-not-reach-child"
+    environment["PGPASSFILE"] = "must-not-reach-child"
     environment["ORDINARY_SETTING"] = "visible"
     script = (
         "import os; "
         "print(os.getenv('OPENAI_API_KEY', 'missing')); "
+        "print(os.getenv('PGPASSWORD', 'missing')); "
+        "print(os.getenv('PGPASSFILE', 'missing')); "
         "print(os.getenv('ORDINARY_SETTING', 'missing'))"
     )
 
@@ -681,7 +775,36 @@ def test_local_runner_strips_secret_environment_variables(repository: Path) -> N
     )
 
     assert result.status is CommandStatus.EXITED
-    assert result.output.decode("utf-8").splitlines() == ["missing", "visible"]
+    assert result.output.decode("utf-8").splitlines() == [
+        "missing",
+        "missing",
+        "missing",
+        "visible",
+    ]
+
+
+def test_verifier_environment_cannot_turn_pytest_into_collection_only(
+    repository: Path,
+) -> None:
+    repository.joinpath("test_failure.py").write_text(
+        "def test_failure():\n    assert False\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PYTEST_ADDOPTS"] = "--collect-only"
+
+    result = LocalCommandRunner(environment=environment).run(
+        CommandRequest(
+            argv=(sys.executable, "-I", "-m", "pytest", "-q"),
+            cwd=repository,
+            timeout_seconds=10,
+            environment_profile=CommandEnvironmentProfile.VERIFIER,
+        )
+    )
+
+    assert result.status is CommandStatus.EXITED
+    assert result.exit_code == 1
+    assert "FAILED" in result.output.decode("utf-8")
 
 
 def test_local_runner_bounds_raw_output_with_a_head_tail_capture(repository: Path) -> None:
@@ -962,6 +1085,8 @@ def test_environment_sanitizer_removes_prompts_and_secret_markers() -> None:
             "DATABASE_PASSWORD": "hidden",
             "SERVICE_TOKEN": "hidden",
             "PYTHONPATH": "untrusted-module-path",
+            "PGPASSWORD": "hidden",
+            "PGPASSFILE": "hidden",
             "TOKENIZERS_PARALLELISM": "visible",
         }
     )
@@ -971,8 +1096,30 @@ def test_environment_sanitizer_removes_prompts_and_secret_markers() -> None:
     assert "DATABASE_PASSWORD" not in sanitized
     assert "SERVICE_TOKEN" not in sanitized
     assert "PYTHONPATH" not in sanitized
+    assert "PGPASSWORD" not in sanitized
+    assert "PGPASSFILE" not in sanitized
     assert sanitized["TOKENIZERS_PARALLELISM"] == "visible"
     assert sanitized["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_verifier_environment_uses_a_small_allowlist() -> None:
+    environment = command_module._verification_environment(
+        {
+            "PATH": "visible",
+            "TEMP": "visible",
+            "ORDINARY_SETTING": "hidden",
+            "PYTEST_ADDOPTS": "--collect-only",
+            "PYTEST_PLUGINS": "untrusted_plugin",
+            "PGPASSWORD": "hidden",
+        }
+    )
+
+    assert environment["PATH"] == "visible"
+    assert environment["TEMP"] == "visible"
+    assert "ORDINARY_SETTING" not in environment
+    assert "PYTEST_ADDOPTS" not in environment
+    assert "PYTEST_PLUGINS" not in environment
+    assert "PGPASSWORD" not in environment
 
 
 def test_command_classification_and_result_reject_incoherent_shapes() -> None:
@@ -1045,6 +1192,13 @@ def test_runner_configuration_rejects_unbounded_or_invalid_limits() -> None:
         LocalCommandRunner(max_output_bytes=1)
     with pytest.raises(ValueError, match="termination_grace_seconds"):
         LocalCommandRunner(termination_grace_seconds=0)
+    with pytest.raises(ValueError, match="host-owned"):
+        CommandRequest(
+            argv=("tool",),
+            cwd=Path.cwd(),
+            timeout_seconds=1,
+            environment_profile=cast(CommandEnvironmentProfile, "verifier"),
+        )
 
 
 def test_command_tool_rejects_an_output_budget_too_small_for_safe_headers(

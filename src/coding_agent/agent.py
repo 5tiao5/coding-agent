@@ -17,6 +17,7 @@ from coding_agent.models import (
     ToolCall,
     ToolExecution,
 )
+from coding_agent.run_id import require_run_id
 from coding_agent.session import (
     LoadedSession,
     SessionBoundary,
@@ -32,6 +33,10 @@ DEFAULT_SYSTEM_PROMPT = """You are a coding agent. Use the available local tools
 Keep plans and action summaries explicit, but never provide hidden reasoning or chain of thought.
 After changing files, run a recognized test, build, or check before giving a concise final answer.
 Runtime evidence, not your textual claim, determines whether the result is verified."""
+
+_PRESENTATION_PREVIEW_TOOLS = frozenset(
+    {"replace_text", "undo_change", "update_plan", "write_file"}
+)
 
 _ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
     AgentState.CREATED: {AgentState.PLANNING},
@@ -80,8 +85,22 @@ class AgentRunner:
         self._context = context_manager or ContextManager(max_chars=80_000)
         self._session_store = session_store
 
-    def run(self, task: str, *, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> AgentResult:
-        return self._run(task, system_prompt=system_prompt, resumed=None)
+    def run(
+        self,
+        task: str,
+        *,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        run_id: str | None = None,
+    ) -> AgentResult:
+        """Start a run, optionally using a host-owned ID acquired under an external lease."""
+
+        selected_run_id = uuid4().hex if run_id is None else require_run_id(run_id)
+        return self._run(
+            task,
+            system_prompt=system_prompt,
+            resumed=None,
+            run_id=selected_run_id,
+        )
 
     def resume(self, loaded: LoadedSession) -> AgentResult:
         """Continue one passive ready-for-model checkpoint without replaying tools."""
@@ -93,6 +112,7 @@ class AgentRunner:
             checkpoint.task,
             system_prompt=checkpoint.system_prompt,
             resumed=loaded,
+            run_id=checkpoint.run_id,
         )
 
     def _run(
@@ -101,12 +121,12 @@ class AgentRunner:
         *,
         system_prompt: str,
         resumed: LoadedSession | None,
+        run_id: str,
     ) -> AgentResult:
         if not task.strip():
             raise ValueError("task cannot be empty")
 
         if resumed is None:
-            run_id = uuid4().hex
             state = AgentState.CREATED
             messages: list[ChatMessage] = [
                 ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
@@ -123,9 +143,19 @@ class AgentRunner:
             state = self._transition(run_id, state, AgentState.PLANNING)
             total_tool_calls = 0
             first_step = 1
+            # The initial system/user transcript is already a stable boundary. Saving
+            # it makes a first-request provider failure resumable without replaying any
+            # side effect.
+            self._save_checkpoint(
+                run_id,
+                task,
+                system_prompt,
+                messages,
+                SessionBoundary.READY_FOR_MODEL,
+                0,
+            )
         else:
             checkpoint = resumed.checkpoint
-            run_id = checkpoint.run_id
             state = AgentState.OBSERVING
             messages = list(checkpoint.messages)
             total_tool_calls = checkpoint.completed_tool_calls
@@ -144,6 +174,12 @@ class AgentRunner:
             )
         verification = VerificationLedger()
         repetition = RepeatedToolCallGuard(max_identical=self._max_repeated_tool_results)
+        seen_tool_call_ids = {
+            call.id
+            for message in messages
+            if message.role is MessageRole.ASSISTANT
+            for call in message.tool_calls
+        }
 
         for step in range(first_step, self._max_steps + 1):
             state = self._transition(run_id, state, AgentState.ACTING, step)
@@ -210,6 +246,26 @@ class AgentRunner:
             )
 
             if response.tool_calls:
+                response_call_ids = [call.id for call in response.tool_calls]
+                duplicate_call_id = len(response_call_ids) != len(set(response_call_ids)) or any(
+                    call_id in seen_tool_call_ids for call_id in response_call_ids
+                )
+                if duplicate_call_id:
+                    _append_cancelled_tool_results(
+                        messages,
+                        response.tool_calls,
+                        error_code="tool_batch_rejected",
+                        error_message="tool call IDs must be unique across the run",
+                    )
+                    return self._failure(
+                        run_id,
+                        state,
+                        StopReason.MODEL_ERROR,
+                        step,
+                        messages,
+                        "Model returned a duplicate tool call ID",
+                    )
+                seen_tool_call_ids.update(response_call_ids)
                 requested_calls = len(response.tool_calls)
                 if requested_calls > self._max_tool_calls_per_step:
                     _append_cancelled_tool_results(
@@ -278,21 +334,32 @@ class AgentRunner:
                             tool_name=call.name,
                         )
                     )
+                    event_data: dict[str, object] = {
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "ok": execution.ok,
+                        "error_code": execution.error_code,
+                        "duration_ms": execution.duration_ms,
+                        "output_chars": len(execution.output or ""),
+                        "truncated": execution.truncated,
+                        "summary": execution.summary,
+                    }
+                    if execution.metadata:
+                        event_data["metadata"] = dict(execution.metadata)
+                    if (
+                        execution.ok
+                        and execution.output is not None
+                        and call.name in _PRESENTATION_PREVIEW_TOOLS
+                    ):
+                        # Only explicit plans and bounded mutation diffs are presentation-safe.
+                        # Read/search/command output stays in the private canonical transcript.
+                        event_data["preview"] = execution.output
                     self._emit(
                         run_id,
                         EventKind.TOOL_FINISHED,
                         f"Tool {'succeeded' if execution.ok else 'failed'}: {call.name}",
                         step,
-                        {
-                            "call_id": call.id,
-                            "tool_name": call.name,
-                            "ok": execution.ok,
-                            "error_code": execution.error_code,
-                            "duration_ms": execution.duration_ms,
-                            "output_chars": len(execution.output or ""),
-                            "truncated": execution.truncated,
-                            "summary": execution.summary,
-                        },
+                        event_data,
                     )
                     self._record_control_facts(run_id, execution, verification, step)
                     if execution.control.terminal_stop:
@@ -357,6 +424,18 @@ class AgentRunner:
                 else AgentState.COMPLETED_UNVERIFIED
             )
             state = self._transition(run_id, state, terminal_state, step)
+            self._save_checkpoint(
+                run_id,
+                task,
+                system_prompt,
+                messages,
+                SessionBoundary.TERMINAL,
+                step,
+                stop_reason=StopReason.FINAL_RESPONSE,
+            )
+            # Keep the terminal event truly terminal. Renderers can now print one final
+            # card without a later checkpoint event appearing beneath it or restarting
+            # a live display.
             self._emit(
                 run_id,
                 EventKind.RUN_FINISHED,
@@ -367,15 +446,6 @@ class AgentRunner:
                 ),
                 step,
                 verification_report.event_data(),
-            )
-            self._save_checkpoint(
-                run_id,
-                task,
-                system_prompt,
-                messages,
-                SessionBoundary.TERMINAL,
-                step,
-                stop_reason=StopReason.FINAL_RESPONSE,
             )
             return AgentResult(
                 run_id=run_id,
@@ -411,6 +481,7 @@ class AgentRunner:
         try:
             checkpoint = SessionCheckpoint(
                 run_id=run_id,
+                workspace_fingerprint=self._session_store.workspace_fingerprint,
                 task=task,
                 system_prompt=system_prompt,
                 messages=tuple(messages),
