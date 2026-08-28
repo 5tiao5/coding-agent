@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
@@ -45,6 +46,8 @@ def _temporary_files(root: Path) -> list[Path]:
 
 
 def _windows_file_attributes(path: Path) -> int:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows file attributes are unavailable on this platform")
     import ctypes
     from ctypes import wintypes
 
@@ -58,6 +61,8 @@ def _windows_file_attributes(path: Path) -> int:
 
 
 def _set_windows_file_attributes(path: Path, attributes: int) -> None:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows file attributes are unavailable on this platform")
     import ctypes
     from ctypes import wintypes
 
@@ -69,6 +74,8 @@ def _set_windows_file_attributes(path: Path, attributes: int) -> None:
 
 
 def _windows_dacl(path: Path) -> bytes:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows DACLs are unavailable on this platform")
     import ctypes
     from ctypes import wintypes
 

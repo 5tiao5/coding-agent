@@ -10,6 +10,7 @@ import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -55,7 +56,11 @@ def start_contained_process(
     environment: Mapping[str, str],
 ) -> tuple[subprocess.Popen[bytes], ProcessContainment]:
     """Start a process only after an OS process-tree capability is established."""
-    if os.name == "posix":  # pragma: no cover - exercised by POSIX CI.
+    if sys.platform != "win32":  # pragma: no cover - exercised by POSIX CI.
+        if os.name != "posix":
+            raise ProcessControlError(
+                "command process containment is unavailable on this operating system"
+            )
         process = subprocess.Popen(
             argv,
             cwd=cwd,

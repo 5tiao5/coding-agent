@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -75,7 +76,7 @@ def commit_bytes(
 
 def opened_file_path(descriptor: int) -> Path | None:
     """Return the physical path bound to an open descriptor when the OS exposes it."""
-    if os.name != "nt":  # pragma: no cover - POSIX safety comes from openat anchoring.
+    if sys.platform != "win32" or os.name != "nt":  # pragma: no cover - POSIX path.
         return None
 
     import ctypes
@@ -106,7 +107,7 @@ def opened_file_path(descriptor: int) -> Path | None:
 
 def require_no_named_streams(path: Path, display_path: str) -> None:
     """Reject NTFS streams that the byte-only journal cannot faithfully restore."""
-    if os.name != "nt":  # pragma: no cover - Windows-specific filesystem metadata.
+    if sys.platform != "win32" or os.name != "nt":  # pragma: no cover - POSIX path.
         return
 
     import ctypes
@@ -162,7 +163,7 @@ def require_no_named_streams(path: Path, display_path: str) -> None:
 
 def invoke_replace_file(target: Path, replacement: Path, backup: Path) -> int | None:
     """Return None on success or the native ReplaceFileW error code on failure."""
-    if os.name != "nt":  # pragma: no cover - only called by the Windows commit path.
+    if sys.platform != "win32" or os.name != "nt":  # pragma: no cover - POSIX path.
         raise WorkspaceError("unsupported_platform", "ReplaceFileW requires Windows")
 
     import ctypes
@@ -219,7 +220,7 @@ def _replace_file(
     invoke_replace_file: InvokeReplaceFile,
 ) -> bool:
     """Replace a Windows file and recover the documented partial-failure state."""
-    if os.name != "nt":  # pragma: no cover - only called by the Windows commit path.
+    if sys.platform != "win32" or os.name != "nt":  # pragma: no cover - POSIX path.
         raise WorkspaceError("unsupported_platform", "ReplaceFileW requires Windows")
 
     error = invoke_replace_file(target, replacement, backup)
