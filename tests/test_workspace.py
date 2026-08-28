@@ -50,6 +50,8 @@ def workspace_root(tmp_path: Path) -> Path:
         r"\\?\C:\secret",
         "bad\x00path",
         "line\nbreak",
+        "bidi\u202efile",
+        "separator\u2028file",
         "file.txt:stream",
         "CON",
         "CONIN$",
@@ -137,12 +139,28 @@ def test_nested_gitignore_overrides_parent_rules(workspace_root: Path) -> None:
     _write(workspace_root / "nested" / "keep.tmp")
     workspace = Workspace(workspace_root)
 
-    entries = workspace.children(workspace.resolve("nested", expected="directory"))
+    entries = workspace.children(workspace.resolve("nested", expected="directory")).entries
 
     assert [entry.relative for entry in entries] == [
         "nested/.gitignore",
         "nested/keep.tmp",
     ]
+
+
+def test_ignored_parent_cannot_be_reincluded_by_its_nested_gitignore(tmp_path: Path) -> None:
+    root = tmp_path / "ignored-parent"
+    root.mkdir()
+    _write(root / ".gitignore", "hidden/\n")
+    _write(root / "hidden" / ".gitignore", "!secret.txt\n")
+    _write(root / "hidden" / "secret.txt", "must remain ignored")
+    workspace = Workspace(root)
+
+    with pytest.raises(WorkspaceError) as captured:
+        workspace.resolve("hidden/secret.txt", expected="file")
+
+    assert captured.value.code == "path_ignored"
+    entries = workspace.children(workspace.resolve(".", expected="directory")).entries
+    assert "hidden" not in [entry.relative for entry in entries]
 
 
 def test_gitignore_cache_refreshes_when_rules_change(workspace_root: Path) -> None:
@@ -227,7 +245,7 @@ def test_children_are_sorted_filtered_and_never_expose_absolute_names(
 ) -> None:
     workspace = Workspace(workspace_root)
 
-    entries = workspace.children(workspace.resolve(".", expected="directory"))
+    entries = workspace.children(workspace.resolve(".", expected="directory")).entries
 
     assert [entry.relative for entry in entries] == [
         ".env.example",
@@ -281,7 +299,7 @@ def test_children_accepts_a_case_alias_that_resolves_to_the_same_directory(
     workspace = Workspace(workspace_root)
     aliased = workspace.resolve("SRC", expected="directory")
 
-    entries = workspace.children(aliased)
+    entries = workspace.children(aliased).entries
 
     assert [entry.relative for entry in entries] == ["SRC/南京.py"]
 
@@ -399,9 +417,112 @@ def test_directory_symlinks_are_not_traversed_even_when_target_is_internal(
         pytest.skip("symbolic links are unavailable on this platform")
 
     workspace = Workspace(workspace_root)
-    root_entries = workspace.children(workspace.resolve(".", expected="directory"))
+    root_entries = workspace.children(workspace.resolve(".", expected="directory")).entries
 
     assert "src-link" not in [entry.relative for entry in root_entries]
     with pytest.raises(WorkspaceError) as captured:
         workspace.resolve("src-link", expected="directory")
     assert captured.value.code == "invalid_path"
+
+
+def test_directory_scan_has_a_deterministic_hard_entry_limit(workspace_root: Path) -> None:
+    _write(workspace_root / "a.py")
+    _write(workspace_root / "b.py")
+    _write(workspace_root / "c.py")
+    workspace = Workspace(workspace_root)
+
+    scan = workspace.children(workspace.resolve(".", expected="directory"), max_entries=2)
+
+    assert [entry.relative for entry in scan.entries] == [".env.example", ".gitignore"]
+    assert scan.examined >= 2
+    assert scan.truncated is True
+
+
+def test_directory_scan_rejects_a_non_positive_limit(workspace_root: Path) -> None:
+    workspace = Workspace(workspace_root)
+
+    with pytest.raises(ValueError, match="max_entries must be at least 1"):
+        workspace.children(workspace.resolve(".", expected="directory"), max_entries=0)
+
+    with pytest.raises(ValueError, match="max_examined must be between"):
+        workspace.children(workspace.resolve(".", expected="directory"), max_examined=0)
+
+
+def test_directory_scan_counts_ignored_raw_entries_against_its_budget(tmp_path: Path) -> None:
+    root = tmp_path / "raw-budget"
+    root.mkdir()
+    _write(root / ".gitignore", "*.tmp\n")
+    for index in range(20):
+        _write(root / f"{index:02}.tmp")
+    workspace = Workspace(root)
+
+    scan = workspace.children(
+        workspace.resolve(".", expected="directory"),
+        max_entries=20,
+        max_examined=4,
+    )
+
+    assert scan.examined == 4
+    assert scan.truncated is True
+    assert [entry.relative for entry in scan.entries] == [".gitignore"]
+
+
+def test_workspace_reads_authorized_files_through_a_bounded_handle(workspace_root: Path) -> None:
+    workspace = Workspace(workspace_root)
+    target = workspace.resolve("src/南京.py", expected="file")
+
+    assert workspace.read_bytes(target, max_bytes=100) == b"content"
+
+    with pytest.raises(WorkspaceError) as captured:
+        workspace.read_bytes(target, max_bytes=3)
+    assert captured.value.code == "file_too_large"
+
+
+def test_workspace_rejects_a_file_swapped_to_an_outside_symlink(
+    workspace_root: Path,
+    tmp_path: Path,
+) -> None:
+    victim = workspace_root / "victim.txt"
+    outside = tmp_path / "outside-secret.txt"
+    _write(victim, "safe")
+    _write(outside, "OUTSIDE_SECRET")
+    workspace = Workspace(workspace_root)
+    authorized = workspace.resolve("victim.txt", expected="file")
+    victim.unlink()
+    try:
+        victim.symlink_to(outside)
+    except OSError:
+        pytest.skip("symbolic links are unavailable on this platform")
+
+    with pytest.raises(WorkspaceError) as captured:
+        workspace.read_bytes(authorized, max_bytes=100)
+
+    assert captured.value.code in {"invalid_path", "path_outside_workspace"}
+    assert "OUTSIDE_SECRET" not in captured.value.message
+
+
+def test_workspace_rejects_hardlinked_sensitive_content(workspace_root: Path) -> None:
+    public_alias = workspace_root / "public.txt"
+    try:
+        os.link(workspace_root / ".env", public_alias)
+    except OSError:
+        pytest.skip("hard links are unavailable on this platform")
+    workspace = Workspace(workspace_root)
+    target = workspace.resolve("public.txt", expected="file")
+
+    with pytest.raises(WorkspaceError) as captured:
+        workspace.read_bytes(target, max_bytes=100)
+
+    assert captured.value.code == "unsafe_file_link"
+    assert "TOKEN=secret" not in captured.value.message
+
+
+def test_oversized_gitignore_is_rejected_before_parsing(tmp_path: Path) -> None:
+    root = tmp_path / "oversized-ignore"
+    root.mkdir()
+    (root / ".gitignore").write_bytes(b"a" * 256_001)
+
+    with pytest.raises(WorkspaceError) as captured:
+        Workspace(root)
+
+    assert captured.value.code == "invalid_workspace"
