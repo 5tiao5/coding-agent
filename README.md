@@ -1,5 +1,7 @@
 # Coding Agent
 
+[![CI](https://github.com/5tiao5/coding-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/5tiao5/coding-agent/actions/workflows/ci.yml)
+
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
 The project is at **M4 (real model CLI, safe approval, durable traces, and demo UX)**. Its offline demo tells one complete repair story:
