@@ -1,6 +1,8 @@
 # Coding Agent 项目计划
 
-> 版本：v0.2 · 2026-08-28 · 截止：2026-09-02 24:00（北京时间）
+> 版本：v0.3 · 2026-08-28 · 截止：2026-09-02 24:00（北京时间）
+
+> 当前进度：M3 运行控制内核已实现；M4 的交互式 CLI、权限确认 UX、事件轨迹与界面打磨尚未开始。
 
 ## 1. 目标
 
@@ -21,7 +23,7 @@
 ### P0：核心闭环
 
 - 单次任务与交互式 CLI。
-- OpenAI-compatible 模型适配器，以及用于测试的 `FakeModel`。
+- OpenAI-compatible 模型适配器，以及用于测试的 `ScriptedModel`。
 - 工具：`list_files`、`read_file`、`search_text`、`write_file`、`replace_text`、`run_command`。
 - 手写模型—工具—观察循环；工具失败作为结构化观察返回模型。
 - 定义稳定的 `RunEvent` 事件模型和最小文本渲染器；状态变化、工具调用和验证结果从第一天即可观察。
@@ -33,8 +35,8 @@
 - 事件驱动的 Rich 终端界面：流式反馈、计划状态、工具时间线、折叠输出、Diff 和最终验证卡片。
 - 结构化任务计划：维护待办、进行中和已完成状态，但不记录模型隐式思维过程。
 - Verification Gate：最后一次写操作之后没有成功测试、构建或检查证据时，只能报告“完成但未验证”。
-- `safe` / `auto` 两档权限模式；危险操作始终拒绝或确认。
-- 会话持久化与恢复。
+- `safe` / `auto` 两档策略内核；交互确认与 CLI 模式选择在 M4 接入。
+- 被动 transcript checkpoint/load/resume 内核；CLI 入口和工具局部状态恢复待完成。
 - 写文件前生成 Diff，并支持本次会话内撤销。
 - JSONL 事件轨迹与 `inspect <run-id>`：记录工具调用、结果、耗时、错误和停止原因；不记录模型隐式思维过程。
 - 自动评测：单文件修复、跨文件修改、新增功能、间接故障调试四类任务，统计成功率、步数、耗时和工具错误。
@@ -60,14 +62,14 @@ CLI
      ├─ ToolRegistry（校验与执行）
      │   ├─ File/Search Tools
      │   └─ Command Tool
-     ├─ Policy（路径、权限、资源限制）
+     ├─ Policy（路径、命令能力、资源限制）
      ├─ SessionStore（保存与恢复）
-     └─ EventBus
-         ├─ RichRenderer（用户视图）
-         └─ EventRecorder（轨迹与指标）
+     └─ EventSink
+         ├─ ConsoleEventSink（当前最小用户视图）
+         └─ EventRecorder（M4：轨迹与指标）
 ```
 
-内部边界采用少量稳定接口：`ModelAdapter.complete()`、`Tool.execute()`、`Policy.authorize()`、`EventSink.emit()`。事件轨迹是事实记录，上下文是从事实中选择出的模型视图，两者分离。
+内部边界采用少量稳定接口：`ModelAdapter.complete()`、`ToolDispatcher.execute()`、`CommandPolicy.classify()`、`EventSink.emit()`。事件轨迹是事实记录，上下文是从事实中选择出的模型视图，两者分离。
 
 ```text
 CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
@@ -90,9 +92,10 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 
 | 依赖 | 用途 | 不由它负责的内容 |
 |---|---|---|
-| `openai` | 原始模型请求与原生 tool calling 传输 | 自动工具执行、托管工具、重试决策、上下文 |
+| `openai`（M4 计划） | 原始模型请求与原生 tool calling 传输 | 自动工具执行、托管工具、重试决策、上下文 |
 | `pydantic` | 配置、工具参数和事件校验 | 工具调度与业务规则 |
-| `typer`、`rich`、`prompt-toolkit` | CLI、流式展示、输入行历史 | Agent 状态机与对话历史 |
+| `typer`、`rich` | 当前 CLI 与事件渲染 | Agent 状态机与对话历史 |
+| `prompt-toolkit`（M4 计划） | 交互输入与历史 | Agent 循环与权限决策 |
 | `pathspec` | 尊重 `.gitignore` | 工作区安全边界 |
 | `psutil` | 枚举和终止进程树 | 命令启动、授权、超时与错误语义 |
 | `pytest` | 单元、集成与评测测试 | 运行时逻辑 |
@@ -101,15 +104,15 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 
 ## 7. 里程碑与提交
 
-| 日期 | 里程碑 | 主要验收 |
-|---|---|---|
-| 8/27 | 需求与设计 | 合规审查、架构、范围和验收标准落档 |
-| 8/28 | 骨架与核心循环 | 项目可运行；`FakeModel`、`RunEvent` 驱动离线多轮工具调用 |
-| 8/29 | 工具与安全 | Agent 在 fixture 中定位 Bug、修改代码并修复失败测试 |
-| 8/30 | 上下文与验证 | 计划、压缩、停止、恢复和 Verification Gate 测试通过 |
-| 8/31 | Demo UX 与轨迹 | 时间线、Diff、撤销、`inspect` 和验证卡片可完整演示 |
-| 9/1 | 评测与冻结 | 四类任务评测；干净环境复验；视频彩排；晚间冻结功能 |
-| 9/2 | 最终交付 | 安全检查、录制视频、整理材料并在截止前完成最终推送 |
+| 日期 | 里程碑 | 状态 | 主要验收 |
+|---|---|---|---|
+| 8/27 | M0 需求与设计 | 完成 | 合规审查、架构、范围和验收标准落档 |
+| 8/28 | M1 骨架与核心循环 | 完成 | `ScriptedModel`、`RunEvent` 驱动离线多轮工具调用 |
+| 8/29 | M2 工具与安全 | 完成 | Agent 在 fixture 中定位 Bug、原子修改并支持撤销 |
+| 8/30 | M3 上下文与验证 | 完成 | 命令、计划、压缩、停止、被动恢复和 Verification Gate 测试通过 |
+| 8/31 | M4 Demo UX 与轨迹 | 待开始 | 时间线、Diff、撤销、`inspect` 和验证卡片可完整演示 |
+| 9/1 | M5 评测与冻结 | 待开始 | 四类任务评测；干净环境复验；视频彩排；晚间冻结功能 |
+| 9/2 | 最终交付 | 待开始 | 安全检查、录制视频、整理材料并在截止前完成最终推送 |
 
 按可解释的功能单元小步提交并保留历史，不 squash、不改写已推送提交；截止后不再 push，包括文档修正和 tag。
 

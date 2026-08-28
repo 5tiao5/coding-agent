@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,16 +13,20 @@ from rich.panel import Panel
 
 from coding_agent import __version__
 from coding_agent.agent import AgentRunner
+from coding_agent.command import CommandPolicy, VerificationCommandSpec
 from coding_agent.model import ScriptedModel
-from coding_agent.models import ModelResponse, ToolCall
+from coding_agent.models import ModelResponse, ToolCall, VerificationKind
 from coding_agent.mutation import MutationSession
+from coding_agent.plan import PlanState
 from coding_agent.tools import (
     ListFilesTool,
     ReadFileTool,
     ReplaceTextTool,
+    RunCommandTool,
     SearchTextTool,
     ToolRegistry,
     UndoChangeTool,
+    UpdatePlanTool,
     WriteFileTool,
 )
 from coding_agent.ui import ConsoleEventSink, console_safe
@@ -44,6 +49,7 @@ _DEMO_SOURCE_AFTER = (
     b"    discounted = subtotal - discount\n"
     b"    return discounted\n"
 )
+_DEMO_VERIFICATION_ARGV = (sys.executable, "-I", "-m", "pytest", "-q")
 
 
 def _version_callback(value: bool) -> None:
@@ -68,43 +74,143 @@ def main(
 
 @app.command()
 def demo() -> None:
-    """Run a deterministic offline read-edit-verify loop against a temporary repository."""
+    """Run a deterministic failing-test, repair, and verified-test repository loop."""
     with TemporaryDirectory(prefix="coding-agent-demo-") as temporary_directory:
         demo_root = Path(temporary_directory)
         _write_demo_project(demo_root)
         workspace = Workspace(demo_root)
         mutation_session = MutationSession(workspace)
+        plan_state = PlanState()
         model = _repository_demo_model()
         tools = ToolRegistry(
             [
                 ListFilesTool(workspace),
                 ReadFileTool(workspace),
                 SearchTextTool(workspace),
+                RunCommandTool(
+                    workspace,
+                    policy=CommandPolicy(
+                        verification_commands=(
+                            VerificationCommandSpec(
+                                argv=_DEMO_VERIFICATION_ARGV,
+                                cwd=".",
+                                kind=VerificationKind.TEST,
+                                label="demo pytest",
+                            ),
+                        )
+                    ),
+                ),
                 WriteFileTool(mutation_session),
                 ReplaceTextTool(mutation_session),
                 UndoChangeTool(mutation_session),
+                UpdatePlanTool(plan_state),
             ]
         )
-        runner = AgentRunner(model, tools, event_sink=ConsoleEventSink(console), max_steps=7)
+        runner = AgentRunner(model, tools, event_sink=ConsoleEventSink(console), max_steps=12)
         result = runner.run(
-            "Inspect this repository, fix the duplicate discount in calculate_total, "
-            "and read the file again to verify the edit."
+            "Reproduce the failing pricing test, locate and fix the duplicate discount, "
+            "then rerun the test suite and report only current verification evidence."
         )
-        demo_verified = demo_root.joinpath("src/pricing.py").read_bytes() == _DEMO_SOURCE_AFTER
+        demo_verified = (
+            result.state.value == "completed"
+            and demo_root.joinpath("src/pricing.py").read_bytes() == _DEMO_SOURCE_AFTER
+        )
 
     if result.final_text:
         final_text = console_safe(result.final_text, console)
-        title = "Repair report · post-read confirmed" if demo_verified else "Repair report"
+        title = "VERIFIED repair report" if demo_verified else "UNVERIFIED repair report"
         console.print(Panel.fit(final_text, title=title, border_style="green"))
     if result.error:
         error = console_safe(result.error, console)
         console.print(Panel.fit(error, title="Failed", border_style="red"))
+        raise typer.Exit(code=1)
+    if not demo_verified:
         raise typer.Exit(code=1)
 
 
 def _repository_demo_model() -> ScriptedModel:
     return ScriptedModel(
         [
+            ModelResponse(
+                content="I will expose a short observable plan before acting.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-plan-1",
+                        name="update_plan",
+                        arguments={
+                            "items": [
+                                {
+                                    "id": "reproduce",
+                                    "step": "Run the failing pricing test",
+                                    "status": "in_progress",
+                                },
+                                {
+                                    "id": "locate",
+                                    "step": "Locate the duplicate-discount defect",
+                                    "status": "pending",
+                                },
+                                {
+                                    "id": "repair",
+                                    "step": "Apply one revision-checked edit",
+                                    "status": "pending",
+                                },
+                                {
+                                    "id": "verify",
+                                    "step": "Rerun the pricing test suite",
+                                    "status": "pending",
+                                },
+                            ]
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="I will reproduce the defect before reading implementation details.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-test-fail",
+                        name="run_command",
+                        arguments={
+                            "argv": list(_DEMO_VERIFICATION_ARGV),
+                            "cwd": ".",
+                            "timeout_seconds": 30,
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="The test fails as expected; I will now locate the implementation.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-plan-2",
+                        name="update_plan",
+                        arguments={
+                            "items": [
+                                {
+                                    "id": "reproduce",
+                                    "step": "Run the failing pricing test",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "locate",
+                                    "step": "Locate the duplicate-discount defect",
+                                    "status": "in_progress",
+                                },
+                                {
+                                    "id": "repair",
+                                    "step": "Apply one revision-checked edit",
+                                    "status": "pending",
+                                },
+                                {
+                                    "id": "verify",
+                                    "step": "Rerun the pricing test suite",
+                                    "status": "pending",
+                                },
+                            ]
+                        },
+                    ),
+                ),
+            ),
             ModelResponse(
                 content="I will map the repository before choosing a file.",
                 tool_calls=(
@@ -139,6 +245,39 @@ def _repository_demo_model() -> ScriptedModel:
                 content="The second subtraction is the defect; I will apply one exact edit.",
                 tool_calls=(
                     ToolCall(
+                        id="demo-plan-3",
+                        name="update_plan",
+                        arguments={
+                            "items": [
+                                {
+                                    "id": "reproduce",
+                                    "step": "Run the failing pricing test",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "locate",
+                                    "step": "Locate the duplicate-discount defect",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "repair",
+                                    "step": "Apply one revision-checked edit",
+                                    "status": "in_progress",
+                                },
+                                {
+                                    "id": "verify",
+                                    "step": "Rerun the pricing test suite",
+                                    "status": "pending",
+                                },
+                            ]
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="The plan now names the exact edit; I will apply it.",
+                tool_calls=(
+                    ToolCall(
                         id="demo-replace-1",
                         name="replace_text",
                         arguments={
@@ -151,19 +290,89 @@ def _repository_demo_model() -> ScriptedModel:
                 ),
             ),
             ModelResponse(
-                content="The diff was applied; I will re-read the file as post-change evidence.",
+                content="The diff was applied; I will advance the explicit plan to verification.",
                 tool_calls=(
                     ToolCall(
-                        id="demo-read-2",
-                        name="read_file",
-                        arguments={"path": "src/pricing.py", "start_line": 1, "line_count": 40},
+                        id="demo-plan-4",
+                        name="update_plan",
+                        arguments={
+                            "items": [
+                                {
+                                    "id": "reproduce",
+                                    "step": "Run the failing pricing test",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "locate",
+                                    "step": "Locate the duplicate-discount defect",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "repair",
+                                    "step": "Apply one revision-checked edit",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "verify",
+                                    "step": "Rerun the pricing test suite",
+                                    "status": "in_progress",
+                                },
+                            ]
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="Only a fresh external test result can satisfy the verification gate.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-test-pass",
+                        name="run_command",
+                        arguments={
+                            "argv": list(_DEMO_VERIFICATION_ARGV),
+                            "cwd": ".",
+                            "timeout_seconds": 30,
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                content="The current test run passed; I will close the explicit plan.",
+                tool_calls=(
+                    ToolCall(
+                        id="demo-plan-5",
+                        name="update_plan",
+                        arguments={
+                            "items": [
+                                {
+                                    "id": "reproduce",
+                                    "step": "Run the failing pricing test",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "locate",
+                                    "step": "Locate the duplicate-discount defect",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "repair",
+                                    "step": "Apply one revision-checked edit",
+                                    "status": "completed",
+                                },
+                                {
+                                    "id": "verify",
+                                    "step": "Rerun the pricing test suite",
+                                    "status": "completed",
+                                },
+                            ]
+                        },
                     ),
                 ),
             ),
             ModelResponse(
                 content=(
                     "Fixed src/pricing.py: calculate_total now applies the discount exactly once. "
-                    "The post-change read matches the intended implementation."
+                    "The post-change pytest run passed and is current for the final edit."
                 )
             ),
         ]
@@ -175,7 +384,13 @@ def _write_demo_project(root: Path) -> None:
     test = root / "tests" / "test_pricing.py"
     source.parent.mkdir(parents=True)
     test.parent.mkdir(parents=True)
+    source.parent.joinpath("__init__.py").write_text("", encoding="utf-8")
+    test.parent.joinpath("__init__.py").write_text("", encoding="utf-8")
     source.write_bytes(_DEMO_SOURCE_BEFORE)
+    root.joinpath(".gitignore").write_text(
+        ".pytest_cache/\n__pycache__/\n*.py[cod]\n",
+        encoding="utf-8",
+    )
     test.write_text(
         "from src.pricing import calculate_total\n\n"
         "def test_discount_is_applied_once() -> None:\n"
