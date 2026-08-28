@@ -348,15 +348,15 @@ class CommandPolicy:
             if spec.argv == requested_argv and spec.cwd == cwd:
                 if _recognized_verification_kind(executable, arguments) is not spec.kind:
                     return self._general_or_require_approval(approved=approved)
+                executable_path = Path(requested_argv[0])
+                if spec.workspace_executable_sha256 is not None and not _matches_sha256(
+                    executable_path, spec.workspace_executable_sha256
+                ):
+                    return self._general_or_require_approval(approved=approved)
                 if (
                     workspace_root is not None
-                    and _is_within_workspace(Path(requested_argv[0]), workspace_root)
-                    and (
-                        spec.workspace_executable_sha256 is None
-                        or not _matches_sha256(
-                            Path(requested_argv[0]), spec.workspace_executable_sha256
-                        )
-                    )
+                    and _is_within_workspace(executable_path, workspace_root)
+                    and spec.workspace_executable_sha256 is None
                 ):
                     return self._general_or_require_approval(approved=approved)
                 return CommandClassification(
@@ -865,11 +865,18 @@ def _kind_for_named_action(
 
 def _is_within_workspace(executable: Path, workspace_root: Path) -> bool:
     try:
+        absolute_executable = Path(os.path.abspath(executable))
+        absolute_root = Path(os.path.abspath(workspace_root))
         resolved_executable = executable.resolve(strict=False)
         resolved_root = workspace_root.resolve(strict=True)
     except (OSError, RuntimeError):
         return True
-    return resolved_executable == resolved_root or resolved_root in resolved_executable.parents
+    return (
+        absolute_executable == absolute_root
+        or absolute_root in absolute_executable.parents
+        or resolved_executable == resolved_root
+        or resolved_root in resolved_executable.parents
+    )
 
 
 def executable_sha256(executable: Path) -> str:

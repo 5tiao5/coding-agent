@@ -45,6 +45,16 @@ def _temporary_files(root: Path) -> list[Path]:
     return list(root.rglob(".coding-agent-tmp-*"))
 
 
+def _replace_with_same_bytes(path: Path) -> None:
+    original_identity = (path.stat().st_dev, path.stat().st_ino)
+    replacement = path.with_name(f"{path.name}.external-replacement")
+    replacement.write_bytes(path.read_bytes())
+    replacement_identity = (replacement.stat().st_dev, replacement.stat().st_ino)
+    assert replacement_identity != original_identity
+    os.replace(replacement, path)
+    assert (path.stat().st_dev, path.stat().st_ino) == replacement_identity
+
+
 def _windows_file_attributes(path: Path) -> int:
     if sys.platform != "win32":
         raise RuntimeError("Windows file attributes are unavailable on this platform")
@@ -344,8 +354,7 @@ def test_final_revalidation_detects_same_byte_file_replacement(
     def race(operation: str, path: Path) -> None:
         assert operation == "write"
         assert path == target.resolve()
-        target.unlink()
-        target.write_bytes(b"before\n")
+        _replace_with_same_bytes(target)
 
     workspace = HookedWorkspace(mutation_root, race)
     snapshot = workspace.snapshot_for_write("src/existing.py", max_bytes=1_000)
@@ -618,8 +627,7 @@ def test_remove_rejects_a_same_byte_replacement_by_identity(mutation_root: Path)
     def race(operation: str, path: Path) -> None:
         assert operation == "remove"
         assert path == target.resolve()
-        target.unlink()
-        target.write_bytes(b"created by agent\n")
+        _replace_with_same_bytes(target)
 
     workspace = HookedWorkspace(mutation_root, race)
     snapshot = workspace.snapshot_for_write("src/created.py", max_bytes=1_000)

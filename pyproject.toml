@@ -39,6 +39,7 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
+relative_files = true
 source = ["coding_agent"]
 
 [tool.coverage.report]

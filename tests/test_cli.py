@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 from typer.testing import CliRunner
 
 from coding_agent import __version__
@@ -196,7 +197,7 @@ def test_real_run_persists_terminal_session_and_inspectable_trace(
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     assert "FINAL RESULT" in result.stdout
     assert "VERIFIED" in result.stdout
     assert "The repository test passed" in result.stdout
@@ -619,7 +620,7 @@ def test_resume_reverifies_without_replaying_and_rejects_the_wrong_workspace(
         ],
     )
 
-    assert resumed.exit_code == 0
+    assert resumed.exit_code == 0, resumed.stdout
     assert "Session resumed" in resumed.stdout
     assert "Fresh verification passed after resume" in resumed.stdout
     assert "VERIFIED" in resumed.stdout
@@ -662,9 +663,27 @@ def test_live_cli_help_discloses_the_stateless_reasoning_limit() -> None:
     assert run_help.exit_code == 0
     assert resume_help.exit_code == 0
     for output in (run_help.stdout, resume_help.stdout):
-        assert all(word in output for word in ("stateless", "provider", "reasoning", "state"))
-        assert "--reasoning-effort" in output
-        assert "use" in output and "none" in output
+        plain_output = Text.from_ansi(output).plain
+        assert all(word in plain_output for word in ("stateless", "provider", "reasoning", "state"))
+        assert "--reasoning-effort" in plain_output
+        assert "use" in plain_output and "none" in plain_output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv launchers are symlinks")
+def test_default_verifier_preserves_a_posix_virtualenv_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actual_interpreter = Path(sys.executable)
+    launcher = tmp_path / ".venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(actual_interpreter)
+    monkeypatch.setattr("coding_agent.runtime.sys.executable", str(launcher))
+
+    verifier = default_pytest_verifier(tmp_path)
+
+    assert verifier.argv[0] == str(launcher)
+    assert verifier.workspace_executable_sha256 is not None
 
 
 def test_resume_refuses_a_stale_ready_checkpoint_when_trace_already_completed(

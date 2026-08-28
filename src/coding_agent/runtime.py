@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -43,7 +44,11 @@ class RuntimeComponents:
 
 
 def default_pytest_verifier(workspace_root: Path | None = None) -> VerificationCommandSpec:
-    executable = Path(sys.executable).resolve(strict=True)
+    # Resolving a POSIX virtualenv launcher dereferences it to the base interpreter,
+    # which loses the virtualenv and its installed pytest package when executed.
+    executable = Path(os.path.abspath(sys.executable))
+    if not executable.is_file():
+        raise ValueError("verification executable is unavailable")
     workspace_digest: str | None = None
     if workspace_root is not None:
         resolved_root = workspace_root.resolve(strict=True)

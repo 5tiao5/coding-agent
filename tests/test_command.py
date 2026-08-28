@@ -384,6 +384,47 @@ def test_hash_bound_workspace_verifier_is_valid_only_while_unchanged(repository:
     assert classification.command_class is CommandClass.GENERAL
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable symlink policy")
+def test_workspace_symlink_verifier_requires_an_unchanged_hash(repository: Path) -> None:
+    target = repository.parent / "external-pytest"
+    target.write_bytes(b"trusted launcher")
+    launcher = repository / "pytest"
+    launcher.symlink_to(target)
+    unbound = VerificationCommandSpec(
+        argv=(str(launcher), "-q"),
+        cwd=".",
+        kind=VerificationKind.TEST,
+        label="workspace pytest symlink",
+    )
+    bound = VerificationCommandSpec(
+        argv=unbound.argv,
+        cwd=unbound.cwd,
+        kind=unbound.kind,
+        label=unbound.label,
+        workspace_executable_sha256=executable_sha256(launcher),
+    )
+
+    assert (
+        CommandPolicy(CommandPermissionMode.AUTO, verification_commands=(unbound,))
+        .classify(unbound.argv, workspace_root=repository)
+        .command_class
+        is CommandClass.GENERAL
+    )
+
+    policy = CommandPolicy(
+        CommandPermissionMode.AUTO,
+        verification_commands=(bound,),
+    )
+    assert (
+        policy.classify(bound.argv, workspace_root=repository).command_class
+        is CommandClass.VERIFIER
+    )
+
+    target.write_bytes(b"rewritten launcher")
+    classification = policy.classify(bound.argv, workspace_root=repository)
+    assert classification.command_class is CommandClass.GENERAL
+
+
 def test_verification_capability_requires_an_absolute_executable() -> None:
     with pytest.raises(ValueError, match="absolute"):
         VerificationCommandSpec(
@@ -708,7 +749,14 @@ def test_process_control_failure_forces_a_terminal_stop(repository: Path) -> Non
     assert "Safety stop: descendant could not be terminated" in str(execution.output)
 
 
-def test_tool_escapes_terminal_controls_and_keeps_head_and_tail(repository: Path) -> None:
+def test_tool_escapes_terminal_controls_and_keeps_head_and_tail(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "coding_agent.command.locale.getpreferredencoding",
+        lambda _setlocale=False: "missing-codec",
+    )
     output = b"HEAD\x00\x1b[31m" + b"x" * 1_000 + b"TAIL\xff"
     runner = RecordingRunner(_result(output=output))
 

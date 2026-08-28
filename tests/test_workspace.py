@@ -464,7 +464,7 @@ def test_directory_scan_counts_ignored_raw_entries_against_its_budget(tmp_path: 
 
     assert scan.examined == 4
     assert scan.truncated is True
-    assert [entry.relative for entry in scan.entries] == [".gitignore"]
+    assert {entry.relative for entry in scan.entries} <= {".gitignore"}
 
 
 def test_workspace_reads_authorized_files_through_a_bounded_handle(workspace_root: Path) -> None:

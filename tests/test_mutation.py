@@ -25,6 +25,16 @@ def _digest(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+def _replace_with_same_bytes(path: Path) -> None:
+    original_identity = (path.stat().st_dev, path.stat().st_ino)
+    replacement = path.with_name(f"{path.name}.external-replacement")
+    replacement.write_bytes(path.read_bytes())
+    replacement_identity = (replacement.stat().st_dev, replacement.stat().st_ino)
+    assert replacement_identity != original_identity
+    os.replace(replacement, path)
+    assert (path.stat().st_dev, path.stat().st_ino) == replacement_identity
+
+
 def _execute(
     tool: WriteFileTool | ReplaceTextTool | UndoChangeTool,
     arguments: dict[str, object],
@@ -241,10 +251,7 @@ def test_undo_rejects_an_external_same_byte_replacement(repository: Path) -> Non
     target = repository / "src" / "owned.txt"
     session = MutationSession(Workspace(repository))
     created = session.write_text(path="src/owned.txt", content="same bytes\n", expected_sha256=None)
-    original_identity = target.stat().st_ino
-    target.unlink()
-    target.write_bytes(b"same bytes\n")
-    assert target.stat().st_ino != original_identity
+    _replace_with_same_bytes(target)
 
     with pytest.raises(MutationError) as caught:
         session.undo_change(created.change_id or "")
