@@ -2,30 +2,93 @@
 
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
-The project is currently at **M3 (runtime control core)**. Its deterministic offline demo follows a real repair story:
+The project is at **M4 (real model CLI, safe approval, durable traces, and demo UX)**. Its offline demo tells one complete repair story:
 
-`plan → failing pytest → search/read → revision-checked edit → passing pytest → VERIFIED`
+`plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
 
-`VERIFIED` is not model prose. It is a terminal state granted only by fresh runtime evidence from a host-registered exact command capability whose entry point is recognized as a test, build, or check.
+`VERIFIED` is not model prose. The runtime grants it only when a host-registered exact test/build/check command passes after the latest known workspace mutation.
 
-## Development setup
+## Quick start
 
 ```powershell
-uv sync
+uv sync --all-groups
 uv run coding-agent demo
-uv run ruff check .
-uv run mypy
+uv run ruff check src tests
+uv run mypy src tests
 uv run pytest
 ```
 
-The demo creates a temporary repository, reproduces a failing test, locates a duplicate-discount defect, applies one compare-and-swap edit, and reruns the same test capability. It requires no API key or network access. `ScriptedModel` is deliberately deterministic: the demo validates the real runtime/tool protocol, not autonomous model reasoning.
+The demo needs no API key or network. `ScriptedModel` supplies deterministic decisions, while the real Agent loop, tools, subprocess, diff, verification gate, events, and Rich dashboard still execute.
 
-M3 adds direct-argv command execution, bounded output, timeouts and descendant cleanup, `safe`/`auto` policy primitives, context compaction, repeated-call stopping, explicit plan state, passive checkpoints, and a trusted Verification Gate. The M2 workspace layer still provides rooted paths, ignore/sensitive filtering, SHA-256 stale-write checks, link rejection, atomic replacement, bounded escaped diffs, and conditional undo.
+For a real repository run, provide the API key only through the environment and select the model explicitly:
 
-Current limits are intentional: the real model adapter, interactive task/approval CLI, JSONL `inspect`, richer live UI, and automated evaluation suite remain later milestones. Checkpoint resume restores the canonical transcript, not `PlanState` or the in-memory undo journal. A workspace-relative command `cwd` is not an OS sandbox; see [docs/SECURITY.md](docs/SECURITY.md).
+```powershell
+$env:OPENAI_API_KEY = "..."
+$env:CODING_AGENT_MODEL = "<responses-compatible-model>"
+uv run coding-agent run "Fix the failing tests and verify the repair" --root . --mode safe
+```
 
-See [PLAN.md](PLAN.md) for scope, compliance boundaries, milestones, and acceptance criteria.
+Omit the task string for a `prompt-toolkit` input prompt. No `--api-key` option exists, so the key
+never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment;
+your shell may still record a literal environment-assignment command in its own history.
+
+Useful commands:
+
+```powershell
+uv run coding-agent runs
+uv run coding-agent inspect <run-id>
+uv run coding-agent resume <run-id> --root . --model <model>
+```
+
+`safe` is the default: registered verification commands run directly, ordinary commands require a human confirmation, and non-interactive input denies them. `auto` skips that confirmation but keeps the destructive-command deny rules; it is not an OS sandbox.
+
+For `run` and `resume`, exit codes distinguish control outcomes:
+
+| Code | Meaning |
+|---:|---|
+| `0` | `COMPLETED` with current trusted verification |
+| `1` | runtime/setup failure or refused resume |
+| `2` | CLI usage or argument validation error |
+| `3` | final response exists, but verification is missing, failed, or stale |
+
+## What M4 adds
+
+- A raw OpenAI Responses adapter that maps the project-owned transcript and custom function tools without an Agent SDK, hosted tools, automatic tool execution, or provider-managed conversation state.
+- A real `run` command, interactive task entry, `safe`/`auto` selection, exact-argv approval panel, and environment-only credential flow.
+- A passive Rich dashboard with plan/diff previews, tool durations, verification evidence, and an explicit `VERIFIED`/`UNVERIFIED` final card.
+- Bounded per-run JSONL traces plus read-only `runs` and `inspect` commands.
+- Schema-v2 checkpoints bound to an opaque workspace identity, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
+- A deployment-safe pytest capability: if Python itself lives inside the repository, its exact executable hash is bound before it may issue verification evidence.
+
+The default live runtime registers only the exact current-Python `-I -m pytest -q` capability. Other
+commands may run under the selected permission mode, but their output cannot manufacture
+verification evidence.
+
+## Important limits
+
+- The Responses adapter uses `store=False` and explicitly sends a bounded context projection derived
+  from the canonical transcript. It currently rejects a response that combines a reasoning item with
+  function calls because safely continuing that turn requires encrypted provider state that this
+  provider-neutral checkpoint deliberately does not persist. Use a Responses-compatible model that
+  does not emit reasoning items during tool turns.
+- Resume restores the canonical transcript, not `PlanState`, the in-memory undo journal, approval decisions, or old verification evidence. Fresh verification is mandatory.
+- Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
+- A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
+- M5 still needs the four-category automated evaluation suite, clean-environment rehearsal, and final demo freeze.
 
 ## Design boundary
 
-Generic libraries handle validation, terminal rendering, process enumeration, ignore matching, and testing. Agent orchestration, command launch and capability policy, context selection, tool dispatch, verification, stopping rules, and error semantics remain project-owned code.
+Generic libraries handle HTTP transport, validation, terminal rendering, input editing, process enumeration, ignore matching, and tests. Agent orchestration, context selection, tool definitions and dispatch, command launch/capability policy, stopping rules, checkpoint semantics, verification, and error semantics remain project-owned code.
+
+```text
+CLI
+ ├─ OpenAIResponsesModel / ScriptedModel
+ ├─ AgentRunner ─ Context + Stop + Verification
+ │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
+ ├─ SessionStore + RunLease
+ └─ CompositeEventSink
+     ├─ JsonlEventSink       durable audit facts
+     └─ DashboardEventSink   best-effort presentation
+```
+
+The runtime result, resumable checkpoint, audit trace, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/SECURITY.md](docs/SECURITY.md).

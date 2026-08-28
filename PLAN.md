@@ -1,8 +1,8 @@
 # Coding Agent 项目计划
 
-> 版本：v0.3 · 2026-08-28 · 截止：2026-09-02 24:00（北京时间）
+> 版本：v0.4 · 2026-08-28 · 截止：2026-09-02 24:00（北京时间）
 
-> 当前进度：M3 运行控制内核已实现；M4 的交互式 CLI、权限确认 UX、事件轨迹与界面打磨尚未开始。
+> 当前进度：M4 Demo UX 与轨迹已实现并进入冻结前复验；下一阶段是 M5 自动评测、干净环境复验与视频彩排。
 
 ## 1. 目标
 
@@ -16,7 +16,7 @@
 - **允许复用**：模型 HTTP 客户端、数据校验、CLI/终端渲染、进程管理、`.gitignore` 匹配和测试框架。
 - **不使用**：LangChain、LlamaIndex、OpenAI Agents SDK、Claude Agent SDK、AutoGen、CrewAI 等 Agent 框架；服务端代码执行、文件或上下文托管工具；现成 Coding Agent 的封装。
 - 对处于灰区、会隐藏核心逻辑的高级抽象库（如通用 Agent/Tool 编排层）默认不用。
-- API key 只从环境变量或未入库配置读取；运行轨迹默认不入库并脱敏。若密钥误提交，立即作废更换。
+- API key 只从环境变量或未入库配置读取；运行轨迹默认不入库且采用最小化字段，但计划和 Diff 仍可能含源码，须保存在私有状态目录。若密钥误提交，立即作废更换。
 
 ## 3. 交付范围
 
@@ -32,11 +32,11 @@
 
 ### P1：承诺完成的增强能力
 
-- 事件驱动的 Rich 终端界面：流式反馈、计划状态、工具时间线、折叠输出、Diff 和最终验证卡片。
+- 事件驱动的 Rich 终端界面：事件级实时反馈、计划状态、工具时间线、折叠输出、Diff 和最终验证卡片。
 - 结构化任务计划：维护待办、进行中和已完成状态，但不记录模型隐式思维过程。
 - Verification Gate：最后一次写操作之后没有成功测试、构建或检查证据时，只能报告“完成但未验证”。
-- `safe` / `auto` 两档策略内核；交互确认与 CLI 模式选择在 M4 接入。
-- 被动 transcript checkpoint/load/resume 内核；CLI 入口和工具局部状态恢复待完成。
+- `safe` / `auto` 两档策略、精确 argv 交互确认和 CLI 模式选择。
+- 被动 transcript checkpoint/load/resume、工作区绑定、完成轨迹拒绝和并发恢复 lease；工具局部状态不跨进程恢复。
 - 写文件前生成 Diff，并支持本次会话内撤销。
 - JSONL 事件轨迹与 `inspect <run-id>`：记录工具调用、结果、耗时、错误和停止原因；不记录模型隐式思维过程。
 - 自动评测：单文件修复、跨文件修改、新增功能、间接故障调试四类任务，统计成功率、步数、耗时和工具错误。
@@ -65,8 +65,8 @@ CLI
      ├─ Policy（路径、命令能力、资源限制）
      ├─ SessionStore（保存与恢复）
      └─ EventSink
-         ├─ ConsoleEventSink（当前最小用户视图）
-         └─ EventRecorder（M4：轨迹与指标）
+         ├─ DashboardEventSink（Rich 时间线与验证卡）
+         └─ JsonlEventSink（持久轨迹与 inspect）
 ```
 
 内部边界采用少量稳定接口：`ModelAdapter.complete()`、`ToolDispatcher.execute()`、`CommandPolicy.classify()`、`EventSink.emit()`。事件轨迹是事实记录，上下文是从事实中选择出的模型视图，两者分离。
@@ -92,13 +92,13 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 
 | 依赖 | 用途 | 不由它负责的内容 |
 |---|---|---|
-| `openai`（M4 计划） | 原始模型请求与原生 tool calling 传输 | 自动工具执行、托管工具、重试决策、上下文 |
+| `openai` | 原始 Responses 请求与原生 function calling 传输 | 自动工具执行、托管工具、重试决策、上下文 |
 | `pydantic` | 配置、工具参数和事件校验 | 工具调度与业务规则 |
 | `typer`、`rich` | 当前 CLI 与事件渲染 | Agent 状态机与对话历史 |
-| `prompt-toolkit`（M4 计划） | 交互输入与历史 | Agent 循环与权限决策 |
+| `prompt-toolkit` | 交互式任务输入 | Agent 循环与权限决策 |
 | `pathspec` | 尊重 `.gitignore` | 工作区安全边界 |
 | `psutil` | 枚举和终止进程树 | 命令启动、授权、超时与错误语义 |
-| `pytest` | 单元、集成与评测测试 | 运行时逻辑 |
+| `pytest` | 单元/集成测试、离线演示和默认验证能力 | Agent 决策与验证判定 |
 
 依赖统一由 `uv` 管理并锁定版本；API key 仅通过环境变量或未入库配置提供。
 
@@ -110,7 +110,7 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 | 8/28 | M1 骨架与核心循环 | 完成 | `ScriptedModel`、`RunEvent` 驱动离线多轮工具调用 |
 | 8/29 | M2 工具与安全 | 完成 | Agent 在 fixture 中定位 Bug、原子修改并支持撤销 |
 | 8/30 | M3 上下文与验证 | 完成 | 命令、计划、压缩、停止、被动恢复和 Verification Gate 测试通过 |
-| 8/31 | M4 Demo UX 与轨迹 | 待开始 | 时间线、Diff、撤销、`inspect` 和验证卡片可完整演示 |
+| 8/31 | M4 Demo UX 与轨迹 | 完成 | 真实模型 CLI、审批、时间线、Diff、恢复、`inspect` 和验证卡片可完整演示 |
 | 9/1 | M5 评测与冻结 | 待开始 | 四类任务评测；干净环境复验；视频彩排；晚间冻结功能 |
 | 9/2 | 最终交付 | 待开始 | 安全检查、录制视频、整理材料并在截止前完成最终推送 |
 

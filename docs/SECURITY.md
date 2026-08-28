@@ -45,17 +45,24 @@ instead of misreporting an already-applied change as a normal failure.
 ## Command boundary
 
 - Commands are launched as an argument vector with `shell=False`, closed stdin, a bounded wall-clock
-  timeout, combined bounded output, and credential-like environment variables removed. Shells,
+  timeout, combined bounded output, and credential-like environment variables removed. Commands
+  that may issue verification evidence receive a smaller host-owned environment allowlist, so
+  ambient runner options such as `PYTEST_ADDOPTS` cannot silently change an exact argv. Shells,
   batch files, and a small hard-deny set of destructive programs are rejected.
 - `safe` is the default policy: every ordinary external command requires approval before it can
-  start. `auto` is an explicit programmatic opt-in; every ordinary command then invalidates prior
-  verification because its effects are unknown.
+  start. The M4 CLI stops an active Rich display, shows the exact argv and relative cwd as literal
+  text, and defaults to denial. The safe-mode prompt is offered only when both stdin and stdout are
+  terminals, so non-interactive input cannot silently approve. `auto` is an explicit opt-in that
+  skips the prompt. Every ordinary `auto` command invalidates prior verification because its effects
+  are unknown.
 - Verification is capability-first and also constrained to recognizable test, build, and check entry
   points. Only a host-registered exact executable path, argv, workspace-relative cwd, evidence kind,
   and label can issue a verification signal. Generic interpreter code, scripts, unknown launchers,
-  workspace-owned executables, help, version, collection-only, fixture-listing, and no-run variants
-  are rejected as evidence even if a host accidentally registers them. Output text is never parsed
-  to decide success.
+  unbound workspace-owned executables, help, version, collection-only, fixture-listing, and no-run
+  variants are rejected as evidence even if a host accidentally registers them. A verifier
+  executable inside the workspace is accepted only when the host registers its exact SHA-256 and
+  the digest still matches immediately before classification. Output text is never parsed to decide
+  success.
 - The runner owns the command lifetime and attempts to terminate descendants on every exit path.
   A root process that exits while descendants remain after a short launcher-settle window is
   incomplete, even when its exit code is zero. If membership, containment, or cleanup cannot be
@@ -74,7 +81,7 @@ in command arguments or program output.
 Windows commands are attached while suspended to a kill-on-close Job Object. POSIX currently uses a
 fresh session/process group, which is a lifecycle boundary rather than a hostile-code sandbox: a
 malicious descendant can deliberately create a new session and escape that group. Use an external
-cgroup/container boundary for adversarial repositories; M3 does not claim to provide one itself.
+cgroup/container boundary for adversarial repositories; M4 does not claim to provide one itself.
 
 ## Verification boundary
 
@@ -97,5 +104,48 @@ evidence; a resumed run must verify again. The store rejects known credential pa
 reasoning fields, but the canonical transcript can still contain source and command output. Its state
 directory must therefore be private and outside the workspace.
 
-M3 restores the canonical transcript only. `PlanState`, the mutation undo journal, CLI resume UX,
-and interactive approval state are not yet persisted across processes.
+Schema-v2 checkpoints carry an opaque digest of the resolved workspace path and filesystem identity.
+The CLI requires an explicit repository for resume and rejects a mismatch before constructing a
+model client. It also refuses a ready checkpoint when the latest trace says the run already
+completed. A new run preallocates its ID and holds a non-blocking OS file lease before constructing
+the runtime; resume takes that same per-run lease. The original process and a same-ID resume therefore
+cannot execute concurrently.
+
+M4 still restores the canonical transcript only. `PlanState`, the mutation undo journal, interactive
+approval decisions, and verification evidence are not persisted across processes. Resume is not an
+exactly-once transaction: if a process dies after a tool changes disk but before the ready checkpoint
+is replaced, the workspace may be newer than the transcript. Revision checks and fresh observation
+reduce that risk but cannot erase it.
+
+## Trace and presentation boundary
+
+JSONL traces contain only validated `RunEvent` records, not provider response objects, full prompts,
+hidden reasoning, raw read/search results, or raw command output. They can contain bounded plan and
+mutation-diff previews because those are explicit presentation artifacts. Trace files are size
+bounded and reject incomplete records, invalid UTF-8/JSON, symlinks, and multiply linked files. They
+live in the private per-user state directory by default and must not be committed.
+
+`inspect` strictly validates a trace and renders whitelisted fields. A trace is an audit aid, not a
+tamper-proof ledger: even a stored `verified=true` can never restore `VerificationLedger` evidence or
+authorize runtime behavior. The Rich dashboard is wrapped as best-effort presentation after the
+durable trace sink; renderer failure disables the view rather than changing Agent control flow.
+
+## Model transport boundary
+
+The OpenAI adapter uses custom function tools only. It does not use an Agents SDK, hosted code/file
+tools, automatic tool execution, or provider-managed conversation state. Requests set `store=false`;
+each request explicitly sends a bounded context projection derived from the project-owned canonical
+transcript. API keys come from the environment, are removed from child-command environments, and
+have no CLI argument. Explicit remote base URLs must use HTTPS and cannot contain userinfo, a query,
+or a fragment; plain HTTP is limited to loopback.
+
+Tool schemas currently advertise `strict=false` because several local Pydantic schemas intentionally
+contain optional fields with defaults; project-owned validation remains authoritative. SDK retries
+default to zero so retry behavior is not hidden below runtime events and deadlines. Provider errors
+are mapped to fixed messages without preserving headers, URLs, bodies, credentials, or exception
+chains.
+
+Stateless reasoning continuation is an explicit limitation. If a response combines a reasoning item
+with function calls, safe continuation would require retaining and replaying encrypted provider
+state. M4 rejects that turn instead of silently discarding state or persisting hidden reasoning in a
+provider-neutral checkpoint.
