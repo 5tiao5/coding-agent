@@ -151,6 +151,7 @@ class ToolRegistry:
             summary=summary,
             metadata=result.metadata,
             truncated=result.truncated or hard_truncated,
+            control=result.control,
             duration_ms=self._elapsed_ms(started),
         )
 

@@ -31,6 +31,9 @@ class StopReason(StrEnum):
     TOOL_LIMIT = "tool_limit"
     MODEL_ERROR = "model_error"
     USER_INTERRUPTED = "user_interrupted"
+    COMMAND_CONTROL_FAILED = "command_control_failed"
+    CONTEXT_LIMIT = "context_limit"
+    REPEATED_TOOL_CALL = "repeated_tool_call"
 
 
 class MessageRole(StrEnum):
@@ -38,6 +41,30 @@ class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
+
+
+class VerificationSignal(StrEnum):
+    """A trusted verification outcome produced by project-owned tool logic."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class VerificationKind(StrEnum):
+    """A project-recognized class of external verification."""
+
+    TEST = "test"
+    BUILD = "build"
+    CHECK = "check"
+
+
+class VerificationStatus(StrEnum):
+    """Why a terminal answer is or is not backed by current evidence."""
+
+    VERIFIED = "verified"
+    MISSING = "missing"
+    FAILED = "failed"
+    STALE = "stale"
 
 
 class ToolCall(FrozenModel):
@@ -78,6 +105,33 @@ class ToolSpec(FrozenModel):
 ToolMetadataValue = str | int | float | bool | None
 
 
+class ToolControlFacts(FrozenModel):
+    """Runtime control facts that are never exposed as model-authored context."""
+
+    invalidates_verification: bool = False
+    made_progress: bool = False
+    verification: VerificationSignal | None = None
+    verification_kind: VerificationKind | None = None
+    verification_label: str | None = Field(default=None, min_length=1, max_length=120)
+    terminal_stop: bool = False
+    terminal_reason: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_verification_label(self) -> ToolControlFacts:
+        verification_fields = (
+            self.verification,
+            self.verification_kind,
+            self.verification_label,
+        )
+        if any(value is None for value in verification_fields) and any(
+            value is not None for value in verification_fields
+        ):
+            raise ValueError("verification, verification_kind, and label must be set together")
+        if self.terminal_stop != (self.terminal_reason is not None):
+            raise ValueError("terminal_stop and terminal_reason must be set together")
+        return self
+
+
 class ToolOutput(FrozenModel):
     """A tool result split into model content and a safe observable summary."""
 
@@ -85,6 +139,7 @@ class ToolOutput(FrozenModel):
     summary: str = Field(min_length=1, max_length=500)
     metadata: dict[str, ToolMetadataValue] = Field(default_factory=dict)
     truncated: bool = False
+    control: ToolControlFacts = Field(default_factory=ToolControlFacts)
 
 
 class ModelResponse(FrozenModel):
@@ -108,6 +163,7 @@ class ToolExecution(FrozenModel):
     error_message: str | None = None
     metadata: dict[str, ToolMetadataValue] = Field(default_factory=dict)
     truncated: bool = False
+    control: ToolControlFacts = Field(default_factory=ToolControlFacts)
     duration_ms: float = Field(default=0.0, ge=0)
 
     @model_validator(mode="after")
@@ -125,7 +181,7 @@ class ToolExecution(FrozenModel):
     def as_message_content(self) -> str:
         # Timing and the sanitized UI summary are observability data, not model context.
         return self.model_dump_json(
-            exclude={"duration_ms", "summary"},
+            exclude={"control", "duration_ms", "summary"},
             exclude_defaults=True,
             exclude_none=True,
         )

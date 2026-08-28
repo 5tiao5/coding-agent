@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-from coding_agent.models import ToolOutput
+from coding_agent.models import ToolControlFacts, ToolOutput
 from coding_agent.mutation import MutationResult, MutationSession
 from coding_agent.tools._rendering import (
     clip_at_escape_boundary,
@@ -207,6 +207,10 @@ def _render_result(result: MutationResult, revision: int, max_chars: int) -> Too
             "durability_uncertain": result.durability_uncertain,
         },
         truncated=not diff_complete,
+        control=ToolControlFacts(
+            invalidates_verification=result.changed,
+            made_progress=result.changed,
+        ),
     )
 
 
