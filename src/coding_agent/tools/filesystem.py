@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from coding_agent.errors import CodedError
 from coding_agent.models import ToolOutput
+from coding_agent.text import TextDocument, TextDocumentError, decode_utf8_document
 from coding_agent.tools.base import BaseTool, ToolError
 from coding_agent.workspace import Workspace, WorkspaceError, WorkspacePath
 
@@ -239,7 +240,8 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
 
     def run(self, arguments: ReadFileArguments) -> ToolOutput:
         target = self._workspace.resolve(arguments.path, expected="file")
-        text = self._read_utf8(target)
+        document = self._read_utf8(target)
+        text = document.text
         lines = text.splitlines()
 
         if not lines and arguments.start_line != 1:
@@ -258,6 +260,7 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
                 summary=f"Read empty file {_summary_path(target.relative)}",
                 metadata={
                     "path": target.relative,
+                    **self._document_metadata(document),
                     "start_line": 0,
                     "end_line": 0,
                     "requested_end_line": 0,
@@ -313,6 +316,7 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
             summary=summary,
             metadata={
                 "path": target.relative,
+                **self._document_metadata(document),
                 "start_line": arguments.start_line,
                 "end_line": end_line,
                 "requested_end_line": requested_end_line,
@@ -330,17 +334,29 @@ class ReadFileTool(BaseTool[ReadFileArguments]):
             truncated=truncated,
         )
 
-    def _read_utf8(self, target: WorkspacePath) -> str:
+    def _read_utf8(self, target: WorkspacePath) -> TextDocument:
         data = self._workspace.read_bytes(target, max_bytes=self._max_file_bytes)
-        if b"\x00" in data:
-            raise ToolError("binary_file", f"binary file cannot be read: {target.relative}")
         try:
-            return data.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
+            return decode_utf8_document(data)
+        except TextDocumentError as exc:
+            if exc.reason == "binary":
+                raise ToolError(
+                    "binary_file", f"binary file cannot be read: {target.relative}"
+                ) from exc
             raise ToolError(
                 "unsupported_encoding",
                 f"file is not valid UTF-8: {target.relative}",
             ) from exc
+
+    @staticmethod
+    def _document_metadata(document: TextDocument) -> dict[str, str | int | bool]:
+        return {
+            "sha256": document.sha256,
+            "bytes": len(document.raw),
+            "newline": document.newline,
+            "utf8_bom": document.utf8_bom,
+            "ends_with_newline": document.ends_with_newline,
+        }
 
 
 class SearchTextTool(BaseTool[SearchTextArguments]):

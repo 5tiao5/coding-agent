@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,13 @@ def test_read_file_supports_bom_crlf_line_ranges_and_pagination(repository: Path
     assert "\ufeff" not in execution.output
     assert execution.metadata == {
         "path": "paged.txt",
+        "sha256": sha256(
+            b"\xef\xbb\xbffirst\r\n\xe5\x8d\x97\xe4\xba\xac\r\nthird\r\nfourth"
+        ).hexdigest(),
+        "bytes": len(b"\xef\xbb\xbffirst\r\n\xe5\x8d\x97\xe4\xba\xac\r\nthird\r\nfourth"),
+        "newline": "crlf",
+        "utf8_bom": True,
+        "ends_with_newline": False,
         "start_line": 2,
         "end_line": 3,
         "requested_end_line": 3,
@@ -222,9 +230,13 @@ def test_read_file_character_budget_always_advances_pagination(repository: Path)
     )
 
     assert execution.ok is True
-    assert execution.metadata["returned_line_count"] >= 1
-    assert execution.metadata["end_line"] == execution.metadata["returned_line_count"]
-    assert execution.metadata["next_start_line"] == execution.metadata["end_line"] + 1
+    returned_line_count = execution.metadata["returned_line_count"]
+    end_line = execution.metadata["end_line"]
+    assert isinstance(returned_line_count, int)
+    assert isinstance(end_line, int)
+    assert returned_line_count >= 1
+    assert end_line == returned_line_count
+    assert execution.metadata["next_start_line"] == end_line + 1
     assert execution.metadata["line_truncated"] is True
     assert execution.truncated is True
     assert len(str(execution.output)) <= 140
