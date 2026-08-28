@@ -6,6 +6,7 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from enum import StrEnum
 from ipaddress import ip_address
 from typing import Any, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
@@ -43,6 +44,18 @@ class OpenAIModelError(CodedError):
     """A sanitized, stable failure at the OpenAI provider boundary."""
 
 
+class ReasoningEffort(StrEnum):
+    """Explicit Responses API reasoning effort requested from a provider."""
+
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
 class OpenAIResponsesModel:
     """Translate project-owned messages and tools to and from Responses API values.
 
@@ -51,12 +64,19 @@ class OpenAIResponsesModel:
     ``ToolCall`` values for ``AgentRunner`` to dispatch.
     """
 
-    def __init__(self, client: OpenAIClientProtocol, *, model: str) -> None:
+    def __init__(
+        self,
+        client: OpenAIClientProtocol,
+        *,
+        model: str,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> None:
         normalized_model = model.strip()
         if not normalized_model:
             raise ValueError("model must be a non-empty string")
         self._client = client
         self._model = normalized_model
+        self._reasoning_effort = reasoning_effort
 
     def complete(
         self,
@@ -67,13 +87,16 @@ class OpenAIResponsesModel:
 
         response_input = _encode_messages(messages)
         function_tools = _encode_tools(tools)
+        request: dict[str, object] = {
+            "model": self._model,
+            "input": response_input,
+            "tools": function_tools,
+            "store": False,
+        }
+        if self._reasoning_effort is not None:
+            request["reasoning"] = {"effort": self._reasoning_effort.value}
         try:
-            response = self._client.responses.create(
-                model=self._model,
-                input=response_input,
-                tools=function_tools,
-                store=False,
-            )
+            response = self._client.responses.create(**request)
         except Exception:
             # Provider exceptions can contain request headers, URLs, or credentials.
             # Keep the public error deliberately generic and suppress exception chaining.
@@ -91,6 +114,7 @@ def create_openai_responses_model(
     base_url: str | None = None,
     timeout_seconds: float = 120.0,
     max_retries: int = 0,
+    reasoning_effort: ReasoningEffort | None = None,
     client_factory: Callable[..., object] | None = None,
 ) -> OpenAIResponsesModel:
     """Create the official SDK transport while keeping it outside the Agent core."""
@@ -120,7 +144,11 @@ def create_openai_responses_model(
             "openai_client_configuration",
             "OpenAI client could not be configured",
         ) from None
-    return OpenAIResponsesModel(cast(OpenAIClientProtocol, client), model=model)
+    return OpenAIResponsesModel(
+        cast(OpenAIClientProtocol, client),
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def _encode_messages(messages: Sequence[ChatMessage]) -> list[ResponseInputItem]:

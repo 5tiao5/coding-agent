@@ -37,6 +37,7 @@ from coding_agent.models import (
     ToolCall,
     VerificationKind,
 )
+from coding_agent.openai_model import ReasoningEffort
 from coding_agent.runtime import default_pytest_verifier
 from coding_agent.session import SessionBoundary, SessionCheckpoint, SessionStore
 from coding_agent.state import StatePaths
@@ -263,6 +264,46 @@ def test_unverified_live_run_has_a_distinct_exit_code(
         < result.stdout.rfind("Run ID:")
         < result.stdout.rfind("FINAL RESULT")
     )
+
+
+def test_live_run_passes_explicit_reasoning_effort_to_the_model_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    def model_factory(**kwargs: object) -> ScriptedModel:
+        captured.update(kwargs)
+        return ScriptedModel([ModelResponse(content="Configuration received.")])
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    monkeypatch.setattr("coding_agent.cli.create_openai_responses_model", model_factory)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "Check provider configuration",
+            "--root",
+            str(workspace),
+            "--model",
+            "deepseek-v4-flash",
+            "--base-url",
+            "https://api.deepseek.com",
+            "--reasoning-effort",
+            "none",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--plain",
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["base_url"] == "https://api.deepseek.com"
+    assert captured["reasoning_effort"] is ReasoningEffort.NONE
 
 
 @pytest.mark.parametrize(
@@ -550,7 +591,17 @@ def test_resume_reverifies_without_replaying_and_rejects_the_wrong_workspace(
             ModelResponse(content="Fresh verification passed after resume."),
         ]
     )
-    _install_live_model(monkeypatch, fresh_model)
+    resume_configuration: dict[str, object] = {}
+
+    def resume_model_factory(**kwargs: object) -> ScriptedModel:
+        resume_configuration.update(kwargs)
+        return fresh_model
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    monkeypatch.setattr(
+        "coding_agent.cli.create_openai_responses_model",
+        resume_model_factory,
+    )
     resumed = runner.invoke(
         app,
         [
@@ -560,6 +611,8 @@ def test_resume_reverifies_without_replaying_and_rejects_the_wrong_workspace(
             str(workspace),
             "--model",
             "gpt-test",
+            "--reasoning-effort",
+            "none",
             "--state-dir",
             str(state),
             "--plain",
@@ -571,6 +624,7 @@ def test_resume_reverifies_without_replaying_and_rejects_the_wrong_workspace(
     assert "Fresh verification passed after resume" in resumed.stdout
     assert "VERIFIED" in resumed.stdout
     assert len(fresh_model.requests) == 2
+    assert resume_configuration["reasoning_effort"] is ReasoningEffort.NONE
 
 
 def test_live_cli_requires_explicit_model_and_environment_only_api_key(
@@ -593,6 +647,13 @@ def test_live_cli_requires_explicit_model_and_environment_only_api_key(
     assert "OPENAI_API_KEY" in no_key.stderr
     assert "api-key" not in no_key.stderr
 
+    invalid_reasoning = runner.invoke(
+        app,
+        ["run", "Task", "--reasoning-effort", "turbo"],
+    )
+    assert invalid_reasoning.exit_code == 2
+    assert "turbo" in invalid_reasoning.stderr
+
 
 def test_live_cli_help_discloses_the_stateless_reasoning_limit() -> None:
     run_help = runner.invoke(app, ["run", "--help"], terminal_width=160)
@@ -602,6 +663,8 @@ def test_live_cli_help_discloses_the_stateless_reasoning_limit() -> None:
     assert resume_help.exit_code == 0
     for output in (run_help.stdout, resume_help.stdout):
         assert all(word in output for word in ("stateless", "provider", "reasoning", "state"))
+        assert "--reasoning-effort" in output
+        assert "use" in output and "none" in output
 
 
 def test_resume_refuses_a_stale_ready_checkpoint_when_trace_already_completed(

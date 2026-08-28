@@ -15,6 +15,7 @@ from coding_agent.models import (
 from coding_agent.openai_model import (
     OpenAIModelError,
     OpenAIResponsesModel,
+    ReasoningEffort,
     create_openai_responses_model,
 )
 
@@ -452,6 +453,7 @@ def test_sdk_factory_passes_only_explicit_transport_configuration() -> None:
         base_url="https://example.invalid/v1",
         timeout_seconds=30,
         max_retries=1,
+        reasoning_effort=ReasoningEffort.NONE,
         client_factory=factory,
     )
 
@@ -464,6 +466,14 @@ def test_sdk_factory_passes_only_explicit_transport_configuration() -> None:
             "max_retries": 1,
         }
     ]
+    adapter.complete(
+        (
+            ChatMessage(role=MessageRole.SYSTEM, content="Work locally."),
+            ChatMessage(role=MessageRole.USER, content="Inspect the repository."),
+        ),
+        (),
+    )
+    assert client.responses.requests[0]["reasoning"] == {"effort": "none"}
 
 
 def test_sdk_factory_disables_hidden_transport_retries_by_default() -> None:

@@ -27,7 +27,7 @@ from coding_agent.errors import CodedError
 from coding_agent.events import BestEffortEventSink, CompositeEventSink, EventKind, RunEvent
 from coding_agent.lease import RunLease
 from coding_agent.models import AgentResult, AgentState
-from coding_agent.openai_model import create_openai_responses_model
+from coding_agent.openai_model import ReasoningEffort, create_openai_responses_model
 from coding_agent.presentation import print_agent_response, safe_terminal_text
 from coding_agent.runtime import build_runtime, system_prompt_for
 from coding_agent.session import LoadedSession, SessionBoundary, SessionStore
@@ -113,6 +113,14 @@ def run_task(
         show_envvar=True,
         help="Optional OpenAI-compatible Responses API base URL.",
     ),
+    reasoning_effort: ReasoningEffort | None = typer.Option(
+        None,
+        "--reasoning-effort",
+        envvar="CODING_AGENT_REASONING_EFFORT",
+        show_envvar=True,
+        case_sensitive=False,
+        help="Explicit Responses reasoning effort; use none for stateless tool loops.",
+    ),
     mode: CommandPermissionMode = typer.Option(
         CommandPermissionMode.SAFE,
         "--mode",
@@ -159,6 +167,7 @@ def run_task(
                 root=resolved_root,
                 model_name=selected_model,
                 base_url=base_url,
+                reasoning_effort=reasoning_effort,
                 mode=mode,
                 paths=paths,
                 max_steps=max_steps,
@@ -199,6 +208,14 @@ def resume_task(
         envvar="OPENAI_BASE_URL",
         show_envvar=True,
         help="Optional OpenAI-compatible Responses API base URL.",
+    ),
+    reasoning_effort: ReasoningEffort | None = typer.Option(
+        None,
+        "--reasoning-effort",
+        envvar="CODING_AGENT_REASONING_EFFORT",
+        show_envvar=True,
+        case_sensitive=False,
+        help="Explicit Responses reasoning effort; use none for stateless tool loops.",
     ),
     mode: CommandPermissionMode = typer.Option(
         CommandPermissionMode.SAFE,
@@ -243,6 +260,7 @@ def resume_task(
                 root=resolved_root,
                 model_name=selected_model,
                 base_url=base_url,
+                reasoning_effort=reasoning_effort,
                 mode=mode,
                 paths=paths,
                 max_steps=max_steps,
@@ -335,6 +353,7 @@ def _execute_live_run(
     root: Path,
     model_name: str,
     base_url: str | None,
+    reasoning_effort: ReasoningEffort | None,
     mode: CommandPermissionMode,
     paths: StatePaths,
     max_steps: int,
@@ -358,6 +377,7 @@ def _execute_live_run(
     model = create_openai_responses_model(
         model=model_name,
         base_url=base_url,
+        reasoning_effort=reasoning_effort,
         timeout_seconds=model_timeout,
         max_retries=0,
     )

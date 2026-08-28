@@ -28,6 +28,17 @@ $env:CODING_AGENT_MODEL = "<responses-compatible-model>"
 uv run coding-agent run "Fix the failing tests and verify the repair" --root . --mode safe
 ```
 
+For DeepSeek's Responses-compatible endpoint, use its currently supported Responses model and
+explicitly disable reasoning for the stateless tool loop:
+
+```powershell
+$env:OPENAI_API_KEY = "<DeepSeek API key>"
+$env:OPENAI_BASE_URL = "https://api.deepseek.com"
+$env:CODING_AGENT_MODEL = "deepseek-v4-flash"
+$env:CODING_AGENT_REASONING_EFFORT = "none"
+uv run coding-agent run "Inspect this repository and report one verified improvement" --root . --mode safe
+```
+
 Omit the task string for a `prompt-toolkit` input prompt. No `--api-key` option exists, so the key
 never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment;
 your shell may still record a literal environment-assignment command in its own history.

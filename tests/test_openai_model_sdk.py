@@ -14,6 +14,7 @@ from coding_agent.openai_model import (
     OpenAIClientProtocol,
     OpenAIModelError,
     OpenAIResponsesModel,
+    ReasoningEffort,
 )
 
 
@@ -77,7 +78,11 @@ def test_real_sdk_serializes_a_stateless_two_turn_function_loop() -> None:
         http_client=http_client,
         max_retries=0,
     )
-    adapter = OpenAIResponsesModel(cast(OpenAIClientProtocol, client), model="gpt-test")
+    adapter = OpenAIResponsesModel(
+        cast(OpenAIClientProtocol, client),
+        model="gpt-test",
+        reasoning_effort=ReasoningEffort.NONE,
+    )
     tools = (
         ToolSpec(
             name="read_file",
@@ -122,6 +127,8 @@ def test_real_sdk_serializes_a_stateless_two_turn_function_loop() -> None:
     assert second.content == "README inspected."
     assert requests[0]["store"] is False
     assert requests[1]["store"] is False
+    assert requests[0]["reasoning"] == {"effort": "none"}
+    assert requests[1]["reasoning"] == {"effort": "none"}
     assert cast(list[dict[str, object]], requests[0]["tools"])[0]["strict"] is False
     second_input = cast(list[dict[str, object]], requests[1]["input"])
     assert second_input[-2] == {
