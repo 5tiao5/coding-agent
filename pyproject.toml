@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pathspec>=1.1,<2",
+    "psutil>=6.1,<8",
     "pydantic>=2.10,<3",
     "rich>=13.9,<15",
     "typer>=0.15,<1",
@@ -24,6 +25,7 @@ dev = [
     "pytest>=8.3,<10",
     "pytest-cov>=6,<8",
     "ruff>=0.9,<1",
+    "types-psutil>=7,<8",
 ]
 
 [tool.hatch.build.targets.wheel]
