@@ -1,0 +1,124 @@
+@media (max-width: 1080px) {
+  body {
+    overflow: auto;
+  }
+
+  .app-shell {
+    grid-template-columns: 215px minmax(0, 1fr);
+    height: auto;
+    min-height: 100vh;
+  }
+
+  .left-rail {
+    grid-row: 1 / span 2;
+  }
+
+  .session-view {
+    height: max(680px, 75vh);
+    border-radius: 8px var(--radius-lg) 8px 8px;
+  }
+
+  .right-rail {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(240px, 0.8fr);
+    grid-column: 2;
+    gap: 10px;
+    overflow: visible;
+    border-radius: 8px 8px var(--radius-lg) 8px;
+  }
+
+  .right-rail .detail-panel {
+    margin: 0;
+  }
+
+  .plan-panel {
+    grid-row: 1 / span 2;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    display: flex;
+    padding: 7px;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .left-rail,
+  .right-rail,
+  .session-view {
+    border-radius: var(--radius-md);
+  }
+
+  .left-rail {
+    padding: 14px;
+  }
+
+  .brand {
+    padding-bottom: 13px;
+  }
+
+  .workspace-card,
+  .local-note {
+    display: none;
+  }
+
+  .run-form {
+    margin-top: 0;
+  }
+
+  .run-form textarea {
+    min-height: 78px;
+  }
+
+  .session-view {
+    height: 690px;
+    grid-template-rows: 66px minmax(0, 1fr) 32px;
+  }
+
+  .session-header {
+    padding: 0 15px;
+  }
+
+  .conversation {
+    padding: 18px 14px 38px;
+  }
+
+  .session-footer {
+    padding: 0 12px;
+  }
+
+  .session-footer p {
+    display: none;
+  }
+
+  .right-rail {
+    display: flex;
+    padding: 10px;
+    flex-direction: column;
+  }
+
+  .activity-heading {
+    gap: 6px;
+  }
+
+  .activity-title-group {
+    display: block;
+  }
+
+  .activity-category {
+    display: block;
+    margin-bottom: 3px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

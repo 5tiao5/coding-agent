@@ -33,6 +33,9 @@ _START_KINDS = {EventKind.RUN_STARTED, EventKind.RUN_RESUMED}
 _MUTATION_TOOLS = {"replace_text", "undo_change", "write_file"}
 _NON_TTY_HIDDEN_KINDS = {EventKind.MODEL_REQUESTED, EventKind.MODEL_RESPONDED}
 _VERIFICATION_STATUSES = {"verified", "missing", "failed", "stale", "unverified"}
+_NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
+_MAX_PLAN_LINES = 8
+_MAX_EVIDENCE_LABELS = 8
 _LEVEL_STYLE: dict[TimelineLevel, str] = {
     "info": "cyan",
     "success": "green",
@@ -78,6 +81,8 @@ class DashboardSnapshot:
     elapsed_seconds: float
     terminal: bool
     run_failed: bool
+    stop_reason: str | None
+    plan_lines: tuple[str, ...]
     timeline: tuple[TimelineEntry, ...]
     latest_change: TimelineEntry | None
 
@@ -111,6 +116,8 @@ class DashboardProjection:
         self._last_at: datetime | None = None
         self._terminal = False
         self._run_failed = False
+        self._stop_reason: str | None = None
+        self._plan_lines: tuple[str, ...] = ()
         self._latest_change: TimelineEntry | None = None
 
     @property
@@ -129,6 +136,8 @@ class DashboardProjection:
             elapsed_seconds=self._elapsed_seconds(),
             terminal=self._terminal,
             run_failed=self._run_failed,
+            stop_reason=self._stop_reason,
+            plan_lines=self._plan_lines,
             timeline=tuple(self._timeline),
             latest_change=self._latest_change,
         )
@@ -170,6 +179,26 @@ class DashboardProjection:
         if kind is EventKind.MODEL_REQUESTED:
             self._phase = "DECIDING"
             return self._entry(event, "MODEL", "Selecting the next action", None)
+        if kind is EventKind.MODEL_RETRYING:
+            self._phase = "RETRYING"
+            next_attempt = _data_int(data, "next_attempt")
+            max_attempts = _data_int(data, "max_attempts")
+            delay_seconds = _data_number(data, "delay_seconds")
+            detail_parts: list[str] = []
+            if next_attempt is not None and max_attempts is not None:
+                detail_parts.append(f"Attempt {next_attempt} of {max_attempts}")
+            if delay_seconds is not None:
+                detail_parts.append(f"after {delay_seconds:g}s")
+            error_code = _data_string(data, "error_code")
+            if error_code:
+                detail_parts.append(_status_label(error_code))
+            return self._entry(
+                event,
+                "MODEL",
+                "Transient model failure; retry scheduled",
+                " · ".join(detail_parts) or None,
+                level="warning",
+            )
         if kind is EventKind.MODEL_RESPONDED:
             tool_count = _data_int(data, "tool_count") or 0
             has_content = _data_bool(data, "has_content")
@@ -198,6 +227,7 @@ class DashboardProjection:
             return self._tool_finished(event)
         if kind is EventKind.VERIFICATION_INVALIDATED:
             self._verification_status = "stale"
+            self._verification_labels.clear()
             return self._entry(
                 event,
                 "VERIFY",
@@ -209,7 +239,7 @@ class DashboardProjection:
             return self._verification_recorded(event)
         if kind is EventKind.VERIFICATION_EVALUATED:
             self._phase = "VERIFYING"
-            self._update_verification_status(data)
+            self._update_verification_report(data)
             level: TimelineLevel = (
                 "success" if self._verification_status == "verified" else "warning"
             )
@@ -236,13 +266,15 @@ class DashboardProjection:
             self._terminal = True
             self._phase = "COMPLETED"
             self._active_tools.clear()
-            self._update_verification_status(data)
+            self._update_verification_report(data)
             return None
         if kind is EventKind.RUN_FAILED:
             self._terminal = True
             self._run_failed = True
             self._phase = "FAILED"
             self._active_tools.clear()
+            self._verification_labels.clear()
+            self._stop_reason = _data_string(data, "stop_reason")
             if self._verification_status == "pending":
                 self._verification_status = "unverified"
             return None
@@ -255,7 +287,8 @@ class DashboardProjection:
         if call_id:
             self._active_tools.pop(call_id, None)
         self._tools_finished += 1
-        ok = _data_bool(data, "ok") is not False
+        explicit_ok = _data_bool(data, "ok")
+        ok = explicit_ok is not False
         level: TimelineLevel = "success" if ok else "error"
         if not ok:
             self._tools_failed += 1
@@ -263,6 +296,10 @@ class DashboardProjection:
         detail = summary if summary else (_error_detail(data) if not ok else "Completed")
         duration_ms = _data_number(data, "duration_ms")
         self._phase = "OBSERVING"
+        preview = _preview_lines(
+            data.get("preview"),
+            max_lines=_MAX_PLAN_LINES if name == "update_plan" else 6,
+        )
         entry = self._entry(
             event,
             "TOOL",
@@ -270,8 +307,13 @@ class DashboardProjection:
             detail,
             level=level,
             duration_ms=duration_ms,
-            preview=_preview_lines(data.get("preview")),
+            preview=preview,
         )
+        if name == "update_plan" and explicit_ok is True:
+            # The plan is durable presentation state, not merely a recent event.  An
+            # explicitly successful update replaces the previous snapshot; a missing
+            # or malformed safe preview clears it rather than showing a stale plan.
+            self._plan_lines = preview
         if name in _MUTATION_TOOLS and entry.preview:
             self._latest_change = entry
         return entry
@@ -281,7 +323,11 @@ class DashboardProjection:
         passed = _data_bool(data, "passed") is True
         self._verification_status = "passed" if passed else "failed"
         label = _data_string(data, "label")
-        if label and label not in self._verification_labels:
+        if (
+            label
+            and label not in self._verification_labels
+            and len(self._verification_labels) < _MAX_EVIDENCE_LABELS
+        ):
             self._verification_labels.append(label)
         kind = _data_string(data, "kind")
         detail_parts = [part for part in (kind, label) if part]
@@ -303,6 +349,19 @@ class DashboardProjection:
             self._verification_status = status
         elif verified is False:
             self._verification_status = "unverified"
+
+    def _update_verification_report(self, data: Mapping[str, object]) -> None:
+        """Replace the projection with the report's current, bounded evidence set."""
+        self._update_verification_status(data)
+        labels = _data_string_sequence(
+            data,
+            "evidence_labels",
+            max_items=_MAX_EVIDENCE_LABELS,
+            item_limit=100,
+        )
+        if self._verification_status in _NO_CURRENT_EVIDENCE_STATUSES:
+            labels = ()
+        self._verification_labels = list(labels)
 
     def _entry(
         self,
@@ -469,6 +528,12 @@ class DashboardEventSink:
                 border_style="cyan",
                 box=box.ASCII,
             ),
+            Panel(
+                self._plan_text(snapshot),
+                title=" CURRENT PLAN ",
+                border_style="cyan" if snapshot.plan_lines else "dim",
+                box=box.ASCII,
+            ),
             Panel(timeline, title=" ACTIVITY TIMELINE ", border_style="blue", box=box.ASCII),
             Panel(
                 self._latest_change_text(snapshot),
@@ -505,6 +570,9 @@ class DashboardEventSink:
             body.append(f"\nEvidence: {self._safe(labels)}", style="dim")
         if snapshot.run_failed:
             body.append("\nRun state: FAILED", style="bold red")
+            if snapshot.stop_reason:
+                reason = self._safe(_status_label(snapshot.stop_reason))
+                body.append(f"\nStop reason: {reason}", style="dim")
         return Panel(
             body,
             title=" FINAL RESULT ",
@@ -576,6 +644,16 @@ class DashboardEventSink:
             text.append(self._safe(line), style=_diff_line_style(line))
         return text
 
+    def _plan_text(self, snapshot: DashboardSnapshot) -> Text:
+        if not snapshot.plan_lines:
+            return Text("No structured plan recorded yet", style="dim")
+        text = Text()
+        for index, line in enumerate(snapshot.plan_lines):
+            if index:
+                text.append("\n")
+            text.append(self._safe(line), style="dim")
+        return text
+
     def _safe(self, value: str) -> str:
         return console_safe(_clean_text(value, limit=600), self._console)
 
@@ -617,6 +695,27 @@ def _data_number(data: Mapping[str, object], key: str) -> float | None:
         return None
     numeric = float(value)
     return numeric if numeric >= 0 and math.isfinite(numeric) else None
+
+
+def _data_string_sequence(
+    data: Mapping[str, object],
+    key: str,
+    *,
+    max_items: int,
+    item_limit: int,
+) -> tuple[str, ...]:
+    """Read one explicitly whitelisted, bounded list without stringifying values."""
+    value = data.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    result: list[str] = []
+    for candidate in value[:max_items]:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = _clean_text(candidate, limit=item_limit)
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return tuple(result)
 
 
 def _error_detail(data: Mapping[str, object]) -> str | None:

@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#edf3f7">
+    <meta
+      name="description"
+      content="Relay 是一个本地运行、过程可观察的编程智能体工作台。"
+    >
+    <title>Relay · 本地编程智能体</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/conversation.css">
+    <link rel="stylesheet" href="/static/inspector.css">
+    <link rel="stylesheet" href="/static/responsive.css">
+    <script type="module" src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <div class="app-shell">
+      <aside class="left-rail" aria-label="运行控制">
+        <header class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+          </div>
+          <div>
+            <p class="brand-name">Relay</p>
+            <p class="brand-caption">本地编程智能体</p>
+          </div>
+        </header>
+
+        <section class="workspace-card" aria-labelledby="workspace-heading">
+          <div class="section-kicker" id="workspace-heading">工作区</div>
+          <div class="workspace-row">
+            <div class="repo-glyph" aria-hidden="true"></div>
+            <div class="workspace-copy">
+              <strong id="workspace-name">当前仓库</strong>
+              <span id="runtime-label">本地运行 · 绑定工作区</span>
+            </div>
+          </div>
+          <div class="connection-row">
+            <span class="connection-dot" id="connection-dot" aria-hidden="true"></span>
+            <span id="connection-label">正在连接…</span>
+          </div>
+        </section>
+
+        <form class="run-form" id="run-form">
+          <div class="run-heading">
+            <label for="task-input">新任务</label>
+            <span>Ctrl / ⌘ + ↵</span>
+          </div>
+          <textarea
+            id="task-input"
+            name="task"
+            rows="6"
+            maxlength="20000"
+            placeholder="描述一个明确、聚焦的编程任务…"
+            required
+          ></textarea>
+          <button class="run-button" id="run-button" type="submit">
+            <span class="run-button-icon" aria-hidden="true"></span>
+            <span id="run-button-label">启动智能体</span>
+          </button>
+          <p class="form-message" id="form-message" aria-live="polite"></p>
+        </form>
+
+        <footer class="local-note">
+          <span class="shield-icon" aria-hidden="true"></span>
+          <p>
+            仅在本机运行。<br>
+            凭证只保留在后端。
+          </p>
+        </footer>
+      </aside>
+
+      <main class="session-view">
+        <header class="session-header">
+          <div>
+            <div class="session-title-row">
+              <h1>智能体会话</h1>
+              <span class="run-id" id="run-id" hidden></span>
+            </div>
+            <p id="phase-label">等待任务</p>
+          </div>
+          <div class="status-pill status-idle" id="run-status" role="status">
+            <span aria-hidden="true"></span>
+            <strong id="run-status-label">就绪</strong>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation" aria-label="智能体会话">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-orbit" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <p class="empty-eyebrow">随时可以开始</p>
+            <h2>给 Relay 一个具体的仓库任务。</h2>
+            <p class="empty-copy">
+              计划、工具活动、代码变更和验证证据，会在这里串成一条清晰轨迹。
+            </p>
+            <div class="empty-features" aria-hidden="true">
+              <span>计划</span>
+              <i></i>
+              <span>执行</span>
+              <i></i>
+              <span>验证</span>
+            </div>
+          </div>
+          <div
+            class="message-list"
+            id="message-list"
+            aria-live="polite"
+            aria-relevant="additions text"
+          ></div>
+        </section>
+
+        <footer class="session-footer">
+          <div class="footer-state">
+            <span class="pulse-dot" id="footer-pulse" aria-hidden="true"></span>
+            <span id="footer-label">空闲</span>
+          </div>
+          <p>操作可观察 · 本地执行 · 用证据确认完成</p>
+        </footer>
+      </main>
+
+      <aside class="right-rail" aria-label="运行详情">
+        <section class="detail-panel plan-panel" aria-labelledby="plan-heading">
+          <header class="panel-heading">
+            <div>
+              <p class="section-kicker">执行</p>
+              <h2 id="plan-heading">计划</h2>
+            </div>
+            <span class="panel-count" id="plan-count">0 / 0</span>
+          </header>
+          <div class="plan-list" id="plan-list">
+            <p class="panel-placeholder">运行开始后，这里会显示结构化计划。</p>
+          </div>
+        </section>
+
+        <section class="detail-panel verification-panel" aria-labelledby="verification-heading">
+          <header class="panel-heading compact-heading">
+            <div>
+              <p class="section-kicker">可信证据</p>
+              <h2 id="verification-heading">验证</h2>
+            </div>
+            <span class="verification-orb verification-pending" id="verification-orb" aria-hidden="true"></span>
+          </header>
+          <div class="verification-result">
+            <strong id="verification-outcome">等待验证</strong>
+            <span id="verification-status">等待外部检查证据</span>
+          </div>
+          <div class="evidence-list" id="evidence-list">
+            <span class="evidence-empty">尚无检查记录</span>
+          </div>
+        </section>
+
+        <section class="detail-panel metrics-panel" aria-labelledby="metrics-heading">
+          <header class="panel-heading compact-heading">
+            <div>
+              <p class="section-kicker">运行数据</p>
+              <h2 id="metrics-heading">运行指标</h2>
+            </div>
+          </header>
+          <div class="metric-grid">
+            <div class="metric">
+              <span>步骤</span>
+              <strong id="metric-step">0</strong>
+            </div>
+            <div class="metric">
+              <span>工具</span>
+              <strong id="metric-tools">0 / 0</strong>
+            </div>
+            <div class="metric">
+              <span>失败</span>
+              <strong id="metric-failed">0</strong>
+            </div>
+          </div>
+          <div class="active-tools" id="active-tools" hidden>
+            <span class="active-tools-label">正在运行</span>
+            <div class="active-tool-list" id="active-tool-list"></div>
+          </div>
+        </section>
+      </aside>
+    </div>
+
+    <div class="toast" id="toast" role="alert" hidden>
+      <span class="toast-mark" aria-hidden="true"></span>
+      <span id="toast-text"></span>
+    </div>
+  </body>
+</html>

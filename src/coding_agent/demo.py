@@ -25,10 +25,14 @@ from coding_agent.presentation import print_agent_response
 from coding_agent.runtime import build_runtime
 
 DEMO_TASK = (
-    "Reproduce the failing pricing test, locate and fix the duplicate discount, "
-    "then rerun the test suite and report only current verification evidence."
+    "复现失败的 pricing 测试，定位并修复 calculate_total 中重复扣减 discount 的缺陷；"
+    "随后重新运行 pytest，并且只报告对当前代码仍然有效的验证证据。"
 )
-DEMO_TASK_LABEL = "Repair duplicate discount"
+DEMO_TASK_LABEL = "修复 calculate_total 重复扣减 discount"
+_DEMO_PLAN_REPRODUCE = "运行失败的 pricing 测试以复现问题"
+_DEMO_PLAN_LOCATE = "定位重复扣减 discount 的缺陷"
+_DEMO_PLAN_REPAIR = "执行一次带版本校验的精确修改"
+_DEMO_PLAN_VERIFY = "重新运行 pricing 测试套件"
 DEMO_SOURCE_PATH = Path("src/pricing.py")
 DEMO_SOURCE_BEFORE = (
     b"def calculate_total(subtotal: int, discount: int) -> int:\n"
@@ -92,6 +96,7 @@ def run_repository_demo(
     *,
     event_sink: EventSink | None = None,
     model: ModelAdapter | None = None,
+    run_id: str | None = None,
 ) -> DemoRunResult:
     """Create and run the deterministic repair scenario under ``root``."""
     write_demo_project(root)
@@ -105,7 +110,7 @@ def run_repository_demo(
         event_sink=event_sink,
         max_steps=12,
     )
-    result = runner.run(DEMO_TASK)
+    result = runner.run(DEMO_TASK, run_id=run_id)
     source_matches_expected = root.joinpath(DEMO_SOURCE_PATH).read_bytes() == DEMO_SOURCE_AFTER
     return DemoRunResult(
         result=result,
@@ -127,22 +132,22 @@ def repository_demo_model() -> ScriptedModel:
                             "items": [
                                 {
                                     "id": "reproduce",
-                                    "step": "Run the failing pricing test",
+                                    "step": _DEMO_PLAN_REPRODUCE,
                                     "status": "in_progress",
                                 },
                                 {
                                     "id": "locate",
-                                    "step": "Locate the duplicate-discount defect",
+                                    "step": _DEMO_PLAN_LOCATE,
                                     "status": "pending",
                                 },
                                 {
                                     "id": "repair",
-                                    "step": "Apply one revision-checked edit",
+                                    "step": _DEMO_PLAN_REPAIR,
                                     "status": "pending",
                                 },
                                 {
                                     "id": "verify",
-                                    "step": "Rerun the pricing test suite",
+                                    "step": _DEMO_PLAN_VERIFY,
                                     "status": "pending",
                                 },
                             ]
@@ -174,22 +179,22 @@ def repository_demo_model() -> ScriptedModel:
                             "items": [
                                 {
                                     "id": "reproduce",
-                                    "step": "Run the failing pricing test",
+                                    "step": _DEMO_PLAN_REPRODUCE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "locate",
-                                    "step": "Locate the duplicate-discount defect",
+                                    "step": _DEMO_PLAN_LOCATE,
                                     "status": "in_progress",
                                 },
                                 {
                                     "id": "repair",
-                                    "step": "Apply one revision-checked edit",
+                                    "step": _DEMO_PLAN_REPAIR,
                                     "status": "pending",
                                 },
                                 {
                                     "id": "verify",
-                                    "step": "Rerun the pricing test suite",
+                                    "step": _DEMO_PLAN_VERIFY,
                                     "status": "pending",
                                 },
                             ]
@@ -237,22 +242,22 @@ def repository_demo_model() -> ScriptedModel:
                             "items": [
                                 {
                                     "id": "reproduce",
-                                    "step": "Run the failing pricing test",
+                                    "step": _DEMO_PLAN_REPRODUCE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "locate",
-                                    "step": "Locate the duplicate-discount defect",
+                                    "step": _DEMO_PLAN_LOCATE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "repair",
-                                    "step": "Apply one revision-checked edit",
+                                    "step": _DEMO_PLAN_REPAIR,
                                     "status": "in_progress",
                                 },
                                 {
                                     "id": "verify",
-                                    "step": "Rerun the pricing test suite",
+                                    "step": _DEMO_PLAN_VERIFY,
                                     "status": "pending",
                                 },
                             ]
@@ -285,22 +290,22 @@ def repository_demo_model() -> ScriptedModel:
                             "items": [
                                 {
                                     "id": "reproduce",
-                                    "step": "Run the failing pricing test",
+                                    "step": _DEMO_PLAN_REPRODUCE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "locate",
-                                    "step": "Locate the duplicate-discount defect",
+                                    "step": _DEMO_PLAN_LOCATE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "repair",
-                                    "step": "Apply one revision-checked edit",
+                                    "step": _DEMO_PLAN_REPAIR,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "verify",
-                                    "step": "Rerun the pricing test suite",
+                                    "step": _DEMO_PLAN_VERIFY,
                                     "status": "in_progress",
                                 },
                             ]
@@ -332,22 +337,22 @@ def repository_demo_model() -> ScriptedModel:
                             "items": [
                                 {
                                     "id": "reproduce",
-                                    "step": "Run the failing pricing test",
+                                    "step": _DEMO_PLAN_REPRODUCE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "locate",
-                                    "step": "Locate the duplicate-discount defect",
+                                    "step": _DEMO_PLAN_LOCATE,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "repair",
-                                    "step": "Apply one revision-checked edit",
+                                    "step": _DEMO_PLAN_REPAIR,
                                     "status": "completed",
                                 },
                                 {
                                     "id": "verify",
-                                    "step": "Rerun the pricing test suite",
+                                    "step": _DEMO_PLAN_VERIFY,
                                     "status": "completed",
                                 },
                             ]
@@ -357,8 +362,8 @@ def repository_demo_model() -> ScriptedModel:
             ),
             ModelResponse(
                 content=(
-                    "Fixed src/pricing.py: calculate_total now applies the discount exactly once. "
-                    "The post-change pytest run passed and is current for the final edit."
+                    "已修复 src/pricing.py：calculate_total 现在只会应用一次 discount。"
+                    "修改后重新运行的 pytest 已通过，且验证证据对应最后一次代码修改。"
                 )
             ),
         ]

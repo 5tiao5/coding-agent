@@ -98,7 +98,11 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
             EventKind.VERIFICATION_EVALUATED,
             step=3,
             seconds=1.5,
-            data={"verified": True, "status": "verified"},
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["pytest -q"],
+            },
         ),
         _event(
             EventKind.SESSION_CHECKPOINTED,
@@ -110,7 +114,11 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
             EventKind.RUN_FINISHED,
             step=3,
             seconds=2,
-            data={"verified": True, "status": "verified"},
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["pytest -q"],
+            },
         ),
     ]
 
@@ -131,7 +139,12 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
     assert snapshot.elapsed_seconds == 2
     assert snapshot.terminal is True
     assert snapshot.run_failed is False
+    assert snapshot.stop_reason is None
     assert snapshot.outcome == "VERIFIED"
+    assert snapshot.plan_lines == (
+        "[COMPLETED] Inspect failure",
+        "[IN PROGRESS] Apply repair",
+    )
     assert snapshot.latest_change is None
     tool_result = next(
         item
@@ -213,10 +226,41 @@ def test_projection_covers_resume_failure_and_safe_fallbacks() -> None:
     assert snapshot.tools_started == snapshot.tools_finished == 1
     assert snapshot.tools_failed == 1
     assert snapshot.verification_status == "failed"
+    assert snapshot.verification_labels == ()
+    assert snapshot.stop_reason == "model_error"
     assert snapshot.elapsed_seconds == pytest.approx(0.8)
     assert snapshot.timeline[-1].headline == "Checkpoint not saved"
     assert snapshot.timeline[-1].detail == "CHECKPOINT TOO LARGE"
     assert all("private_reasoning" not in str(item) for item in snapshot.timeline)
+
+
+def test_projection_exposes_only_bounded_model_retry_facts() -> None:
+    projection = DashboardProjection(max_timeline=4)
+    projection.apply(_event(EventKind.RUN_STARTED))
+
+    entry = projection.apply(
+        _event(
+            EventKind.MODEL_RETRYING,
+            step=2,
+            seconds=1,
+            message="provider response and credentials must stay private",
+            data={
+                "attempt": 1,
+                "next_attempt": 2,
+                "max_attempts": 3,
+                "delay_seconds": 0.5,
+                "error_code": "model_request_transient",
+                "provider_body": "must not render",
+            },
+        )
+    )
+
+    assert entry is not None
+    assert projection.snapshot.phase == "RETRYING"
+    assert entry.level == "warning"
+    assert entry.headline == "Transient model failure; retry scheduled"
+    assert entry.detail == "Attempt 2 of 3 · after 0.5s · MODEL REQUEST TRANSIENT"
+    assert "provider" not in entry.detail.casefold()
 
 
 def test_projection_bounds_timeline_and_rejects_mixed_runs() -> None:
@@ -266,6 +310,66 @@ def test_projection_handles_missing_and_unknown_verification_status() -> None:
         )
     )
     assert unknown.snapshot.verification_status == "unverified"
+
+
+def test_verification_reports_replace_labels_and_stale_state_hides_old_evidence() -> None:
+    projection = DashboardProjection(max_timeline=20)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=1,
+            data={"passed": True, "kind": "test", "label": "old pytest"},
+        )
+    )
+    assert projection.snapshot.verification_labels == ("old pytest",)
+
+    projection.apply(_event(EventKind.VERIFICATION_INVALIDATED, step=2))
+    assert projection.snapshot.verification_status == "stale"
+    assert not projection.snapshot.verification_labels
+
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=2,
+            data={
+                "verified": False,
+                "status": "stale",
+                "evidence_labels": ["old pytest", {"private": "SECRET EVIDENCE"}],
+                "raw_report": "SECRET RAW REPORT",
+            },
+        )
+    )
+    assert not projection.snapshot.verification_labels
+    assert "SECRET" not in str(projection.snapshot)
+
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=3,
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["fresh pytest", "fresh pytest", 3],
+            },
+        )
+    )
+    assert projection.snapshot.verification_labels == ("fresh pytest",)
+
+    projection.apply(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=3,
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["final pytest"],
+                "private_labels": ["SECRET FINAL EVIDENCE"],
+            },
+        )
+    )
+    assert projection.snapshot.verification_labels == ("final pytest",)
+    assert "SECRET" not in str(projection.snapshot)
 
 
 def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
@@ -325,7 +429,11 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
             step=2,
             seconds=1,
             message='{"private":"SECRET FINAL"}',
-            data={"verified": True, "status": "verified"},
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["pytest"],
+            },
         )
     )
 
@@ -374,7 +482,17 @@ def test_failed_run_card_is_unverified_and_does_not_repeat() -> None:
     stream = StringIO()
     sink = DashboardEventSink(_plain_console(stream), live=False)
     sink.emit(_event(EventKind.RUN_STARTED))
-    failure = _event(EventKind.RUN_FAILED, step=1, seconds=1)
+    failure = _event(
+        EventKind.RUN_FAILED,
+        step=1,
+        seconds=1,
+        message="SECRET TERMINAL MESSAGE",
+        data={
+            "stop_reason": "command_control_failed",
+            "raw_error": "SECRET RAW ERROR",
+            "private": {"reason": "SECRET PRIVATE REASON"},
+        },
+    )
     sink.emit(failure)
     sink.emit(failure)
 
@@ -382,7 +500,10 @@ def test_failed_run_card_is_unverified_and_does_not_repeat() -> None:
     assert output.count("FINAL RESULT") == 1
     assert "UNVERIFIED" in output
     assert "Run state: FAILED" in output
+    assert "Stop reason: COMMAND CONTROL FAILED" in output
     assert "stopped before trustworthy completion" in output
+    assert "SECRET" not in output
+    assert sink.snapshot.stop_reason == "command_control_failed"
 
 
 def test_full_dashboard_render_has_header_timeline_and_gate() -> None:
@@ -403,6 +524,8 @@ def test_full_dashboard_render_has_header_timeline_and_gate() -> None:
     output = stream.getvalue()
     assert "CODING AGENT" in output
     assert "ACTIVITY TIMELINE" in output
+    assert "CURRENT PLAN" in output
+    assert "No structured plan recorded yet" in output
     assert "LATEST CHANGE" in output
     assert "No workspace mutation recorded yet" in output
     assert "VERIFICATION GATE" in output
@@ -450,6 +573,70 @@ def test_latest_change_survives_timeline_eviction_and_renders_modified_lines() -
     assert "LATEST CHANGE" in output
     assert "-return discounted - discount" in output
     assert "+return discounted" in output
+
+
+def test_current_plan_survives_timeline_eviction_and_only_success_replaces_it() -> None:
+    stream = StringIO()
+    console = _plain_console(stream, width=120)
+    sink = DashboardEventSink(console, live=False, max_timeline=2)
+    sink.emit(_event(EventKind.RUN_STARTED))
+    plan = [
+        {"status": "completed" if index == 1 else "pending", "step": f"Plan step {index}"}
+        for index in range(1, 10)
+    ]
+    sink.emit(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "update_plan",
+                "ok": True,
+                "summary": "Plan updated",
+                "preview": {"plan": plan},
+                "raw_output": "SECRET PLAN OUTPUT",
+                "private": {"analysis": "SECRET PLAN REASONING"},
+            },
+        )
+    )
+    expected = (
+        "[COMPLETED] Plan step 1",
+        "[PENDING] Plan step 2",
+        "[PENDING] Plan step 3",
+        "[PENDING] Plan step 4",
+        "[PENDING] Plan step 5",
+        "[PENDING] Plan step 6",
+        "[PENDING] Plan step 7",
+        "[PENDING] Plan step 8",
+    )
+    assert sink.snapshot.plan_lines == expected
+
+    sink.emit(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=2,
+            data={
+                "tool_name": "update_plan",
+                "ok": False,
+                "error_code": "invalid_plan",
+                "raw_output": "SECRET FAILED PLAN",
+                "private": {"analysis": "SECRET FAILED REASONING"},
+            },
+        )
+    )
+    for step in range(3, 7):
+        sink.emit(_event(EventKind.MODEL_REQUESTED, step=step, seconds=step))
+
+    snapshot = sink.snapshot
+    assert len(snapshot.timeline) == 2
+    assert all(entry.category == "MODEL" for entry in snapshot.timeline)
+    assert snapshot.plan_lines == expected
+    console.print(sink.render())
+    output = stream.getvalue()
+    assert "CURRENT PLAN" in output
+    assert "Plan step 1" in output
+    assert "Plan step 8" in output
+    assert "Plan step 9" not in output
+    assert "SECRET" not in output
 
 
 def test_host_can_delay_final_card_until_all_other_output_is_complete() -> None:
