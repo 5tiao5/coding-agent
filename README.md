@@ -4,7 +4,7 @@
 
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
-The project is at **M4 (real model CLI, safe approval, durable traces, and demo UX)**. Its offline demo tells one complete repair story:
+The M4 core is complete. M5 now adds project-owned transient-model retries, a four-category regression-oracle evaluation harness, and a bounded **M5-UX** slice that exposes the same runtime through an optional local Web view. Both demos tell one complete repair story:
 
 `plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
 
@@ -15,20 +15,40 @@ The project is at **M4 (real model CLI, safe approval, durable traces, and demo 
 ```powershell
 uv sync --all-groups
 uv run coding-agent demo
+uv run coding-agent web --demo
+uv run coding-agent evaluate --help
 uv run ruff check src tests
 uv run mypy src tests
 uv run pytest
 ```
 
-The demo needs no API key or network. `ScriptedModel` supplies deterministic decisions, while the real Agent loop, tools, subprocess, diff, verification gate, events, and Rich dashboard still execute.
+Neither demo needs an API key or network. `coding-agent demo` uses the Rich terminal dashboard;
+`coding-agent web --demo` binds only to `127.0.0.1:8765`, opens the browser, and starts the same
+fixed repair scenario in an ephemeral fixture. `ScriptedModel` supplies deterministic decisions while
+the real Agent loop, tools, subprocess, diff, verification gate, and events still execute. Use
+`--no-open-browser` or `--port <port>` when needed.
 
-For a real repository run, provide the API key only through the environment and select the model explicitly:
+For a real repository run, provide the API key through the process environment or the fixed,
+untracked `.env.local` file and select the model explicitly:
 
 ```powershell
 $env:OPENAI_API_KEY = "..."
 $env:CODING_AGENT_MODEL = "<responses-compatible-model>"
 uv run coding-agent run "Fix the failing tests and verify the repair" --root . --mode safe
 ```
+
+For repeat local runs, copy the committed placeholder file once, edit the copy, and keep it private:
+
+```powershell
+Copy-Item .env.example .env.local
+notepad .env.local
+uv run coding-agent evaluate --live --allow-paid-api --case single-file --format json
+```
+
+Only `.env.local` in the launch directory is read; parent directories are never searched. The
+loader accepts only the four model settings shown in `.env.example`, disables value interpolation,
+and never replaces a value already present in the process environment. The file is Git-ignored but
+is still plaintext on disk, so do not display it in a recording or reuse a key that was committed.
 
 For DeepSeek's Responses-compatible endpoint, use its currently supported Responses model and
 explicitly disable reasoning for the stateless tool loop:
@@ -41,9 +61,51 @@ $env:CODING_AGENT_REASONING_EFFORT = "none"
 uv run coding-agent run "Inspect this repository and report one verified improvement" --root . --mode safe
 ```
 
+The optional live Web view uses the same environment and repository-owned application service:
+
+```powershell
+uv run coding-agent web --root . --model <model> --mode safe
+```
+
+### Opt-in live evaluation
+
+The evaluation command is network-disabled by default. A real-model run requires both explicit
+consent flags; there is no API-key argument:
+
+```powershell
+# One isolated case (recommended first smoke)
+uv run coding-agent evaluate --live --allow-paid-api --case single-file
+
+# Four categories, stable JSON, and a new report file
+uv run coding-agent evaluate --live --allow-paid-api --case all `
+  --format json --output evaluation.json
+```
+
+The command prints the endpoint host and the maximum request-attempt budget before starting. Each
+case begins with a known-red public test in a fresh temporary repository. After the Agent stops, the
+host copies only allowlisted source files into a sibling directory and runs separate regression tests
+with credentials removed. Public tests and pytest control files must remain byte-identical; a zero
+exit without a completed, non-empty all-passing oracle is rejected. Reports omit raw test output,
+commands, provider details, credentials, run IDs, and base URLs, and existing report files are never
+overwritten. This is an independent scoring path, not a secrecy boundary: the built-in scenario and
+oracle definitions ship with the project and code executing in the same environment could inspect
+them. Use an external container or service for a genuinely private benchmark.
+
+Evaluation exits `0` when every attempted case passes, `3` for a genuine task/oracle failure, `1`
+for a runner/provider/harness error, and `2` for invalid configuration. A suite stops after the first
+`error` to limit paid requests. Unit tests exercise the same harness with injected deterministic
+models; they are not presented as evidence of real-model intelligence.
+
+The browser can submit one local task and observe its bounded plan, timeline, latest Diff, verification
+state, and final response. In this first slice, Web `safe` mode has no browser approval broker:
+registered verification commands may run, while ordinary commands fail closed. Select `--mode auto`
+only when that broader local command authority is intentional; it remains subject to the command
+deny rules and is not an OS sandbox.
+
 Omit the task string for a `prompt-toolkit` input prompt. No `--api-key` option exists, so the key
-never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment;
-your shell may still record a literal environment-assignment command in its own history.
+never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment for
+stronger protection; `.env.local` is the convenient untracked development option, and a shell may
+still record a literal environment-assignment command in its own history.
 
 Useful commands:
 
@@ -53,7 +115,10 @@ uv run coding-agent inspect <run-id>
 uv run coding-agent resume <run-id> --root . --model <model>
 ```
 
-`safe` is the default: registered verification commands run directly, ordinary commands require a human confirmation, and non-interactive input denies them. `auto` skips that confirmation but keeps the destructive-command deny rules; it is not an OS sandbox.
+`safe` is the default. The CLI offers an exact-argv confirmation for ordinary commands and denies
+non-interactive input; the Web view currently denies those commands because it has no approval
+broker. `auto` skips confirmation in either host but keeps the destructive-command deny rules; it is
+not an OS sandbox.
 
 For `run` and `resume`, exit codes distinguish control outcomes:
 
@@ -77,6 +142,33 @@ The default live runtime registers only the exact current-Python `-I -m pytest -
 commands may run under the selected permission mode, but their output cannot manufacture
 verification evidence.
 
+## M5-UX local Web slice
+
+- CLI and Web both call the same repository application service and therefore share the Agent loop,
+  tools, permission policy, trace-first event ordering, checkpoints, and Verification Gate.
+- The server owns the repository, model, base URL, permission mode, state directory, and run limits;
+  the browser supplies only a bounded task.
+- At most one background run is active. Graceful server shutdown stops accepting tasks and attempts
+  a bounded drain before process exit. Browser state is a whitelist projection, not raw events,
+  canonical messages, tool output, raw provider response objects, or hidden reasoning.
+- This is a loopback presentation slice, not a remote or multi-user Web product, browser terminal,
+  editor, or alternate Agent implementation.
+- Transient connection, timeout, throttling, and selected server failures are retried by the
+  project-owned loop, not invisibly by the SDK. Retry scheduling is visible in both event projections
+  without exposing provider exception text.
+
+## M5 reliability and evaluation slice
+
+- SDK retries remain disabled; the Agent owns a bounded `0.5s → 1s` retry policy and retries only
+  explicitly classified transient transport/status failures.
+- Four stable categories cover a single-file repair, cross-file change, new feature, and indirect
+  fault. Success requires `AgentState.COMPLETED`, unchanged public-test controls, required source
+  changes, and a separate sibling regression oracle.
+- Case results distinguish `passed`, `failed`, and `error`; aggregate metrics include success rate,
+  steps, duration, and tool failures.
+- On 2026-08-29, `deepseek-v4-flash` passed all four categories individually and again in one
+  continuous suite: 8/8 case runs, five steps per case, zero tool errors; the full suite took 43.05s.
+
 ## Important limits
 
 - The Responses adapter uses `store=False` and explicitly sends a bounded context projection derived
@@ -87,21 +179,30 @@ verification evidence.
 - Resume restores the canonical transcript, not `PlanState`, the in-memory undo journal, approval decisions, or old verification evidence. Fresh verification is mandatory.
 - Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
 - A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
-- M5 still needs the four-category automated evaluation suite, clean-environment rehearsal, and final demo freeze.
+- The local Web view is not authenticated for hostile same-machine users. It binds to loopback and
+  applies host/header restrictions, but it is not intended for port forwarding or remote exposure.
+- Graceful Web shutdown gives an active run five seconds to drain. A longer run, forced process kill,
+  or machine failure can interrupt its final trace/checkpoint write; this is not crash-safe execution.
+- M5 still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
 
 ## Design boundary
 
 Generic libraries handle HTTP transport, validation, terminal rendering, input editing, process enumeration, ignore matching, and tests. Agent orchestration, context selection, tool definitions and dispatch, command launch/capability policy, stopping rules, checkpoint semantics, verification, and error semantics remain project-owned code.
 
 ```text
-CLI
- ├─ OpenAIResponsesModel / ScriptedModel
- ├─ AgentRunner ─ Context + Stop + Verification
- │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
- ├─ SessionStore + RunLease
- └─ CompositeEventSink
-     ├─ JsonlEventSink       durable audit facts
-     └─ DashboardEventSink   best-effort presentation
+CLI / loopback Web
+ └─ Repository application service
+     ├─ OpenAIResponsesModel / ScriptedModel
+     ├─ AgentRunner ─ Context + Stop + Verification
+     │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
+     ├─ SessionStore + RunLease
+     └─ CompositeEventSink
+         ├─ JsonlEventSink       durable audit facts
+         └─ DashboardProjection  bounded CLI/Web presentation
+
+evaluate CLI
+ └─ isolated public fixture → same application service
+     └─ allowlisted source copy → sibling regression oracle
 ```
 
 The runtime result, resumable checkpoint, audit trace, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/SECURITY.md](docs/SECURITY.md).

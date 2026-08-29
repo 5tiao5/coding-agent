@@ -69,6 +69,62 @@ instead of misreporting an already-applied change as a normal failure.
   confirmed, the runner emits a terminal control fact and the whole Agent run stops instead of
   accepting verification.
 
+## Local Web boundary
+
+- The optional Web host binds only to `127.0.0.1`; there is no configurable remote bind. The
+  server, not the browser, owns the repository, model, base URL, permission mode, state root,
+  verifier registrations, and run limits.
+- `TrustedHostMiddleware` accepts only `127.0.0.1` and `localhost`. Responses add a self-only
+  Content Security Policy plus `no-referrer`, `nosniff`, frame-deny, and `no-store` headers. These
+  are browser hardening measures, not user authentication.
+- API credentials remain in the backend environment. A process entry point may populate that
+  environment from the exact launch-directory `.env.local`; it never searches parents, loads only
+  the four allowlisted model settings, disables interpolation, and preserves existing environment
+  values. The file is ignored by Git but remains plaintext local storage. Credentials are never sent to browser state, static
+  assets, or storage. The browser receives only the documented snapshot whitelist and terminal
+  result, not raw events, canonical messages, raw provider responses, tool output, provider state,
+  or runtime config.
+- Worker exceptions and failed-result details are mapped to stable public messages before entering
+  browser state; raw exception text and `AgentResult.error` are not exposed by the Web API.
+- Web `safe` mode is deliberately fail-closed: there is no browser approval broker, so an ordinary
+  command that requires approval is denied. Exact host-registered verification commands retain
+  their capability-based path. `auto` must be selected explicitly and still is not a sandbox.
+- Graceful shutdown closes run admission and gives the daemon worker a five-second best-effort drain
+  window. A longer run, forced kill, host crash, or power loss can interrupt final trace/checkpoint
+  persistence; the Web host does not claim crash-safe execution.
+
+Loopback binding and request headers do not protect against an already-hostile process or user on
+the same machine. Do not port-forward, reverse-proxy, or otherwise expose this local session view.
+
+## Live evaluation boundary
+
+- Evaluation is network-disabled by default and has no API-key argument. A live run requires both
+  `--live` and `--allow-paid-api`, an explicit/environment model, and `OPENAI_API_KEY`. The endpoint
+  is validated before any fixture or model client is created; remote plain HTTP, credentials, query,
+  and fragment components fail as CLI configuration errors.
+- The CLI reports the endpoint host and a worst-case request-attempt ceiling before starting.
+  Evaluation fixes the Agent retry budget at one retry per step and stops a multi-case suite after
+  the first runner/provider/harness `error`.
+- Each case receives a fresh temporary repository with a known-failing public test. Public tests and
+  pytest control files are hashed before the Agent runs; changed, deleted, or newly added controls
+  fail integrity checks. Required source files must exist and required edits must change bytes.
+- Final judgement runs in a sibling directory that is not an Agent workspace. Only scenario-owned
+  source paths are copied there; the regression-oracle tests are materialized afterward. The verifier
+  uses the credential-stripped verifier environment, imports pytest before adding the candidate
+  source root, disables third-party plugin autoload/cache, and requires a per-run randomized marker,
+  a non-empty collected suite, and a passing call report for every collected test. An early zero exit
+  or an all-skipped suite is not success.
+- Success additionally requires the Agent's own state to be `COMPLETED`; an independently green
+  oracle cannot upgrade `COMPLETED_UNVERIFIED`. Reports expose only a versioned metric whitelist and
+  distinguish `passed`, task/oracle `failed`, and runtime `error`. They omit commands, raw pytest
+  output, provider details, base URLs, credentials, and run IDs; report files use exclusive creation.
+
+This separation protects the score from ordinary public-test softening and several process-exit
+tricks. It is neither a hostile-code sandbox nor a secret benchmark: built-in scenario definitions,
+including oracle assertions, ship in the installed Python package and same-environment candidate code
+could inspect them. Candidate source also executes locally. A genuinely private benchmark or an
+untrusted model/repository therefore requires an external service, VM, or container boundary.
+
 ### Not an operating-system sandbox
 
 A workspace-relative `cwd` only selects the starting directory. It does not restrict filesystem,
@@ -135,15 +191,18 @@ durable trace sink; renderer failure disables the view rather than changing Agen
 The OpenAI adapter uses custom function tools only. It does not use an Agents SDK, hosted code/file
 tools, automatic tool execution, or provider-managed conversation state. Requests set `store=false`;
 each request explicitly sends a bounded context projection derived from the project-owned canonical
-transcript. API keys come from the environment, are removed from child-command environments, and
-have no CLI argument. Explicit remote base URLs must use HTTPS and cannot contain userinfo, a query,
+transcript. API keys come from the process environment, optionally populated by the untracked
+`.env.local` boundary described above, are removed from child-command environments, and have no CLI
+argument. Explicit remote base URLs must use HTTPS and cannot contain userinfo, a query,
 or a fragment; plain HTTP is limited to loopback.
 
 Tool schemas currently advertise `strict=false` because several local Pydantic schemas intentionally
 contain optional fields with defaults; project-owned validation remains authoritative. SDK retries
-default to zero so retry behavior is not hidden below runtime events and deadlines. Provider errors
-are mapped to fixed messages without preserving headers, URLs, bodies, credentials, or exception
-chains.
+default to zero so retry behavior is not hidden below runtime events and deadlines. The project-owned
+runner retries only connection/timeouts, HTTP 408/409/429, and HTTP 5xx, with at most two retries in
+normal runs and one in evaluation. Every attempt and scheduled delay is observable. Retry events and
+terminal results use a fixed public error code/message rather than adapter-supplied detail. Provider
+errors are mapped without preserving headers, URLs, bodies, credentials, or exception chains.
 
 Stateless reasoning continuation is an explicit limitation. If a response combines a reasoning item
 with function calls, safe continuation would require retaining and replaying encrypted provider

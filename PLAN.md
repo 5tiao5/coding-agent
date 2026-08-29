@@ -1,12 +1,12 @@
 # Coding Agent 项目计划
 
-> 版本：v0.4 · 2026-08-28 · 截止：2026-09-02 24:00（北京时间）
+> 版本：v0.5 · 2026-08-29 · 截止：2026-09-02 24:00（北京时间）
 
-> 当前进度：M4 Demo UX 与轨迹已实现并进入冻结前复验；下一阶段是 M5 自动评测、干净环境复验与视频彩排。
+> 当前进度：M4 已完成；M5 核心已落地本地 loopback 会话视图、可观察模型重试和四类外置 oracle 评测。DeepSeek 实测两轮共 8/8 场景通过，主线剩余干净环境复验、最终演示任务三连测与视频彩排。
 
 ## 1. 目标
 
-实现一个终端编程智能体：模型自主读写本地项目、执行命令、根据反馈继续工作，直到完成任务或触发明确的停止条件。
+实现一个本地编程智能体：模型自主读写本地项目、执行命令、根据反馈继续工作，直到完成任务或触发明确的停止条件；CLI 与可选的 loopback Web 视图共享同一核心。
 
 项目追求“小内核、强工程性”：核心 Agent 机制自行实现，通用基础能力复用成熟库；最终成果必须可运行、可测试、可追踪、可解释，并能在两分钟内清楚展示一个真实编程闭环。
 
@@ -39,7 +39,8 @@
 - 被动 transcript checkpoint/load/resume、工作区绑定、完成轨迹拒绝和并发恢复 lease；工具局部状态不跨进程恢复。
 - 写文件前生成 Diff，并支持本次会话内撤销。
 - JSONL 事件轨迹与 `inspect <run-id>`：记录工具调用、结果、耗时、错误和停止原因；不记录模型隐式思维过程。
-- 自动评测：单文件修复、跨文件修改、新增功能、间接故障调试四类任务，统计成功率、步数、耗时和工具错误。
+- M5-UX 本地会话视图：绑定 loopback、单后台任务、复用同一 application service，只向浏览器提供白名单状态投影。
+- 自动评测：单文件修复、跨文件修改、新增功能、间接故障调试四类任务；每类使用临时公开红测、受保护测试清单、白名单源码复制和工作区外独立回归 oracle，统计成功率、步数、耗时和工具错误，并区分任务失败与运行错误。oracle 定义随项目发布，这是评分路径隔离而非秘密 benchmark 边界。
 
 ### P2：时间允许再做
 
@@ -49,24 +50,30 @@
 
 ### 非目标
 
-Web UI、多 Agent、向量数据库、MCP、插件市场、远程沙箱和 IDE 集成不进入本次范围。
+完整的远程/多用户 Web 产品、浏览器终端或编辑器、Web 审批 broker、多 Agent、向量数据库、MCP、插件市场、远程沙箱和 IDE 集成不进入本次范围。M5-UX 仅是 `127.0.0.1` 上的单任务会话视图，不扩张这些边界。
 
 ## 4. 架构
 
 ```text
-CLI
- └─ AgentRunner（状态机与循环）
-     ├─ ModelAdapter（供应商协议隔离）
-     ├─ ContextManager（预算与压缩）
-     ├─ Stop / Verification Policy
-     ├─ ToolRegistry（校验与执行）
-     │   ├─ File/Search Tools
-     │   └─ Command Tool
-     ├─ Policy（路径、命令能力、资源限制）
-     ├─ SessionStore（保存与恢复）
-     └─ EventSink
-         ├─ DashboardEventSink（Rich 时间线与验证卡）
-         └─ JsonlEventSink（持久轨迹与 inspect）
+CLI / loopback Web
+ └─ Repository application service
+     └─ AgentRunner（状态机与循环）
+         ├─ ModelAdapter（供应商协议隔离）
+         ├─ ContextManager（预算与压缩）
+         ├─ Stop / Verification Policy
+         ├─ ToolRegistry（校验与执行）
+         │   ├─ File/Search Tools
+         │   └─ Command Tool
+         ├─ Policy（路径、命令能力、资源限制）
+         ├─ SessionStore（保存与恢复）
+         └─ EventSink
+             ├─ JsonlEventSink（持久轨迹与 inspect）
+             ├─ DashboardEventSink（Rich 时间线与验证卡）
+             └─ WebRunService（浏览器白名单投影）
+
+evaluate CLI
+ └─ 临时公开 fixture → 同一 Repository application service
+     └─ 白名单源码复制 → sibling regression oracle
 ```
 
 内部边界采用少量稳定接口：`ModelAdapter.complete()`、`ToolDispatcher.execute()`、`CommandPolicy.classify()`、`EventSink.emit()`。事件轨迹是事实记录，上下文是从事实中选择出的模型视图，两者分离。
@@ -96,6 +103,8 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 | `pydantic` | 配置、工具参数和事件校验 | 工具调度与业务规则 |
 | `typer`、`rich` | 当前 CLI 与事件渲染 | Agent 状态机与对话历史 |
 | `prompt-toolkit` | 交互式任务输入 | Agent 循环与权限决策 |
+| `python-dotenv` | 解析固定且未入库的 `.env.local` | 配置搜索、密钥存储与 Agent 编排 |
+| `fastapi`、`uvicorn` | 本地 loopback 路由、静态资源与进程托管 | Agent 循环、工具执行、远程服务或多用户控制 |
 | `pathspec` | 尊重 `.gitignore` | 工作区安全边界 |
 | `psutil` | 枚举和终止进程树 | 命令启动、授权、超时与错误语义 |
 | `pytest` | 单元/集成测试、离线演示和默认验证能力 | Agent 决策与验证判定 |
@@ -111,7 +120,7 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 | 8/29 | M2 工具与安全 | 完成 | Agent 在 fixture 中定位 Bug、原子修改并支持撤销 |
 | 8/30 | M3 上下文与验证 | 完成 | 命令、计划、压缩、停止、被动恢复和 Verification Gate 测试通过 |
 | 8/31 | M4 Demo UX 与轨迹 | 完成 | 真实模型 CLI、审批、时间线、Diff、恢复、`inspect` 和验证卡片可完整演示 |
-| 9/1 | M5 评测与冻结 | 待开始 | 四类任务评测；干净环境复验；视频彩排；晚间冻结功能 |
+| 9/1 | M5 评测与冻结 | 进行中 | M5-UX、可观察重试和四类外置 oracle 评测已实现；DeepSeek 两轮 8/8 通过，待干净环境复验、最终演示任务三连测与视频彩排 |
 | 9/2 | 最终交付 | 待开始 | 安全检查、录制视频、整理材料并在截止前完成最终推送 |
 
 按可解释的功能单元小步提交并保留历史，不 squash、不改写已推送提交；截止后不再 push，包括文档修正和 tag。
