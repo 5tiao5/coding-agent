@@ -10,21 +10,27 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from rich.console import Console
 from rich.text import Text
 from typer.testing import CliRunner
 
+import coding_agent.cli as cli_module
 from coding_agent import __version__
 from coding_agent.cli import app
+from coding_agent.cli import console as cli_console
 from coding_agent.demo import (
     DEMO_SOURCE_BEFORE,
     DEMO_SOURCE_PATH,
+    DEMO_TASK,
     DEMO_VERIFICATION_ARGV,
     demo_verification_command,
     run_demo,
     run_repository_demo,
     write_demo_project,
 )
+from coding_agent.errors import CodedError
 from coding_agent.events import EventKind, MemoryEventSink, RunEvent
 from coding_agent.lease import RunLease, RunLeaseError
 from coding_agent.model import ScriptedModel
@@ -43,8 +49,31 @@ from coding_agent.runtime import default_pytest_verifier
 from coding_agent.session import SessionBoundary, SessionCheckpoint, SessionStore
 from coding_agent.state import StatePaths
 from coding_agent.trace import TraceStore
+from coding_agent.web.service import WebRunService
 
-runner = CliRunner()
+runner = CliRunner(charset=getattr(cli_console.file, "encoding", None) or "utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_local_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "load_local_environment", lambda: False)
+
+
+def test_cli_sanitizes_local_config_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_load() -> bool:
+        raise CodedError("local_config_unreadable", "Local configuration is invalid.")
+
+    monkeypatch.setattr(cli_module, "load_local_environment", fail_to_load)
+
+    result = runner.invoke(app, ["demo"])
+
+    assert result.exit_code == 2
+    assert "Local configuration is invalid." in result.stderr
+    assert "local_config_unreadable" not in result.stderr
 
 
 def test_version_option_prints_the_package_version() -> None:
@@ -87,8 +116,8 @@ def test_demo_exposes_a_real_read_edit_verify_loop() -> None:
     assert "FINAL RESULT" in result.stdout
     assert "Current trusted verification evidence passed" in result.stdout
     assert "Evidence: demo pytest" in result.stdout
-    assert "calculate_total now applies the discount exactly" in result.stdout
-    assert "post-change pytest run passed" in result.stdout
+    assert "calculate_total 现在只会应用一次" in result.stdout
+    assert "修改后重新运行的 pytest 已通过" in result.stdout
     assert "VERIFIED" in result.stdout
     assert result.stdout.rfind("AGENT RESPONSE") < result.stdout.rfind("FINAL RESULT")
     assert "\x1b" not in result.stdout
@@ -150,12 +179,57 @@ def test_packaged_demo_uses_the_stable_dashboard_renderer() -> None:
     output = stream.getvalue()
     assert result.state is AgentState.COMPLETED
     assert "Running update_plan" in output
-    assert "- [in_progress] reproduce: Run the failing pricing test" in output
+    assert "- [in_progress] reproduce: 运行失败的 pricing 测试以复现问题" in output
     assert "FINAL RESULT" in output
     assert "VERIFIED" in output
     assert "Evidence: demo pytest" in output
     assert output.rfind("AGENT RESPONSE") < output.rfind("FINAL RESULT")
     assert "\x1b" not in output
+
+
+def test_web_demo_uses_loopback_and_the_same_verified_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(web_app: FastAPI, **kwargs: object) -> None:
+        captured.update(kwargs)
+        service: WebRunService = web_app.state.run_service
+        assert service.wait(timeout=10), "offline Web demo did not finish"
+        captured["state"] = service.state()
+        captured["metadata"] = (
+            TestClient(
+                web_app,
+                base_url="http://localhost",
+            )
+            .get("/api/meta")
+            .json()
+        )
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        ["web", "--demo", "--no-open-browser", "--port", "8123"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8123
+    state = captured["state"]
+    assert isinstance(state, dict)
+    assert state["task"] == DEMO_TASK
+    assert state["status"] == "completed"
+    snapshot = state["snapshot"]
+    assert isinstance(snapshot, dict)
+    assert snapshot["outcome"] == "VERIFIED"
+    assert snapshot["plan_lines"]
+    assert captured["metadata"] == {
+        "workspace": "临时演示工作区",
+        "runtime": "离线确定性演示",
+        "task_locked": True,
+        "default_task": DEMO_TASK,
+    }
 
 
 def test_real_run_persists_terminal_session_and_inspectable_trace(

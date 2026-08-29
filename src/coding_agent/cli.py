@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import webbrowser
 from contextlib import suppress
 from pathlib import Path
+from threading import Timer
 from typing import NoReturn
 from uuid import uuid4
 
@@ -18,22 +21,37 @@ from rich.table import Table
 from rich.text import Text
 
 from coding_agent import __version__
-from coding_agent.agent import AgentRunner
+from coding_agent.application import RepositoryRunSpec, execute_repository_run
 from coding_agent.approval import ConsoleCommandApprover
 from coding_agent.command import CommandPermissionMode
 from coding_agent.dashboard import DashboardEventSink
 from coding_agent.demo import run_demo
 from coding_agent.errors import CodedError
-from coding_agent.events import BestEffortEventSink, CompositeEventSink, EventKind, RunEvent
+from coding_agent.evaluation import EvaluationConfig, evaluate_suite
+from coding_agent.evaluation_cli import (
+    EVALUATION_MAX_MODEL_RETRIES,
+    EvaluationCase,
+    EvaluationFormat,
+    evaluation_endpoint_label,
+    evaluation_payload,
+    print_evaluation_report,
+    selected_evaluation_scenarios,
+    validate_new_report_path,
+    write_new_report,
+)
+from coding_agent.events import EventKind, RunEvent
 from coding_agent.lease import RunLease
+from coding_agent.local_config import load_local_environment
 from coding_agent.models import AgentResult, AgentState
-from coding_agent.openai_model import ReasoningEffort, create_openai_responses_model
+from coding_agent.openai_model import (
+    ReasoningEffort,
+    create_openai_responses_model,
+    validate_base_url,
+)
 from coding_agent.presentation import print_agent_response, safe_terminal_text
-from coding_agent.runtime import build_runtime, system_prompt_for
 from coding_agent.session import LoadedSession, SessionBoundary, SessionStore
 from coding_agent.state import StatePaths, default_state_paths
 from coding_agent.trace import (
-    JsonlEventSink,
     TraceError,
     TraceRunStatus,
     TraceStore,
@@ -67,6 +85,10 @@ def main(
 ) -> None:
     """Run the coding agent."""
     del version
+    try:
+        load_local_environment()
+    except CodedError as exc:
+        raise typer.BadParameter(exc.message, param_hint=".env.local") from None
 
 
 @app.command()
@@ -78,6 +100,307 @@ def demo() -> None:
         _abort("Demo failed", _public_exception(exc), code=1)
     if result.state is not AgentState.COMPLETED:
         raise typer.Exit(code=1)
+
+
+@app.command("evaluate")
+def evaluate_agent(
+    case: EvaluationCase = typer.Option(
+        EvaluationCase.SINGLE_FILE,
+        "--case",
+        case_sensitive=False,
+        help="Isolated evaluation case; choose all only for an intentional full paid run.",
+    ),
+    output_format: EvaluationFormat = typer.Option(
+        EvaluationFormat.TABLE,
+        "--format",
+        case_sensitive=False,
+        help="Human-readable table or stable JSON report.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        file_okay=True,
+        dir_okay=False,
+        help="New JSON report path; existing files are never overwritten.",
+    ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Explicitly enable real model requests; evaluation never contacts a model by default.",
+    ),
+    allow_paid_api: bool = typer.Option(
+        False,
+        "--allow-paid-api",
+        help="Confirm that this evaluation may consume paid model API quota.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        envvar="CODING_AGENT_MODEL",
+        show_envvar=True,
+        help="Responses-compatible model used by the live evaluation.",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="OPENAI_BASE_URL",
+        show_envvar=True,
+        help="Optional OpenAI-compatible Responses API base URL.",
+    ),
+    reasoning_effort: ReasoningEffort | None = typer.Option(
+        None,
+        "--reasoning-effort",
+        envvar="CODING_AGENT_REASONING_EFFORT",
+        show_envvar=True,
+        case_sensitive=False,
+        help="Evaluation supports only omitted or none reasoning for stateless tool turns.",
+    ),
+    max_steps: int = typer.Option(12, "--max-steps", min=1, max=20),
+    model_timeout: float = typer.Option(90.0, "--model-timeout", min=1.0, max=600.0),
+    oracle_timeout: float = typer.Option(45.0, "--oracle-timeout", min=1.0, max=300.0),
+) -> None:
+    """Run paid, opt-in model evaluation against integrity-checked temporary fixtures."""
+
+    if not live:
+        raise typer.BadParameter(
+            "evaluation is network-disabled by default; add --live to opt in",
+            param_hint="--live",
+        )
+    if not allow_paid_api:
+        raise typer.BadParameter(
+            "confirm possible model API charges with --allow-paid-api",
+            param_hint="--allow-paid-api",
+        )
+    if output is not None and output_format is not EvaluationFormat.JSON:
+        raise typer.BadParameter(
+            "--output is available only with --format json",
+            param_hint="--output",
+        )
+    if output is not None:
+        try:
+            validate_new_report_path(output)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(
+                _public_exception(exc),
+                param_hint="--output",
+            ) from None
+    if reasoning_effort not in {None, ReasoningEffort.NONE}:
+        raise typer.BadParameter(
+            "this stateless evaluation requires omitted reasoning or --reasoning-effort none",
+            param_hint="--reasoning-effort",
+        )
+    normalized_base_url = base_url
+    if normalized_base_url is not None:
+        try:
+            normalized_base_url = validate_base_url(normalized_base_url)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--base-url") from None
+
+    selected_model = _required_model(model)
+    _require_api_key()
+    scenarios = selected_evaluation_scenarios(case)
+    request_attempt_ceiling = len(scenarios) * max_steps * (EVALUATION_MAX_MODEL_RETRIES + 1)
+    endpoint_label = evaluation_endpoint_label(normalized_base_url)
+    typer.echo(
+        (
+            f"Live evaluation endpoint: {safe_terminal_text(endpoint_label, console=console)}; "
+            f"request-attempt ceiling: {request_attempt_ceiling} "
+            f"({len(scenarios)} case(s) x {max_steps} steps x "
+            f"{EVALUATION_MAX_MODEL_RETRIES + 1} attempts)."
+        ),
+        err=True,
+    )
+    if output_format is EvaluationFormat.TABLE:
+        console.print(
+            Text.assemble(
+                f"Running {len(scenarios)} isolated live evaluation case(s) with ",
+                (selected_model, "bold"),
+                "...",
+            )
+        )
+    try:
+        config = EvaluationConfig(
+            model_name=selected_model,
+            base_url=normalized_base_url,
+            reasoning_effort=reasoning_effort,
+            permission_mode=CommandPermissionMode.SAFE,
+            max_steps=max_steps,
+            model_timeout=model_timeout,
+            oracle_timeout=oracle_timeout,
+            max_model_retries=EVALUATION_MAX_MODEL_RETRIES,
+        )
+        report = evaluate_suite(
+            config=config,
+            scenarios=scenarios,
+        )
+        if output_format is EvaluationFormat.JSON:
+            rendered = json.dumps(
+                evaluation_payload(
+                    report,
+                    model_name=selected_model,
+                    planned_cases=len(scenarios),
+                    max_steps=max_steps,
+                    max_model_retries=EVALUATION_MAX_MODEL_RETRIES,
+                ),
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+            )
+            if output is None:
+                typer.echo(rendered)
+            else:
+                write_new_report(output, rendered)
+                console.print(Text(f"Evaluation report written to {output}"))
+        else:
+            print_evaluation_report(report, console=console)
+    except Exception as exc:  # noqa: BLE001 - sanitize the evaluation host boundary.
+        if output_format is EvaluationFormat.JSON:
+            typer.echo("Evaluation failed. No JSON report was produced.", err=True)
+            raise typer.Exit(code=1) from None
+        message = (
+            _public_exception(exc)
+            if isinstance(exc, (CodedError, OSError))
+            else f"Evaluation harness failed unexpectedly ({type(exc).__name__})."
+        )
+        _abort("Evaluation failed", message, code=1)
+
+    if report.aggregate.error_cases:
+        raise typer.Exit(code=1)
+    if report.aggregate.failed_cases:
+        raise typer.Exit(code=3)
+
+
+@app.command("web")
+def web_console(
+    root: Path = typer.Option(
+        Path("."),
+        "--root",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        help="Repository root fixed for this local Web process.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        envvar="CODING_AGENT_MODEL",
+        show_envvar=True,
+        help="Responses API model name for live runs.",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="OPENAI_BASE_URL",
+        show_envvar=True,
+        help="Optional OpenAI-compatible Responses API base URL.",
+    ),
+    reasoning_effort: ReasoningEffort | None = typer.Option(
+        None,
+        "--reasoning-effort",
+        envvar="CODING_AGENT_REASONING_EFFORT",
+        show_envvar=True,
+        case_sensitive=False,
+        help="Explicit Responses reasoning effort; use none for stateless tool loops.",
+    ),
+    mode: CommandPermissionMode = typer.Option(
+        CommandPermissionMode.SAFE,
+        "--mode",
+        case_sensitive=False,
+        help=(
+            "Command mode; Web safe denies ordinary commands, while auto skips approval "
+            "but is not an OS sandbox."
+        ),
+    ),
+    state_dir: Path | None = typer.Option(None, "--state-dir", help="Private state root."),
+    max_steps: int = typer.Option(20, "--max-steps", min=1, max=100),
+    model_timeout: float = typer.Option(
+        120.0,
+        "--model-timeout",
+        min=1.0,
+        max=600.0,
+    ),
+    port: int = typer.Option(8765, "--port", min=1, max=65535),
+    offline_demo: bool = typer.Option(
+        False,
+        "--demo",
+        help="Run the deterministic repair scenario without a model API key.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open-browser/--no-open-browser",
+        help="Open the loopback UI in the default browser after startup.",
+    ),
+) -> None:
+    """Launch the optional local conversation UI over the same Agent core."""
+    import uvicorn
+
+    from coding_agent.demo import DEMO_TASK
+    from coding_agent.web import create_app
+    from coding_agent.web.runtime import (
+        WebRepositoryConfig,
+        create_demo_service,
+        create_repository_service,
+    )
+
+    resolved_root = root.resolve(strict=True)
+    if offline_demo:
+        service = create_demo_service()
+        workspace_label = "临时演示工作区"
+        runtime_label = "离线确定性演示"
+        default_task = DEMO_TASK
+        task_locked = True
+    else:
+        selected_model = _required_model(model)
+        paths = _resolve_state_paths(state_dir, workspace=resolved_root)
+        _require_api_key()
+        service = create_repository_service(
+            WebRepositoryConfig(
+                root=resolved_root,
+                model_name=selected_model,
+                base_url=base_url,
+                reasoning_effort=reasoning_effort,
+                permission_mode=mode,
+                paths=paths,
+                max_steps=max_steps,
+                model_timeout=model_timeout,
+            )
+        )
+        workspace_label = resolved_root.name
+        mode_label = "安全模式" if mode is CommandPermissionMode.SAFE else "自动模式"
+        runtime_label = f"{selected_model} · {mode_label}"
+        default_task = None
+        task_locked = False
+
+    web_app = create_app(
+        service,
+        workspace_label=workspace_label,
+        runtime_label=runtime_label,
+        default_task=default_task,
+        task_locked=task_locked,
+    )
+    url = f"http://127.0.0.1:{port}"
+    console.print(
+        Panel(
+            f"本地会话界面：{url}\n仅监听本机回环地址；仓库与模型配置由服务端持有。",
+            title="CODING AGENT WEB",
+            border_style="cyan",
+        )
+    )
+    if offline_demo:
+        service.start(DEMO_TASK)
+    if open_browser:
+        opener = Timer(0.6, webbrowser.open, args=(url,))
+        opener.daemon = True
+        opener.start()
+    uvicorn.run(
+        web_app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        access_log=False,
+    )
 
 
 @app.command("run")
@@ -365,41 +688,34 @@ def _execute_live_run(
     dashboard = DashboardEventSink(
         console,
         live=False if plain else None,
-        task_label=f"Repository task in {root.name}",
+        task_label=task,
         auto_final_card=False,
     )
     approver = ConsoleCommandApprover(
         console,
         before_prompt=lambda: _close_dashboard(dashboard),
     )
-    runtime = build_runtime(root, permission_mode=mode, approver=approver)
-    store = session_store or SessionStore(paths.sessions, workspace_root=root)
-    model = create_openai_responses_model(
-        model=model_name,
+    spec = RepositoryRunSpec(
+        run_id=run_id,
+        task=task,
+        root=root,
+        model_name=model_name,
         base_url=base_url,
         reasoning_effort=reasoning_effort,
-        timeout_seconds=model_timeout,
-        max_retries=0,
-    )
-    trace = JsonlEventSink(paths.traces)
-    runner = AgentRunner(
-        model,
-        runtime.tools,
-        event_sink=CompositeEventSink(trace, BestEffortEventSink(dashboard)),
+        permission_mode=mode,
+        paths=paths,
         max_steps=max_steps,
-        session_store=store,
+        model_timeout=model_timeout,
     )
     try:
-        if loaded is None:
-            result = runner.run(
-                task,
-                system_prompt=system_prompt_for(runtime.verification_commands),
-                run_id=run_id,
-            )
-        else:
-            if loaded.checkpoint.run_id != run_id:
-                raise ValueError("loaded checkpoint does not match the leased run ID")
-            result = runner.resume(loaded)
+        result = execute_repository_run(
+            spec,
+            event_sink=dashboard,
+            approver=approver,
+            session_store=session_store,
+            loaded=loaded,
+            model_factory=create_openai_responses_model,
+        )
     finally:
         _close_dashboard(dashboard)
 
