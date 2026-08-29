@@ -7,7 +7,12 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from coding_agent.errors import CodedError
 from coding_agent.models import ChatMessage, ModelResponse, ToolSpec
+
+
+class RetryableModelError(CodedError):
+    """A sanitized transient model failure that the project-owned loop may retry."""
 
 
 class ModelAdapter(Protocol):

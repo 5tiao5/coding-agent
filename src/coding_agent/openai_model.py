@@ -12,6 +12,7 @@ from typing import Any, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
 
 from coding_agent.errors import CodedError
+from coding_agent.model import RetryableModelError
 from coding_agent.models import (
     ChatMessage,
     MessageRole,
@@ -97,9 +98,14 @@ class OpenAIResponsesModel:
             request["reasoning"] = {"effort": self._reasoning_effort.value}
         try:
             response = self._client.responses.create(**request)
-        except Exception:
+        except Exception as exc:
             # Provider exceptions can contain request headers, URLs, or credentials.
             # Keep the public error deliberately generic and suppress exception chaining.
+            if _is_retryable_provider_exception(exc):
+                raise RetryableModelError(
+                    "openai_request_transient",
+                    "OpenAI model request failed transiently",
+                ) from None
             raise OpenAIModelError(
                 "openai_request_failed",
                 "OpenAI model request failed",
@@ -127,7 +133,7 @@ def create_openai_responses_model(
         # every endpoint, including ambient configuration, crosses our boundary.
         base_url = os.environ.get("OPENAI_BASE_URL")
     if base_url is not None:
-        base_url = _validated_base_url(base_url)
+        base_url = validate_base_url(base_url)
     if client_factory is None:
         from openai import OpenAI
 
@@ -352,7 +358,9 @@ def _raise_invalid_request(reason: str) -> NoReturn:
     )
 
 
-def _validated_base_url(value: str) -> str:
+def validate_base_url(value: str) -> str:
+    """Validate and normalize one explicit Responses-compatible endpoint."""
+
     normalized = value.strip()
     if not normalized:
         raise ValueError("base_url must not be blank")
@@ -378,6 +386,22 @@ def _is_loopback_host(host: str) -> bool:
         return ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _is_retryable_provider_exception(exc: Exception) -> bool:
+    """Recognize only official SDK failures whose request is safe to attempt again."""
+
+    try:
+        from openai import APIConnectionError, APIStatusError
+    except ImportError:  # pragma: no cover - the SDK is a runtime dependency.
+        return False
+
+    if isinstance(exc, APIConnectionError):
+        return True
+    if not isinstance(exc, APIStatusError):
+        return False
+    status_code = exc.status_code
+    return status_code in {408, 409, 429} or status_code >= 500
 
 
 def _safe_status(status: str) -> str:

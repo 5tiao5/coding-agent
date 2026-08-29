@@ -16,6 +16,7 @@ class EventKind(StrEnum):
     RUN_RESUMED = "run_resumed"
     STATE_CHANGED = "state_changed"
     MODEL_REQUESTED = "model_requested"
+    MODEL_RETRYING = "model_retrying"
     MODEL_RESPONDED = "model_responded"
     CONTEXT_COMPACTED = "context_compacted"
     TOOL_STARTED = "tool_started"

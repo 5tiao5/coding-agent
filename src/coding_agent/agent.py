@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from math import isfinite
+from time import sleep
 from uuid import uuid4
 
 from coding_agent.context import ContextError, ContextManager
 from coding_agent.events import EventKind, EventSink, NullEventSink, RunEvent
-from coding_agent.model import ModelAdapter
+from coding_agent.model import ModelAdapter, RetryableModelError
 from coding_agent.models import (
     AgentResult,
     AgentState,
@@ -66,6 +68,9 @@ class AgentRunner:
         max_tool_calls_per_step: int = 8,
         max_total_tool_calls: int = 40,
         max_repeated_tool_results: int = 3,
+        max_model_retries: int = 2,
+        model_retry_base_delay_seconds: float = 0.5,
+        model_retry_sleeper: Callable[[float], None] = sleep,
         context_manager: ContextManager | None = None,
         session_store: SessionStore | None = None,
     ) -> None:
@@ -75,6 +80,19 @@ class AgentRunner:
             raise ValueError("tool call limits must be at least 1")
         if max_repeated_tool_results < 2:
             raise ValueError("max_repeated_tool_results must be at least 2")
+        if (
+            isinstance(max_model_retries, bool)
+            or not isinstance(max_model_retries, int)
+            or not 0 <= max_model_retries <= 10
+        ):
+            raise ValueError("max_model_retries must be an integer between 0 and 10")
+        if (
+            isinstance(model_retry_base_delay_seconds, bool)
+            or not isinstance(model_retry_base_delay_seconds, int | float)
+            or not isfinite(model_retry_base_delay_seconds)
+            or not 0 <= model_retry_base_delay_seconds <= 60
+        ):
+            raise ValueError("model_retry_base_delay_seconds must be between 0 and 60")
         self._model = model
         self._tools = tools
         self._events = event_sink or NullEventSink()
@@ -82,6 +100,9 @@ class AgentRunner:
         self._max_tool_calls_per_step = max_tool_calls_per_step
         self._max_total_tool_calls = max_total_tool_calls
         self._max_repeated_tool_results = max_repeated_tool_results
+        self._max_model_retries = max_model_retries
+        self._model_retry_base_delay_seconds = float(model_retry_base_delay_seconds)
+        self._model_retry_sleeper = model_retry_sleeper
         self._context = context_manager or ContextManager(max_chars=80_000)
         self._session_store = session_store
 
@@ -207,28 +228,77 @@ class AgentRunner:
                         "compacted_blocks": prepared.metadata.compacted_blocks,
                     },
                 )
-            self._emit(run_id, EventKind.MODEL_REQUESTED, "Model requested", step)
-
-            try:
-                response = self._model.complete(prepared.model_view, tool_specs)
-            except KeyboardInterrupt:
-                return self._failure(
+            response = None
+            max_attempts = self._max_model_retries + 1
+            for attempt in range(1, max_attempts + 1):
+                self._emit(
                     run_id,
-                    state,
-                    StopReason.USER_INTERRUPTED,
+                    EventKind.MODEL_REQUESTED,
+                    "Model requested",
                     step,
-                    messages,
-                    "Run interrupted by user",
+                    {"attempt": attempt, "max_attempts": max_attempts},
                 )
-            except Exception as exc:  # noqa: BLE001 - adapter errors become terminal run results.
-                return self._failure(
-                    run_id,
-                    state,
-                    StopReason.MODEL_ERROR,
-                    step,
-                    messages,
-                    f"Model request failed: {exc}",
-                )
+                try:
+                    response = self._model.complete(prepared.model_view, tool_specs)
+                except KeyboardInterrupt:
+                    return self._failure(
+                        run_id,
+                        state,
+                        StopReason.USER_INTERRUPTED,
+                        step,
+                        messages,
+                        "Run interrupted by user",
+                    )
+                except RetryableModelError:
+                    if attempt == max_attempts:
+                        return self._failure(
+                            run_id,
+                            state,
+                            StopReason.MODEL_ERROR,
+                            step,
+                            messages,
+                            "Model request failed after transient retries",
+                        )
+                    delay_seconds = min(
+                        self._model_retry_base_delay_seconds * (2 ** (attempt - 1)),
+                        60.0,
+                    )
+                    self._emit(
+                        run_id,
+                        EventKind.MODEL_RETRYING,
+                        "Retrying model after a transient failure",
+                        step,
+                        {
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "delay_seconds": delay_seconds,
+                            "error_code": "model_request_transient",
+                        },
+                    )
+                    try:
+                        self._model_retry_sleeper(delay_seconds)
+                    except KeyboardInterrupt:
+                        return self._failure(
+                            run_id,
+                            state,
+                            StopReason.USER_INTERRUPTED,
+                            step,
+                            messages,
+                            "Run interrupted by user during model retry delay",
+                        )
+                except Exception as exc:  # noqa: BLE001 - adapter errors terminate the run.
+                    return self._failure(
+                        run_id,
+                        state,
+                        StopReason.MODEL_ERROR,
+                        step,
+                        messages,
+                        f"Model request failed: {exc}",
+                    )
+                else:
+                    break
+            assert response is not None
 
             self._emit(
                 run_id,

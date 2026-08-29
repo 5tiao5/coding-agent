@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import httpx
 import pytest
+from openai import APIStatusError, APITimeoutError
 
+from coding_agent.model import RetryableModelError
 from coding_agent.models import (
     ChatMessage,
     MessageRole,
@@ -333,6 +336,49 @@ def test_sanitizes_sdk_exceptions_without_chaining_provider_details() -> None:
     assert str(error.value) == "OpenAI model request failed"
     assert secret not in str(error.value)
     assert error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("kind", ["timeout", "rate-limit", "server-error"])
+def test_maps_only_transient_sdk_request_failures_to_retryable_errors(kind: str) -> None:
+    request = httpx.Request("POST", "https://provider.invalid/v1/responses")
+    if kind == "timeout":
+        provider_error: Exception = APITimeoutError(request)
+    else:
+        status_code = 429 if kind == "rate-limit" else 503
+        response = httpx.Response(status_code, request=request)
+        provider_error = APIStatusError(
+            "provider body must not escape",
+            response=response,
+            body={"secret": "TEST_PROVIDER_SECRET_SENTINEL"},
+        )
+    adapter, _ = _adapter(provider_error)
+
+    with pytest.raises(RetryableModelError) as error:
+        adapter.complete(
+            (ChatMessage(role=MessageRole.USER, content="Respond."),),
+            (),
+        )
+
+    assert error.value.code == "openai_request_transient"
+    assert str(error.value) == "OpenAI model request failed transiently"
+    assert "provider body" not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_nontransient_sdk_status_failure_remains_nonretryable() -> None:
+    request = httpx.Request("POST", "https://provider.invalid/v1/responses")
+    response = httpx.Response(400, request=request)
+    adapter, _ = _adapter(APIStatusError("invalid request detail", response=response, body=None))
+
+    with pytest.raises(OpenAIModelError) as error:
+        adapter.complete(
+            (ChatMessage(role=MessageRole.USER, content="Respond."),),
+            (),
+        )
+
+    assert not isinstance(error.value, RetryableModelError)
+    assert error.value.code == "openai_request_failed"
+    assert str(error.value) == "OpenAI model request failed"
 
 
 def test_rejects_non_json_history_arguments_before_contacting_provider() -> None:

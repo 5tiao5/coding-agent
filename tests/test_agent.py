@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Sequence
 
 import pytest
 from pydantic import BaseModel, Field, TypeAdapter
@@ -11,14 +12,16 @@ from pydantic import BaseModel, Field, TypeAdapter
 from coding_agent.agent import AgentRunner
 from coding_agent.context import ContextManager
 from coding_agent.events import EventKind, MemoryEventSink
-from coding_agent.model import ScriptedModel
+from coding_agent.model import RetryableModelError, ScriptedModel
 from coding_agent.models import (
     AgentState,
+    ChatMessage,
     MessageRole,
     ModelResponse,
     StopReason,
     ToolCall,
     ToolControlFacts,
+    ToolSpec,
     VerificationKind,
     VerificationSignal,
 )
@@ -66,6 +69,27 @@ class EchoTool(BaseTool[EchoArgs]):
         self.calls.append(arguments)
         content = arguments.text.upper() if arguments.uppercase else arguments.text
         return ToolOutput(content=content, summary="Echoed test text")
+
+
+class OutcomeModel:
+    """Return responses or raise failures in a deterministic request sequence."""
+
+    def __init__(self, outcomes: Sequence[ModelResponse | BaseException]) -> None:
+        self._outcomes = list(outcomes)
+        self.requests: list[tuple[tuple[ChatMessage, ...], tuple[ToolSpec, ...]]] = []
+
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec],
+    ) -> ModelResponse:
+        self.requests.append((tuple(messages), tuple(tools)))
+        if not self._outcomes:
+            raise RuntimeError("outcome model has no response remaining")
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 def _tool_payload(model: ScriptedModel, request_index: int = 1) -> dict[str, object]:
@@ -277,6 +301,151 @@ def test_model_error_becomes_a_terminal_failed_result() -> None:
         EventKind.RUN_FAILED,
     ]
     assert events.events[-1].data == {"stop_reason": StopReason.MODEL_ERROR.value}
+
+
+def test_retryable_model_failures_use_bounded_exponential_backoff() -> None:
+    model = OutcomeModel(
+        [
+            RetryableModelError("provider_busy", "provider is temporarily unavailable"),
+            RetryableModelError("provider_busy", "provider is temporarily unavailable"),
+            ModelResponse(content="Recovered after transient failures."),
+        ]
+    )
+    events = MemoryEventSink()
+    delays: list[float] = []
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        max_model_retries=2,
+        model_retry_base_delay_seconds=0.25,
+        model_retry_sleeper=delays.append,
+    ).run("Retry a transient model request")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert len(model.requests) == 3
+    assert delays == [0.25, 0.5]
+    model_events = [
+        event
+        for event in events.events
+        if event.kind
+        in {EventKind.MODEL_REQUESTED, EventKind.MODEL_RETRYING, EventKind.MODEL_RESPONDED}
+    ]
+    assert [event.kind for event in model_events] == [
+        EventKind.MODEL_REQUESTED,
+        EventKind.MODEL_RETRYING,
+        EventKind.MODEL_REQUESTED,
+        EventKind.MODEL_RETRYING,
+        EventKind.MODEL_REQUESTED,
+        EventKind.MODEL_RESPONDED,
+    ]
+    assert [event.data for event in model_events if event.kind is EventKind.MODEL_RETRYING] == [
+        {
+            "attempt": 1,
+            "next_attempt": 2,
+            "max_attempts": 3,
+            "delay_seconds": 0.25,
+            "error_code": "model_request_transient",
+        },
+        {
+            "attempt": 2,
+            "next_attempt": 3,
+            "max_attempts": 3,
+            "delay_seconds": 0.5,
+            "error_code": "model_request_transient",
+        },
+    ]
+
+
+def test_exhausted_retryable_model_failure_is_terminal() -> None:
+    model = OutcomeModel(
+        [
+            RetryableModelError(
+                "TEST_PRIVATE_RETRY_CODE_SENTINEL",
+                "TEST_PRIVATE_RETRY_MESSAGE_SENTINEL",
+            )
+            for _ in range(3)
+        ]
+    )
+    events = MemoryEventSink()
+    delays: list[float] = []
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        max_model_retries=2,
+        model_retry_base_delay_seconds=1,
+        model_retry_sleeper=delays.append,
+    ).run("Exhaust the model retry budget")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.error == "Model request failed after transient retries"
+    assert len(model.requests) == 3
+    assert delays == [1.0, 2.0]
+    assert [event.kind for event in events.events].count(EventKind.MODEL_RETRYING) == 2
+    assert EventKind.MODEL_RESPONDED not in [event.kind for event in events.events]
+    assert "TEST_PRIVATE_RETRY" not in str(events.events)
+    assert "TEST_PRIVATE_RETRY" not in str(result)
+
+
+def test_keyboard_interrupt_during_model_retry_delay_stops_without_another_request() -> None:
+    model = OutcomeModel([RetryableModelError("provider_busy", "transient request failure")])
+    events = MemoryEventSink()
+
+    def interrupt_delay(_: float) -> None:
+        raise KeyboardInterrupt
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        model_retry_sleeper=interrupt_delay,
+    ).run("Interrupt model retry backoff")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert result.error == "Run interrupted by user during model retry delay"
+    assert len(model.requests) == 1
+    assert [event.kind for event in events.events].count(EventKind.MODEL_RETRYING) == 1
+
+
+def test_keyboard_interrupt_during_model_request_is_not_retried() -> None:
+    model = OutcomeModel([KeyboardInterrupt()])
+    events = MemoryEventSink()
+    delays: list[float] = []
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        model_retry_sleeper=delays.append,
+    ).run("Interrupt the model request")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert result.error == "Run interrupted by user"
+    assert len(model.requests) == 1
+    assert delays == []
+    assert EventKind.MODEL_RETRYING not in [event.kind for event in events.events]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_model_retries": -1}, "max_model_retries"),
+        ({"max_model_retries": True}, "max_model_retries"),
+        ({"model_retry_base_delay_seconds": float("nan")}, "model_retry_base_delay_seconds"),
+    ],
+)
+def test_model_retry_configuration_is_bounded(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AgentRunner(ScriptedModel([]), ToolRegistry(), **kwargs)  # type: ignore[arg-type]
 
 
 def test_max_steps_stops_a_model_that_only_requests_tools() -> None:
