@@ -319,14 +319,17 @@ def test_verification_reports_replace_labels_and_stale_state_hides_old_evidence(
         _event(
             EventKind.VERIFICATION_RECORDED,
             step=1,
-            data={"passed": True, "kind": "test", "label": "old pytest"},
+            data={"passed": True, "kind": "test", "label": "old pytest", "epoch": 0},
         )
     )
     assert projection.snapshot.verification_labels == ("old pytest",)
 
-    projection.apply(_event(EventKind.VERIFICATION_INVALIDATED, step=2))
+    projection.apply(_event(EventKind.VERIFICATION_INVALIDATED, step=2, data={"epoch": 1}))
     assert projection.snapshot.verification_status == "stale"
     assert not projection.snapshot.verification_labels
+    assert not projection.snapshot.verification_evidence
+    assert projection.snapshot.verification_epoch == 1
+    assert projection.snapshot.invalidation_count == 1
 
     projection.apply(
         _event(
@@ -351,10 +354,23 @@ def test_verification_reports_replace_labels_and_stale_state_hides_old_evidence(
                 "verified": True,
                 "status": "verified",
                 "evidence_labels": ["fresh pytest", "fresh pytest", 3],
+                "epoch": 1,
+                "invalidation_count": 1,
+                "evidence": [
+                    {
+                        "label": "fresh pytest",
+                        "kind": "test",
+                        "passed": True,
+                        "step": 3,
+                        "epoch": 1,
+                    },
+                    {"label": "unsafe", "kind": {"private": "SECRET"}},
+                ],
             },
         )
     )
     assert projection.snapshot.verification_labels == ("fresh pytest",)
+    assert projection.snapshot.verification_evidence[0].label == "fresh pytest"
 
     projection.apply(
         _event(
@@ -411,6 +427,15 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
                 "summary": "Changed one file",
                 "duration_ms": 12.5,
                 "preview": ["- old line", "+ new line"],
+                "metadata": {
+                    "path": "src/pricing.py",
+                    "changed": True,
+                    "added_lines": 1,
+                    "removed_lines": 1,
+                    "mutation_revision": 1,
+                    "change_kind": "update",
+                    "after_sha256": "SECRET HASH",
+                },
                 "output": "SECRET RAW OUTPUT",
             },
         )
@@ -420,7 +445,7 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
             EventKind.VERIFICATION_RECORDED,
             step=2,
             seconds=0.5,
-            data={"passed": True, "kind": "test", "label": "pytest"},
+            data={"passed": True, "kind": "test", "label": "pytest", "epoch": 1},
         )
     )
     sink.emit(
@@ -432,7 +457,19 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
             data={
                 "verified": True,
                 "status": "verified",
+                "epoch": 1,
+                "invalidation_count": 1,
                 "evidence_labels": ["pytest"],
+                "evidence": [
+                    {
+                        "label": "pytest",
+                        "kind": "test",
+                        "passed": True,
+                        "step": 2,
+                        "epoch": 1,
+                        "private": "SECRET EVIDENCE",
+                    }
+                ],
             },
         )
     )
@@ -445,12 +482,18 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
     assert "+ new line" in output
     assert "FINAL RESULT" in output
     assert "VERIFIED" in output
-    assert "Evidence: pytest" in output
+    assert "Changes: src/pricing.py (+1/-1)" in output
+    assert "Evidence: pytest PASS (test, step 2, workspace revision 1)" in output
+    assert "Freshness: evidence matches workspace revision 1" in output
     assert "Selecting the next action" not in output
     assert "Action selected" not in output
     assert "SECRET" not in output
     assert "\x1b" not in output
     assert sink.snapshot.outcome == "VERIFIED"
+    assert sink.snapshot.changed_files[0].path == "src/pricing.py"
+    assert sink.snapshot.verification_evidence[0].step == 2
+    assert sink.snapshot.verification_epoch == 1
+    assert sink.snapshot.invalidation_count == 1
 
 
 @pytest.mark.parametrize(
@@ -504,6 +547,49 @@ def test_failed_run_card_is_unverified_and_does_not_repeat() -> None:
     assert "stopped before trustworthy completion" in output
     assert "SECRET" not in output
     assert sink.snapshot.stop_reason == "command_control_failed"
+
+
+def test_failed_run_clears_previously_passing_structured_evidence() -> None:
+    stream = StringIO()
+    sink = DashboardEventSink(_plain_console(stream), live=False)
+    sink.emit(_event(EventKind.RUN_STARTED))
+    sink.emit(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=2,
+            data={
+                "passed": True,
+                "kind": "test",
+                "label": "pytest",
+                "epoch": 1,
+            },
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=2,
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": ["pytest"],
+            },
+        )
+    )
+    sink.emit(
+        _event(
+            EventKind.RUN_FAILED,
+            step=3,
+            data={"stop_reason": "model_error"},
+        )
+    )
+
+    output = stream.getvalue()
+    assert sink.snapshot.verification_status == "unverified"
+    assert sink.snapshot.verification_labels == ()
+    assert sink.snapshot.verification_evidence == ()
+    assert "pytest PASS" not in output
+    assert "Freshness:" not in output
 
 
 def test_full_dashboard_render_has_header_timeline_and_gate() -> None:

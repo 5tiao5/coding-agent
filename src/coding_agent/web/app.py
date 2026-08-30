@@ -54,6 +54,26 @@ class TimelineResponse(BaseModel):
     preview: list[str]
 
 
+class ChangedFileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    added_lines: int
+    removed_lines: int
+    revision: int
+    change_kind: str
+
+
+class VerificationEvidenceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    kind: str
+    passed: bool
+    step: int
+    epoch: int
+
+
 class SnapshotResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +86,10 @@ class SnapshotResponse(BaseModel):
     active_tools: list[str]
     verification_status: str
     verification_labels: list[str]
+    verification_evidence: list[VerificationEvidenceResponse]
+    verification_epoch: int
+    invalidation_count: int
+    changed_files: list[ChangedFileResponse]
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelineResponse]

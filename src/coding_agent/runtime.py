@@ -55,7 +55,16 @@ def default_pytest_verifier(workspace_root: Path | None = None) -> VerificationC
         if executable == resolved_root or resolved_root in executable.parents:
             workspace_digest = executable_sha256(executable)
     return VerificationCommandSpec(
-        argv=(str(executable), "-I", "-m", "pytest", "-q"),
+        argv=(
+            str(executable),
+            "-I",
+            "-B",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ),
         cwd=".",
         kind=VerificationKind.TEST,
         label="pytest",

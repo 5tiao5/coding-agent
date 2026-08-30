@@ -84,8 +84,10 @@ uv run coding-agent evaluate --live --allow-paid-api --case all `
 The command prints the endpoint host and the maximum request-attempt budget before starting. Each
 case begins with a known-red public test in a fresh temporary repository. After the Agent stops, the
 host copies only allowlisted source files into a sibling directory and runs separate regression tests
-with credentials removed. Public tests and pytest control files must remain byte-identical; a zero
-exit without a completed, non-empty all-passing oracle is rejected. Reports omit raw test output,
+with credentials removed. Public tests and pytest control files must remain byte-identical, while a
+whole-repository before/after manifest rejects every change outside the scenario's
+explicit path allowlist. A zero exit without a completed, non-empty all-passing oracle is rejected.
+Reports omit raw test output,
 commands, provider details, credentials, run IDs, and base URLs, and existing report files are never
 overwritten. This is an independent scoring path, not a secrecy boundary: the built-in scenario and
 oracle definitions ship with the project and code executing in the same environment could inspect
@@ -96,8 +98,8 @@ for a runner/provider/harness error, and `2` for invalid configuration. A suite 
 `error` to limit paid requests. Unit tests exercise the same harness with injected deterministic
 models; they are not presented as evidence of real-model intelligence.
 
-The browser can submit one local task and observe its bounded plan, timeline, latest Diff, verification
-state, and final response. In this first slice, Web `safe` mode has no browser approval broker:
+The browser can submit one local task and observe its bounded plan, timeline, latest Diff, structured
+file-change-to-verifier evidence chain, and final response. In this first slice, Web `safe` mode has no browser approval broker:
 registered verification commands may run, while ordinary commands fail closed. Select `--mode auto`
 only when that broader local command authority is intentional; it remains subject to the command
 deny rules and is not an OS sandbox.
@@ -138,7 +140,10 @@ For `run` and `resume`, exit codes distinguish control outcomes:
 - Schema-v2 checkpoints bound to an opaque workspace identity, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
 - A deployment-safe pytest capability: if Python itself lives inside the repository, its exact executable hash is bound before it may issue verification evidence.
 
-The default live runtime registers only the exact current-Python `-I -m pytest -q` capability. Other
+The default live runtime registers only the exact current-Python
+`-I -B -m pytest -q -p no:cacheprovider` capability. The bytecode and cache-provider flags keep
+trusted verification observational: running it does not create Python or pytest cache files in the
+workspace. Other
 commands may run under the selected permission mode, but their output cannot manufacture
 verification evidence.
 
@@ -163,7 +168,8 @@ verification evidence.
   explicitly classified transient transport/status failures.
 - Four stable categories cover a single-file repair, cross-file change, new feature, and indirect
   fault. Success requires `AgentState.COMPLETED`, unchanged public-test controls, required source
-  changes, and a separate sibling regression oracle.
+  changes, no workspace change outside the scenario allowlist, and a separate sibling regression
+  oracle. JSON reports expose the bounded scope proof as `coding-agent.eval.v2`.
 - Case results distinguish `passed`, `failed`, and `error`; aggregate metrics include success rate,
   steps, duration, and tool failures.
 - On 2026-08-29, `deepseek-v4-flash` passed all four categories individually and again in one
@@ -205,4 +211,4 @@ evaluate CLI
      └─ allowlisted source copy → sibling regression oracle
 ```
 
-The runtime result, resumable checkpoint, audit trace, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/SECURITY.md](docs/SECURITY.md).
+The runtime result, resumable checkpoint, audit trace, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), and [docs/REFERENCES.md](docs/REFERENCES.md).

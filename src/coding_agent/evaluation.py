@@ -160,11 +160,18 @@ class CaseMetrics:
     protected_tests_unchanged: bool
     required_files_present: bool
     required_changes_present: bool
+    allowed_changed_paths: tuple[str, ...]
+    observed_changed_paths: tuple[str, ...]
+    unexpected_changed_paths: tuple[str, ...]
     failure_reasons: tuple[str, ...]
 
     @property
     def success(self) -> bool:
         return self.outcome is EvaluationOutcome.PASSED
+
+    @property
+    def only_allowed_paths_changed(self) -> bool:
+        return not self.unexpected_changed_paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,10 +244,14 @@ def evaluate_case(
                 protected_tests_unchanged=True,
                 required_files_present=False,
                 required_changes_present=False,
+                allowed_changed_paths=scenario.allowed_changed_paths,
+                observed_changed_paths=(),
+                unexpected_changed_paths=(),
                 failure_reasons=(
                     "baseline pytest must fail with return code 1 before the Agent runs",
                 ),
             )
+        initial_workspace_manifest = _workspace_manifest(repository)
 
         run_id = uuid4().hex
         paths = StatePaths((evaluation_root / "state").resolve())
@@ -271,6 +282,16 @@ def evaluate_case(
         except Exception as exc:  # noqa: BLE001 - one broken case must not abort the suite.
             runner_error = _bounded_error(exc)
         duration_seconds = perf_counter() - started
+
+        current_workspace_manifest = _workspace_manifest(repository)
+        observed_changed_paths = _manifest_changes(
+            initial_workspace_manifest,
+            current_workspace_manifest,
+        )
+        allowed_path_set = set(scenario.allowed_changed_paths)
+        unexpected_changed_paths = tuple(
+            path for path in observed_changed_paths if path not in allowed_path_set
+        )
 
         oracle, unavailable_oracle_sources = _run_holdout_oracle(
             evaluation_root,
@@ -331,6 +352,10 @@ def evaluate_case(
             failure_reasons.append(
                 "required source files were not changed: " + ", ".join(unchanged_required)
             )
+        if unexpected_changed_paths:
+            failure_reasons.append(
+                "unexpected workspace changes: " + ", ".join(unexpected_changed_paths)
+            )
 
         runner_protocol_error = result is not None and result.run_id != run_id
         execution_error = (
@@ -364,6 +389,9 @@ def evaluate_case(
             protected_tests_unchanged=protected_unchanged,
             required_files_present=required_files_present,
             required_changes_present=required_changes_present,
+            allowed_changed_paths=scenario.allowed_changed_paths,
+            observed_changed_paths=observed_changed_paths,
+            unexpected_changed_paths=unexpected_changed_paths,
             failure_reasons=tuple(failure_reasons),
         )
 
@@ -457,6 +485,56 @@ def _run_holdout_oracle(
     if unavailable:
         return None, tuple(unavailable)
     return _run_host_pytest(oracle_repository, timeout=timeout), ()
+
+
+def _workspace_manifest(repository: Path) -> dict[str, str]:
+    """Hash every workspace file without following link-like entries."""
+
+    manifest: dict[str, str] = {}
+    pending_directories = [repository]
+    while pending_directories:
+        directory = pending_directories.pop()
+        try:
+            children = tuple(directory.iterdir())
+        except OSError:
+            relative = directory.relative_to(repository).as_posix()
+            if relative != ".":
+                manifest[relative] = "unreadable-directory"
+            continue
+        for path in children:
+            relative = path.relative_to(repository).as_posix()
+            # Check symlinks and Windows reparse points before asking whether this
+            # entry is a directory. Recursive globbing can otherwise descend through
+            # a junction and hash files outside the evaluation repository.
+            if is_link_like(path):
+                manifest[relative] = "link-like"
+                continue
+            try:
+                if path.is_dir():
+                    pending_directories.append(path)
+                    continue
+                if not path.is_file():
+                    continue
+                content = path.read_bytes()
+            except OSError:
+                manifest[relative] = "unreadable"
+            else:
+                manifest[relative] = "sha256:" + hashlib.sha256(content).hexdigest()
+    return manifest
+
+
+def _manifest_changes(before: dict[str, str], after: dict[str, str]) -> tuple[str, ...]:
+    """Return stable paths whose final type, presence, or bytes differ from the baseline."""
+
+    return tuple(
+        sorted(
+            path
+            for path in before.keys() | after.keys()
+            if before.get(path) != after.get(path)
+            or before.get(path) == "unreadable"
+            or after.get(path) == "unreadable"
+        )
+    )
 
 
 def _protected_manifest(

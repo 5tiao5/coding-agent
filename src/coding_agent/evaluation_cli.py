@@ -107,13 +107,17 @@ def evaluation_payload(
                     "protected_tests_unchanged": case.protected_tests_unchanged,
                     "required_files_present": case.required_files_present,
                     "required_changes_present": case.required_changes_present,
+                    "only_allowed_paths_changed": case.only_allowed_paths_changed,
+                    "allowed_changed_paths": list(case.allowed_changed_paths),
+                    "observed_changed_paths": list(case.observed_changed_paths),
+                    "unexpected_changed_paths": list(case.unexpected_changed_paths),
                 },
                 "failure_reasons": list(case.failure_reasons),
             }
         )
     aggregate = report.aggregate
     return {
-        "schema_version": "coding-agent.eval.v1",
+        "schema_version": "coding-agent.eval.v2",
         "mode": "live",
         "model": model_name,
         "limits": {
@@ -174,6 +178,7 @@ def print_evaluation_report(report: EvaluationReport, *, console: Console) -> No
             case.protected_tests_unchanged
             and case.required_files_present
             and case.required_changes_present
+            and case.only_allowed_paths_changed
         )
         table.add_row(
             case.case_id,

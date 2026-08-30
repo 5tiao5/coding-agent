@@ -23,6 +23,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from coding_agent._dashboard_evidence import (
+    ChangedFile,
+    VerificationEvidenceItem,
+    changed_file_from_event,
+    changed_file_label,
+    verification_evidence_items,
+    verification_evidence_label,
+)
 from coding_agent.events import EventKind, RunEvent
 from coding_agent.ui import console_safe
 
@@ -36,6 +44,7 @@ _VERIFICATION_STATUSES = {"verified", "missing", "failed", "stale", "unverified"
 _NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
 _MAX_PLAN_LINES = 8
 _MAX_EVIDENCE_LABELS = 8
+_MAX_CHANGED_FILES = 12
 _LEVEL_STYLE: dict[TimelineLevel, str] = {
     "info": "cyan",
     "success": "green",
@@ -78,6 +87,10 @@ class DashboardSnapshot:
     active_tools: tuple[str, ...]
     verification_status: str
     verification_labels: tuple[str, ...]
+    verification_evidence: tuple[VerificationEvidenceItem, ...]
+    verification_epoch: int
+    invalidation_count: int
+    changed_files: tuple[ChangedFile, ...]
     elapsed_seconds: float
     terminal: bool
     run_failed: bool
@@ -112,6 +125,10 @@ class DashboardProjection:
         self._active_tools: dict[str, str] = {}
         self._verification_status = "pending"
         self._verification_labels: list[str] = []
+        self._verification_evidence: dict[str, VerificationEvidenceItem] = {}
+        self._verification_epoch = 0
+        self._invalidation_count = 0
+        self._changed_files: dict[str, ChangedFile] = {}
         self._started_at: datetime | None = None
         self._last_at: datetime | None = None
         self._terminal = False
@@ -133,6 +150,10 @@ class DashboardProjection:
             active_tools=tuple(self._active_tools.values()),
             verification_status=self._verification_status,
             verification_labels=tuple(self._verification_labels),
+            verification_evidence=tuple(self._verification_evidence.values()),
+            verification_epoch=self._verification_epoch,
+            invalidation_count=self._invalidation_count,
+            changed_files=tuple(self._changed_files.values()),
             elapsed_seconds=self._elapsed_seconds(),
             terminal=self._terminal,
             run_failed=self._run_failed,
@@ -228,6 +249,11 @@ class DashboardProjection:
         if kind is EventKind.VERIFICATION_INVALIDATED:
             self._verification_status = "stale"
             self._verification_labels.clear()
+            self._verification_evidence.clear()
+            epoch = _data_int(data, "epoch")
+            if epoch is not None:
+                self._verification_epoch = max(self._verification_epoch, epoch)
+            self._invalidation_count += 1
             return self._entry(
                 event,
                 "VERIFY",
@@ -274,8 +300,9 @@ class DashboardProjection:
             self._phase = "FAILED"
             self._active_tools.clear()
             self._verification_labels.clear()
+            self._verification_evidence.clear()
             self._stop_reason = _data_string(data, "stop_reason")
-            if self._verification_status == "pending":
+            if self._verification_status in {"pending", "verified"}:
                 self._verification_status = "unverified"
             return None
         return None
@@ -316,7 +343,18 @@ class DashboardProjection:
             self._plan_lines = preview
         if name in _MUTATION_TOOLS and entry.preview:
             self._latest_change = entry
+        if name in _MUTATION_TOOLS and explicit_ok is True:
+            self._record_changed_file(data)
         return entry
+
+    def _record_changed_file(self, data: Mapping[str, object]) -> None:
+        change = changed_file_from_event(data)
+        if change is None:
+            return
+        existing = self._changed_files.get(change.path)
+        if existing is None and len(self._changed_files) >= _MAX_CHANGED_FILES:
+            return
+        self._changed_files[change.path] = change
 
     def _verification_recorded(self, event: RunEvent) -> TimelineEntry:
         data = event.data
@@ -330,6 +368,24 @@ class DashboardProjection:
         ):
             self._verification_labels.append(label)
         kind = _data_string(data, "kind")
+        epoch = _data_int(data, "epoch")
+        if epoch is not None:
+            self._verification_epoch = max(self._verification_epoch, epoch)
+        if (
+            label
+            and kind
+            and (
+                label in self._verification_evidence
+                or len(self._verification_evidence) < _MAX_EVIDENCE_LABELS
+            )
+        ):
+            self._verification_evidence[label] = VerificationEvidenceItem(
+                label=label,
+                kind=kind,
+                passed=passed,
+                step=max(0, event.step),
+                epoch=max(0, epoch or 0),
+            )
         detail_parts = [part for part in (kind, label) if part]
         detail = " / ".join(detail_parts) if detail_parts else None
         return self._entry(
@@ -353,6 +409,12 @@ class DashboardProjection:
     def _update_verification_report(self, data: Mapping[str, object]) -> None:
         """Replace the projection with the report's current, bounded evidence set."""
         self._update_verification_status(data)
+        epoch = _data_int(data, "epoch")
+        if epoch is not None:
+            self._verification_epoch = max(0, epoch)
+        invalidations = _data_int(data, "invalidation_count")
+        if invalidations is not None:
+            self._invalidation_count = max(0, invalidations)
         labels = _data_string_sequence(
             data,
             "evidence_labels",
@@ -362,6 +424,20 @@ class DashboardProjection:
         if self._verification_status in _NO_CURRENT_EVIDENCE_STATUSES:
             labels = ()
         self._verification_labels = list(labels)
+        evidence = verification_evidence_items(
+            data.get("evidence"),
+            max_items=_MAX_EVIDENCE_LABELS,
+        )
+        if evidence:
+            self._verification_evidence = {item.label: item for item in evidence}
+        elif self._verification_status in _NO_CURRENT_EVIDENCE_STATUSES:
+            self._verification_evidence.clear()
+        elif labels:
+            self._verification_evidence = {
+                label: item
+                for label, item in self._verification_evidence.items()
+                if label in labels
+            }
 
     def _entry(
         self,
@@ -565,9 +641,22 @@ class DashboardEventSink:
             f"{_format_duration(snapshot.elapsed_seconds * 1_000)}",
             style="dim",
         )
-        if snapshot.verification_labels:
+        if snapshot.changed_files:
+            changes = ", ".join(changed_file_label(item) for item in snapshot.changed_files)
+            body.append(f"\nChanges: {self._safe(changes)}", style="dim")
+        if snapshot.verification_evidence:
+            evidence = ", ".join(
+                verification_evidence_label(item) for item in snapshot.verification_evidence
+            )
+            body.append(f"\nEvidence: {self._safe(evidence)}", style="dim")
+        elif snapshot.verification_labels:
             labels = ", ".join(snapshot.verification_labels)
             body.append(f"\nEvidence: {self._safe(labels)}", style="dim")
+        if snapshot.verification_status == "verified":
+            body.append(
+                f"\nFreshness: evidence matches workspace revision {snapshot.verification_epoch}",
+                style="dim",
+            )
         if snapshot.run_failed:
             body.append("\nRun state: FAILED", style="bold red")
             if snapshot.stop_reason:

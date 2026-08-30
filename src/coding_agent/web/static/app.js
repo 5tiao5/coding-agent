@@ -16,6 +16,7 @@ const elements = {
   activeTools: document.querySelector("#active-tools"),
   connectionDot: document.querySelector("#connection-dot"),
   connectionLabel: document.querySelector("#connection-label"),
+  changeScopeList: document.querySelector("#change-scope-list"),
   conversation: document.querySelector("#conversation"),
   emptyState: document.querySelector("#empty-state"),
   evidenceList: document.querySelector("#evidence-list"),
@@ -580,15 +581,56 @@ function renderVerification(snapshot, runStatus) {
   elements.verificationStatus.textContent = copy.detail;
   elements.verificationOrb.className = `verification-orb verification-${copy.tone}`;
 
-  const labels = asArray(snapshot.verification_labels).map((item) => asText(item, String(item))).filter(Boolean);
-  if (!labels.length) {
+  const changes = asArray(snapshot.changed_files).map(asObject).filter((item) => asText(item.path).trim());
+  if (!changes.length) {
+    elements.changeScopeList.replaceChildren(createElement("span", "evidence-empty", "尚无文件变更"));
+  } else {
+    const changeFragment = document.createDocumentFragment();
+    for (const change of changes.slice(0, 12)) {
+      const path = asText(change.path).trim();
+      const additions = Math.max(0, asNumber(change.added_lines));
+      const deletions = Math.max(0, asNumber(change.removed_lines));
+      const item = createElement("span", "evidence-item change-scope-item");
+      item.append(
+        createElement("i", "", "±"),
+        document.createTextNode(`${path}  +${additions}/-${deletions}`),
+      );
+      changeFragment.append(item);
+    }
+    elements.changeScopeList.replaceChildren(changeFragment);
+  }
+
+  const evidence = asArray(snapshot.verification_evidence).map(asObject);
+  if (!evidence.length) {
+    const labels = asArray(snapshot.verification_labels)
+      .map((item) => asText(item, String(item)))
+      .filter(Boolean);
+    if (labels.length) {
+      const fallbackFragment = document.createDocumentFragment();
+      for (const label of labels.slice(0, 8)) {
+        const item = createElement("span", "evidence-item");
+        item.append(createElement("i", "", "✓"), document.createTextNode(label));
+        fallbackFragment.append(item);
+      }
+      elements.evidenceList.replaceChildren(fallbackFragment);
+      return;
+    }
     elements.evidenceList.replaceChildren(createElement("span", "evidence-empty", "尚无检查记录"));
     return;
   }
   const fragment = document.createDocumentFragment();
-  for (const label of labels.slice(0, 8)) {
+  for (const evidenceItem of evidence.slice(0, 8)) {
+    const label = asText(evidenceItem.label, "检查");
+    const kind = asText(evidenceItem.kind, "check").toUpperCase();
+    const step = Math.max(0, asNumber(evidenceItem.step));
+    const epoch = Math.max(0, asNumber(evidenceItem.epoch));
+    const passed = evidenceItem.passed === true;
     const item = createElement("span", "evidence-item");
-    item.append(createElement("i", "", "✓"), document.createTextNode(label));
+    item.classList.toggle("evidence-failed", !passed);
+    item.append(
+      createElement("i", "", passed ? "✓" : "×"),
+      document.createTextNode(`${label} · ${kind} · 步骤 ${step} · 修订 ${epoch}`),
+    );
     fragment.append(item);
   }
   elements.evidenceList.replaceChildren(fragment);

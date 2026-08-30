@@ -156,8 +156,20 @@
             <strong id="verification-outcome">等待验证</strong>
             <span id="verification-status">等待外部检查证据</span>
           </div>
-          <div class="evidence-list" id="evidence-list">
-            <span class="evidence-empty">尚无检查记录</span>
+          <div class="evidence-chain">
+            <div class="evidence-stage">
+              <span class="evidence-stage-label">Agent 文件变更</span>
+              <div class="evidence-list" id="change-scope-list">
+                <span class="evidence-empty">尚无文件变更</span>
+              </div>
+            </div>
+            <span class="evidence-arrow" aria-hidden="true">↓</span>
+            <div class="evidence-stage">
+              <span class="evidence-stage-label">当前修订验证</span>
+              <div class="evidence-list" id="evidence-list">
+                <span class="evidence-empty">尚无检查记录</span>
+              </div>
+            </div>
           </div>
         </section>
 

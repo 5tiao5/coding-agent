@@ -82,7 +82,15 @@ def _emit_completed_story(run_id: str, sink: EventSink) -> None:
                     "Diff preview:\n--- a/src/example.py\n+++ b/src/example.py\n"
                     "@@ -1 +1 @@\n-old\n+new"
                 ),
-                "metadata": {"private_sha256": "must-not-leak"},
+                "metadata": {
+                    "path": "src/example.py",
+                    "changed": True,
+                    "added_lines": 1,
+                    "removed_lines": 1,
+                    "mutation_revision": 1,
+                    "change_kind": "update",
+                    "private_sha256": "must-not-leak",
+                },
             },
         )
     )
@@ -92,10 +100,26 @@ def _emit_completed_story(run_id: str, sink: EventSink) -> None:
             kind=EventKind.VERIFICATION_RECORDED,
             message="verification",
             step=2,
-            data={"passed": True, "kind": "test", "label": "pytest"},
+            data={"passed": True, "kind": "test", "label": "pytest", "epoch": 1},
         )
     )
-    terminal = {"verified": True, "status": "verified", "evidence_labels": ["pytest"]}
+    terminal = {
+        "verified": True,
+        "status": "verified",
+        "epoch": 1,
+        "invalidation_count": 1,
+        "evidence_labels": ["pytest"],
+        "evidence": [
+            {
+                "label": "pytest",
+                "kind": "test",
+                "passed": True,
+                "step": 2,
+                "epoch": 1,
+                "private": "must-not-leak",
+            }
+        ],
+    }
     sink.emit(
         RunEvent(
             run_id=run_id,
@@ -155,6 +179,10 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
         "active_tools",
         "verification_status",
         "verification_labels",
+        "verification_evidence",
+        "verification_epoch",
+        "invalidation_count",
+        "changed_files",
         "outcome",
         "plan_lines",
         "timeline",
@@ -167,6 +195,20 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
     assert snapshot["tools_finished"] == 1
     assert snapshot["verification_status"] == "verified"
     assert snapshot["verification_labels"] == ["pytest"]
+    assert snapshot["verification_evidence"] == [
+        {"label": "pytest", "kind": "test", "passed": True, "step": 2, "epoch": 1}
+    ]
+    assert snapshot["verification_epoch"] == 1
+    assert snapshot["invalidation_count"] == 1
+    assert snapshot["changed_files"] == [
+        {
+            "path": "src/example.py",
+            "added_lines": 1,
+            "removed_lines": 1,
+            "revision": 1,
+            "change_kind": "update",
+        }
+    ]
     assert snapshot["outcome"] == "VERIFIED"
     assert snapshot["plan_lines"] == []
     assert snapshot["latest_change"]["preview"][-2:] == ["-old", "+new"]

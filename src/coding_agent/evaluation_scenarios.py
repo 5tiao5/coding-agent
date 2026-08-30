@@ -43,6 +43,7 @@ class EvaluationScenario:
     protected_paths: tuple[str, ...]
     oracle_files: tuple[FixtureFile, ...]
     oracle_source_paths: tuple[str, ...]
+    allowed_changed_paths: tuple[str, ...]
     required_changed_paths: tuple[str, ...] = ()
     required_new_paths: tuple[str, ...] = ()
 
@@ -65,6 +66,7 @@ class EvaluationScenario:
         for path in (
             *self.protected_paths,
             *self.oracle_source_paths,
+            *self.allowed_changed_paths,
             *self.required_changed_paths,
             *self.required_new_paths,
         ):
@@ -74,6 +76,7 @@ class EvaluationScenario:
         oracle_set = set(oracle_paths)
         protected = set(self.protected_paths)
         oracle_sources = set(self.oracle_source_paths)
+        allowed = set(self.allowed_changed_paths)
         changed = set(self.required_changed_paths)
         new = set(self.required_new_paths)
         if not protected:
@@ -84,16 +87,25 @@ class EvaluationScenario:
             raise ValueError("required changed paths must exist in the initial fixture")
         if _portable_keys(changed) & _portable_keys(protected):
             raise ValueError("protected paths cannot also be required source changes")
+        if _portable_keys(allowed) & _portable_keys(protected):
+            raise ValueError("protected paths cannot also be allowed workspace changes")
         if _portable_keys(new) & _portable_keys(fixture_set):
             raise ValueError("required new paths must be absent from the initial fixture")
         if not oracle_sources <= fixture_set | new:
             raise ValueError("oracle source paths must be initial or required-new source files")
         if not (changed | new) <= oracle_sources:
             raise ValueError("all required source changes must be checked by the host oracle")
+        if not allowed <= fixture_set | new:
+            raise ValueError("allowed changed paths must be initial or required-new files")
+        if not (changed | new) <= allowed:
+            raise ValueError("all required source changes must be allowed workspace changes")
+        if not allowed <= oracle_sources:
+            raise ValueError("all allowed workspace changes must be checked by the host oracle")
         if _portable_keys(oracle_set) & _portable_keys(oracle_sources):
             raise ValueError("host oracle files cannot overlap copied source files")
         _require_portable_unique(self.protected_paths, label="protected paths")
         _require_portable_unique(self.oracle_source_paths, label="oracle source paths")
+        _require_portable_unique(self.allowed_changed_paths, label="allowed changed paths")
         _require_portable_unique(self.required_changed_paths, label="required changed paths")
         _require_portable_unique(self.required_new_paths, label="required new paths")
         _require_no_prefix_conflicts(
@@ -209,6 +221,7 @@ _BUILT_IN_SCENARIOS = (
             ),
         ),
         oracle_source_paths=("calculator.py",),
+        allowed_changed_paths=("calculator.py",),
         required_changed_paths=("calculator.py",),
     ),
     EvaluationScenario(
@@ -287,6 +300,7 @@ _BUILT_IN_SCENARIOS = (
             "shipping/rates.py",
             "shipping/quote.py",
         ),
+        allowed_changed_paths=("shipping/rates.py", "shipping/quote.py"),
         required_changed_paths=("shipping/rates.py", "shipping/quote.py"),
     ),
     EvaluationScenario(
@@ -345,6 +359,7 @@ _BUILT_IN_SCENARIOS = (
             ),
         ),
         oracle_source_paths=("text_tools/__init__.py", "text_tools/slug.py"),
+        allowed_changed_paths=("text_tools/__init__.py", "text_tools/slug.py"),
         required_new_paths=("text_tools/slug.py",),
     ),
     EvaluationScenario(
@@ -426,6 +441,7 @@ _BUILT_IN_SCENARIOS = (
             "reports/formatting.py",
             "reports/service.py",
         ),
+        allowed_changed_paths=("reports/config.py",),
         required_changed_paths=("reports/config.py",),
     ),
 )

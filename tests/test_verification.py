@@ -62,6 +62,15 @@ def test_passed_evidence_is_bound_to_the_current_epoch() -> None:
     assert len(report.evidence) == 1
     assert report.evidence[0].label == "pytest"
     assert report.evidence[0].step == 3
+    assert report.event_data()["evidence"] == [
+        {
+            "label": "pytest",
+            "kind": "test",
+            "passed": True,
+            "step": 3,
+            "epoch": 1,
+        }
+    ]
 
 
 def test_later_possible_write_makes_passed_evidence_stale() -> None:

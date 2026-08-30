@@ -126,6 +126,9 @@ def _report(*, success: bool = True, error: bool = False) -> EvaluationReport:
         protected_tests_unchanged=True,
         required_files_present=True,
         required_changes_present=success,
+        allowed_changed_paths=("shipping/rates.py", "shipping/quote.py"),
+        observed_changed_paths=("shipping/quote.py", "shipping/rates.py"),
+        unexpected_changed_paths=(),
         failure_reasons=reasons,
     )
     return EvaluationReport(
@@ -265,10 +268,19 @@ def test_evaluate_json_uses_a_strict_public_whitelist(
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "coding-agent.eval.v1"
+    assert payload["schema_version"] == "coding-agent.eval.v2"
     assert payload["mode"] == "live"
     assert payload["model"] == "test-model"
     assert payload["cases"][0]["result"] == "passed"
+    assert payload["cases"][0]["integrity"] == {
+        "protected_tests_unchanged": True,
+        "required_files_present": True,
+        "required_changes_present": True,
+        "only_allowed_paths_changed": True,
+        "allowed_changed_paths": ["shipping/rates.py", "shipping/quote.py"],
+        "observed_changed_paths": ["shipping/quote.py", "shipping/rates.py"],
+        "unexpected_changed_paths": [],
+    }
     assert payload["summary"]["passed"] == 1
     assert _PROVIDER_SECRET not in result.output
     assert _RAW_ORACLE_OUTPUT not in result.output

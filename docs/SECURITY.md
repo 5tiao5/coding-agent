@@ -107,7 +107,11 @@ the same machine. Do not port-forward, reverse-proxy, or otherwise expose this l
   the first runner/provider/harness `error`.
 - Each case receives a fresh temporary repository with a known-failing public test. Public tests and
   pytest control files are hashed before the Agent runs; changed, deleted, or newly added controls
-  fail integrity checks. Required source files must exist and required edits must change bytes.
+  fail integrity checks. Required source files must exist and required edits must change bytes. A
+  separate whole-repository manifest compares presence, type, and bytes before and after the Agent.
+  It has no filename-based cache exceptions: any path not declared in the scenario's change
+  allowlist fails the case even when the regression oracle is green. The registered pytest verifier
+  disables bytecode writes and pytest's cache provider so trusted verification remains observational.
 - Final judgement runs in a sibling directory that is not an Agent workspace. Only scenario-owned
   source paths are copied there; the regression-oracle tests are materialized afterward. The verifier
   uses the credential-stripped verifier environment, imports pytest before adding the candidate

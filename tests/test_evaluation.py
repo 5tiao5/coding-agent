@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import replace
 from hashlib import sha256
@@ -12,6 +13,7 @@ from coding_agent.application import ModelFactory, RepositoryRunSpec
 from coding_agent.evaluation import (
     EvaluationConfig,
     EvaluationOutcome,
+    _workspace_manifest,
     evaluate_case,
     evaluate_suite,
 )
@@ -171,6 +173,14 @@ def test_built_in_suite_runs_four_isolated_red_to_green_cases(tmp_path: Path) ->
     assert all(case.protected_tests_unchanged for case in report.cases)
     assert all(case.required_files_present for case in report.cases)
     assert all(case.required_changes_present for case in report.cases)
+    assert all(case.only_allowed_paths_changed for case in report.cases)
+    assert [case.observed_changed_paths for case in report.cases] == [
+        ("calculator.py",),
+        ("shipping/quote.py", "shipping/rates.py"),
+        ("text_tools/slug.py",),
+        ("reports/config.py",),
+    ]
+    assert all(not case.unexpected_changed_paths for case in report.cases)
     assert report.aggregate.total_cases == 4
     assert report.aggregate.successful_cases == 4
     assert report.aggregate.failed_cases == 0
@@ -199,6 +209,160 @@ def test_host_oracle_rejects_a_runner_that_modifies_protected_tests(tmp_path: Pa
     assert metrics.outcome is EvaluationOutcome.FAILED
     assert metrics.protected_tests_unchanged is False
     assert any("protected test files changed" in reason for reason in metrics.failure_reasons)
+
+
+def test_host_oracle_rejects_an_unexpected_workspace_file(tmp_path: Path) -> None:
+    repairer = RepairingRunner()
+
+    def noisy_runner(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink | None,
+        model_factory: ModelFactory | None,
+    ) -> AgentResult:
+        result = repairer(spec, event_sink=event_sink, model_factory=model_factory)
+        notes = spec.root / "notes"
+        notes.mkdir()
+        notes.joinpath("debug.txt").write_text("unrequested\n", encoding="utf-8")
+        return result
+
+    metrics = evaluate_case(
+        built_in_scenarios()[0],
+        config=_config(),
+        run_callable=noisy_runner,
+        temporary_parent=tmp_path,
+    )
+
+    assert metrics.oracle is not None and metrics.oracle.passed
+    assert metrics.protected_tests_unchanged
+    assert metrics.required_changes_present
+    assert metrics.observed_changed_paths == ("calculator.py", "notes/debug.txt")
+    assert metrics.unexpected_changed_paths == ("notes/debug.txt",)
+    assert metrics.only_allowed_paths_changed is False
+    assert metrics.outcome is EvaluationOutcome.FAILED
+    assert "unexpected workspace changes: notes/debug.txt" in metrics.failure_reasons
+
+
+def test_workspace_manifest_rejects_generated_named_disguised_changes(tmp_path: Path) -> None:
+    repairer = RepairingRunner()
+
+    def cache_writing_runner(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink | None,
+        model_factory: ModelFactory | None,
+    ) -> AgentResult:
+        result = repairer(spec, event_sink=event_sink, model_factory=model_factory)
+        pytest_cache = spec.root / ".pytest_cache" / "v" / "cache"
+        pytest_cache.mkdir(parents=True)
+        pytest_cache.joinpath("nodeids").write_text("[]\n", encoding="utf-8")
+        bytecode = spec.root / "__pycache__"
+        bytecode.mkdir()
+        bytecode.joinpath("calculator.cpython-311.pyc").write_bytes(b"generated")
+        spec.root.joinpath(".coverage").write_bytes(b"generated")
+        spec.root.joinpath(".coverage.worker").write_bytes(b"generated")
+        return result
+
+    metrics = evaluate_case(
+        built_in_scenarios()[0],
+        config=_config(),
+        run_callable=cache_writing_runner,
+        temporary_parent=tmp_path,
+    )
+
+    assert metrics.outcome is EvaluationOutcome.FAILED
+    assert metrics.observed_changed_paths == (
+        ".coverage",
+        ".coverage.worker",
+        ".pytest_cache/v/cache/nodeids",
+        "__pycache__/calculator.cpython-311.pyc",
+        "calculator.py",
+    )
+    assert metrics.unexpected_changed_paths == (
+        ".coverage",
+        ".coverage.worker",
+        ".pytest_cache/v/cache/nodeids",
+        "__pycache__/calculator.cpython-311.pyc",
+    )
+
+
+def test_workspace_manifest_rejects_deleting_a_disallowed_fixture(tmp_path: Path) -> None:
+    repairer = RepairingRunner()
+    scenario = built_in_scenarios()[0]
+    scenario = replace(
+        scenario,
+        files=(*scenario.files, FixtureFile("README.md", "fixture documentation\n")),
+    )
+
+    def deleting_runner(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink | None,
+        model_factory: ModelFactory | None,
+    ) -> AgentResult:
+        result = repairer(spec, event_sink=event_sink, model_factory=model_factory)
+        spec.root.joinpath("README.md").unlink()
+        return result
+
+    metrics = evaluate_case(
+        scenario,
+        config=_config(),
+        run_callable=deleting_runner,
+        temporary_parent=tmp_path,
+    )
+
+    assert metrics.oracle is not None and metrics.oracle.passed
+    assert metrics.observed_changed_paths == ("README.md", "calculator.py")
+    assert metrics.unexpected_changed_paths == ("README.md",)
+    assert metrics.outcome is EvaluationOutcome.FAILED
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_workspace_manifest_does_not_descend_through_a_junction(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    repository.joinpath("inside.txt").write_text("inside\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside.joinpath("secret.txt").write_text("outside\n", encoding="utf-8")
+    junction = repository / "outside-link"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        manifest = _workspace_manifest(repository)
+    finally:
+        junction.rmdir()
+
+    assert set(manifest) == {"inside.txt", "outside-link"}
+    assert manifest["outside-link"] == "link-like"
+    assert outside.joinpath("secret.txt").read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_workspace_manifest_does_not_descend_through_a_loop_junction(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    repository.joinpath("inside.txt").write_text("inside\n", encoding="utf-8")
+    junction = repository / "loop"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        manifest = _workspace_manifest(repository)
+    finally:
+        junction.rmdir()
+
+    assert set(manifest) == {"inside.txt", "loop"}
+    assert manifest["loop"] == "link-like"
 
 
 def test_host_oracle_does_not_upgrade_an_unverified_agent_result(tmp_path: Path) -> None:
@@ -354,6 +518,7 @@ def test_passing_baseline_is_rejected_before_runner_is_called(tmp_path: Path) ->
             ),
         ),
         oracle_source_paths=("value.py",),
+        allowed_changed_paths=(),
     )
 
     def forbidden_runner(
@@ -507,7 +672,16 @@ def test_model_factory_drives_the_production_application_path(tmp_path: Path) ->
                             id="eval-pytest",
                             name="run_command",
                             arguments={
-                                "argv": [sys.executable, "-I", "-m", "pytest", "-q"],
+                                "argv": [
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    "-m",
+                                    "pytest",
+                                    "-q",
+                                    "-p",
+                                    "no:cacheprovider",
+                                ],
                                 "cwd": ".",
                                 "timeout_seconds": 20,
                             },
@@ -558,6 +732,7 @@ def test_scenario_rejects_unsafe_or_overlapping_integrity_paths() -> None:
                 ),
             ),
             oracle_source_paths=("tests/test_case.py",),
+            allowed_changed_paths=("tests/test_case.py",),
             required_changed_paths=("tests/test_case.py",),
         )
 
@@ -587,6 +762,20 @@ def test_scenario_schema_rejects_ambiguous_or_unchecked_fixtures() -> None:
         ("protect at least one", {"protected_paths": ()}),
         ("protected paths must exist", {"protected_paths": ("tests/missing.py",)}),
         ("required changed paths must exist", {"required_changed_paths": ("missing.py",)}),
+        ("allowed changed paths must be initial", {"allowed_changed_paths": ("missing.py",)}),
+        (
+            "all required source changes must be allowed",
+            {"allowed_changed_paths": ()},
+        ),
+        (
+            "all allowed workspace changes must be checked",
+            {
+                "allowed_changed_paths": (
+                    *scenario.allowed_changed_paths,
+                    "tests/__init__.py",
+                )
+            },
+        ),
         (
             "required new paths must be absent",
             {"required_new_paths": ("calculator.py",)},
@@ -616,10 +805,15 @@ def test_scenario_schema_rejects_ambiguous_or_unchecked_fixtures() -> None:
             {"required_changed_paths": scenario.required_changed_paths * 2},
         ),
         (
+            "allowed changed paths must be unique",
+            {"allowed_changed_paths": scenario.allowed_changed_paths * 2},
+        ),
+        (
             "required new paths must be unique",
             {
                 "required_new_paths": ("new.py", "new.py"),
                 "oracle_source_paths": (*scenario.oracle_source_paths, "new.py"),
+                "allowed_changed_paths": (*scenario.allowed_changed_paths, "new.py"),
             },
         ),
     )

@@ -191,6 +191,7 @@ def test_scripted_model_completes_a_multi_turn_tool_loop() -> None:
         "invalidation_count": 0,
         "evidence_count": 0,
         "evidence_labels": [],
+        "evidence": [],
     }
 
 

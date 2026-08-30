@@ -28,6 +28,26 @@ class TimelinePayload(TypedDict):
     preview: list[str]
 
 
+class ChangedFilePayload(TypedDict):
+    """Whitelisted mutation summary for one workspace-relative file."""
+
+    path: str
+    added_lines: int
+    removed_lines: int
+    revision: int
+    change_kind: str
+
+
+class VerificationEvidencePayload(TypedDict):
+    """Whitelisted trusted verifier fact bound to one workspace revision."""
+
+    label: str
+    kind: str
+    passed: bool
+    step: int
+    epoch: int
+
+
 class SnapshotPayload(TypedDict):
     """Browser-safe subset of :class:`DashboardSnapshot`."""
 
@@ -40,6 +60,10 @@ class SnapshotPayload(TypedDict):
     active_tools: list[str]
     verification_status: str
     verification_labels: list[str]
+    verification_evidence: list[VerificationEvidencePayload]
+    verification_epoch: int
+    invalidation_count: int
+    changed_files: list[ChangedFilePayload]
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelinePayload]
@@ -234,6 +258,28 @@ def _snapshot_payload(snapshot: DashboardSnapshot) -> SnapshotPayload:
         "active_tools": list(snapshot.active_tools),
         "verification_status": snapshot.verification_status,
         "verification_labels": list(snapshot.verification_labels),
+        "verification_evidence": [
+            {
+                "label": item.label,
+                "kind": item.kind,
+                "passed": item.passed,
+                "step": item.step,
+                "epoch": item.epoch,
+            }
+            for item in snapshot.verification_evidence
+        ],
+        "verification_epoch": snapshot.verification_epoch,
+        "invalidation_count": snapshot.invalidation_count,
+        "changed_files": [
+            {
+                "path": item.path,
+                "added_lines": item.added_lines,
+                "removed_lines": item.removed_lines,
+                "revision": item.revision,
+                "change_kind": item.change_kind,
+            }
+            for item in snapshot.changed_files
+        ],
         "outcome": snapshot.outcome,
         "plan_lines": _plan_lines(snapshot),
         "timeline": [_timeline_payload(entry) for entry in snapshot.timeline],

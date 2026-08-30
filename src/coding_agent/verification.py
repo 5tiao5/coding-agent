@@ -40,6 +40,16 @@ class VerificationReport:
             "invalidation_count": self.invalidation_count,
             "evidence_count": len(self.evidence),
             "evidence_labels": [evidence.label for evidence in self.evidence],
+            "evidence": [
+                {
+                    "label": evidence.label,
+                    "kind": evidence.kind.value,
+                    "passed": evidence.signal is VerificationSignal.PASSED,
+                    "step": evidence.step,
+                    "epoch": evidence.epoch,
+                }
+                for evidence in self.evidence
+            ],
         }
 
 

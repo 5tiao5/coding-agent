@@ -35,6 +35,8 @@ def test_system_prompt_names_only_exact_host_registered_verifier() -> None:
     assert verifier.label in prompt
     assert verifier.cwd in prompt
     assert json.dumps(list(verifier.argv), ensure_ascii=False) in prompt
+    assert "-B" in verifier.argv
+    assert verifier.argv[-2:] == ("-p", "no:cacheprovider")
     assert "nearby commands" in prompt
 
 

@@ -78,8 +78,9 @@ The FastAPI lifespan first closes admission and gives the current run a finite b
 window. The worker is daemonized as a final process-exit bound; normally completed runs still flush
 their trace and checkpoint, while a shutdown that outlasts the window may interrupt them.
 The runtime-to-browser document is an explicit read-only whitelist: task label, phase, bounded
-counters and active-tool names, current verification labels, outcome, plan lines, recent timeline,
-and latest Diff. The terminal response and public error are separate result fields. Raw
+counters and active-tool names, sanitized file-mutation summaries, current structured verifier
+evidence and revision, outcome, plan lines, recent timeline, and latest Diff. The terminal response
+and public error are separate result fields. Raw
 `RunEvent` objects, event messages, canonical chat history, raw provider responses, read/search/command
 output, provider state, credentials, and server configuration never enter that projection. The
 browser may submit a bounded task, but it cannot select the repository, model, base URL, state root,
