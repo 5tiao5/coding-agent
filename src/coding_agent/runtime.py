@@ -28,6 +28,7 @@ from coding_agent.mutation import MutationSession
 from coding_agent.plan import PlanState
 from coding_agent.run_memory import RunMemory
 from coding_agent.tools import (
+    CreateDirectoryTool,
     ListFilesTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -136,6 +137,7 @@ def build_runtime(
                 ),
                 approver=approver,
             ),
+            CreateDirectoryTool(workspace),
             WriteFileTool(mutation_session),
             ReplaceTextTool(mutation_session),
             UndoChangeTool(mutation_session),

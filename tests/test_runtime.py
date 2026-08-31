@@ -14,7 +14,7 @@ from coding_agent.models import ToolCall, VerificationKind
 from coding_agent.runtime import build_runtime, system_prompt_for
 
 
-def test_runtime_exposes_the_complete_m4_tool_surface(tmp_path: Path) -> None:
+def test_runtime_exposes_the_complete_tool_surface(tmp_path: Path) -> None:
     runtime = build_runtime(tmp_path, permission_mode=CommandPermissionMode.AUTO)
 
     assert [spec.name for spec in runtime.tools.specs()] == [
@@ -22,6 +22,7 @@ def test_runtime_exposes_the_complete_m4_tool_surface(tmp_path: Path) -> None:
         "read_file",
         "search_text",
         "run_command",
+        "create_directory",
         "write_file",
         "replace_text",
         "undo_change",

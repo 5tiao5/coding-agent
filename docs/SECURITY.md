@@ -8,12 +8,15 @@ administrator or a hostile process that can continuously rewrite the directory t
 
 - Every target is workspace-relative. Absolute, drive-qualified, parent-traversal, device,
   alternate-data-stream, control-character, ignored, internal, and sensitive paths fail closed.
-- Parent directories must already exist. File tools cannot create directory trees or request a
-  policy bypass.
+- Parent directories must already exist. `create_directory` creates exactly one explicitly named
+  child at a time; it never performs recursive parent creation. File tools retain their original
+  behavior and cannot create directory trees or request a policy bypass.
 - `.gitignore` files are readable policy inputs but are not mutation targets, so a change cannot
   rewrite the policy that its own undo must traverse.
 - Symlinks, junctions/reparse points, multiply linked files, and Windows files carrying named
   data streams are not mutation targets.
+- Directory creation uses no-clobber `mkdir`; an existing ordinary directory is an idempotent
+  success, while an existing file or link fails closed.
 - Existing files require the raw-byte SHA-256 returned by `read_file`; `null` means the target
   must not exist. Digest, mode, and file identity are checked again immediately before commit.
 - Writes use an exclusive same-directory temporary file, flush it, then replace the directory
@@ -27,8 +30,9 @@ administrator or a hostile process that can continuously rewrite the directory t
 
 ## Platform boundary
 
-POSIX commits use root-anchored directory descriptors and no-follow operations where the Python
-runtime exposes them. Windows replacement remains path-based: existing files use `ReplaceFileW`
+POSIX file commits and directory creation use root-anchored directory descriptors and no-follow
+operations where the Python runtime exposes them. Windows mutation remains path-based: existing
+files use `ReplaceFileW`
 with a reserved same-directory backup to carry the original DACL and filesystem attributes forward,
 while new files use no-clobber `os.rename`. Documented partial `ReplaceFileW` failures either restore
 the backup without clobbering a new target or preserve it under the reserved name and return

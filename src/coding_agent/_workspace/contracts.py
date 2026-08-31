@@ -46,6 +46,14 @@ class DirectoryScan:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectoryReceipt:
+    """The stable outcome of one no-clobber directory creation request."""
+
+    relative: str
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FileSnapshot:
     """An authorized file version used as a compare-and-swap write precondition."""
 

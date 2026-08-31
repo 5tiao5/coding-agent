@@ -143,7 +143,12 @@ class WorkspacePolicy:
                 "sensitive_path", f"sensitive files cannot be read: {relative.as_posix()}"
             )
 
-    def enforce_mutation(self, relative: PurePosixPath) -> None:
+    def enforce_mutation(
+        self,
+        relative: PurePosixPath,
+        *,
+        is_directory: bool = False,
+    ) -> None:
         """Apply mutation-only policy without resolving a potentially missing leaf."""
         if relative.name.casefold() == ".gitignore":
             raise WorkspaceError("path_ignored", "repository ignore-policy files cannot be changed")
@@ -153,7 +158,7 @@ class WorkspacePolicy:
             raise WorkspaceError(
                 "sensitive_path", f"sensitive files cannot be changed: {relative.as_posix()}"
             )
-        if self._matches_gitignore(relative, is_directory=False):
+        if self._matches_gitignore(relative, is_directory=is_directory):
             raise WorkspaceError("path_ignored", f"path is ignored: {relative.as_posix()}")
 
     def is_excluded(

@@ -137,6 +137,11 @@ registered verification commands may run, while ordinary commands fail closed. S
 only when that broader local command authority is intentional; it remains subject to the command
 deny rules and is not an OS sandbox.
 
+Empty projects are supported without weakening `write_file`: the Agent must call
+`create_directory` once for each missing directory level, then write files beneath those explicit
+parents. Directory creation is no-clobber, rejects links and policy-protected paths, and is available
+in both `safe` and `auto` modes because it stays inside the Workspace boundary.
+
 Omit the task string for a `prompt-toolkit` input prompt. No `--api-key` option exists, so the key
 never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment for
 stronger protection; `.env.local` is the convenient untracked development option, and a shell may

@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from coding_agent._workspace import native, posix, windows
 from coding_agent._workspace.contracts import (
+    DirectoryReceipt,
     DirectoryScan,
     ExpectedPathKind,
     FileIdentity,
@@ -26,6 +27,7 @@ from coding_agent._workspace.policy import WorkspacePolicy
 
 __all__ = (
     "DirectoryScan",
+    "DirectoryReceipt",
     "ExpectedPathKind",
     "FileIdentity",
     "FileSnapshot",
@@ -472,6 +474,140 @@ class Workspace:
             ) from exc
         except OSError as exc:
             raise WorkspaceError("io_error", f"cannot remove file: {current.relative}") from exc
+
+    def create_directory(self, user_path: str) -> DirectoryReceipt:
+        """Create exactly one authorized directory without creating missing parents.
+
+        The namespace operation is no-clobber and idempotent for an existing ordinary
+        directory. Parent traversal, ignored/sensitive/internal paths, and link-like targets
+        reuse the same fail-closed policy as file mutation.
+        """
+
+        relative, parent, target = self._directory_creation_location(user_path)
+        existing = self._inspect_directory_target(relative, target)
+        if existing is not None:
+            return existing
+
+        try:
+            if os.name == "nt":
+                parent_identity = native.path_identity(parent.path)
+                self._before_mutation_commit("mkdir", target)
+                rebound = self.resolve(parent.relative, expected="directory")
+                if (
+                    rebound.path != parent.path
+                    or native.path_identity(parent.path) != parent_identity
+                ):
+                    raise WorkspaceError(
+                        "write_conflict",
+                        f"parent changed before directory creation: {relative.as_posix()}",
+                    )
+                os.mkdir(target)
+            else:  # pragma: no cover - exercised by the POSIX CI job.
+                if os.mkdir not in os.supports_dir_fd:
+                    raise WorkspaceError(
+                        "unsupported_platform",
+                        "secure workspace directory creation is unavailable on this platform",
+                    )
+                parent_descriptor = posix.open_directory(self._root, parent.path)
+                try:
+                    parent_identity = native.descriptor_identity(parent_descriptor)
+                    self._before_mutation_commit("mkdir", target)
+                    rebound = self.resolve(parent.relative, expected="directory")
+                    if (
+                        rebound.path != parent.path
+                        or native.path_identity(parent.path) != parent_identity
+                    ):
+                        raise WorkspaceError(
+                            "write_conflict",
+                            f"parent changed before directory creation: {relative.as_posix()}",
+                        )
+                    os.mkdir(target.name, dir_fd=parent_descriptor)
+                    with suppress(OSError):
+                        os.fsync(parent_descriptor)
+                finally:
+                    with suppress(OSError):
+                        os.close(parent_descriptor)
+        except WorkspaceError:
+            raise
+        except FileExistsError:
+            raced = self._inspect_directory_target(relative, target)
+            if raced is not None:
+                return raced
+            raise WorkspaceError(
+                "write_conflict",
+                f"directory target changed during creation: {relative.as_posix()}",
+            ) from None
+        except FileNotFoundError as exc:
+            raise WorkspaceError(
+                "write_conflict",
+                f"parent changed before directory creation: {relative.as_posix()}",
+            ) from exc
+        except PermissionError as exc:
+            raise WorkspaceError(
+                "permission_denied", f"permission denied: {relative.as_posix()}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceError(
+                "io_error", f"cannot create directory: {relative.as_posix()}"
+            ) from exc
+
+        # Resolve again so a link-like or outside replacement never receives a success receipt.
+        created = self.resolve(relative.as_posix(), expected="directory")
+        if created.path != target:
+            raise WorkspaceError(
+                "write_conflict",
+                f"directory changed after creation: {relative.as_posix()}",
+            )
+        return DirectoryReceipt(relative=created.relative, created=True)
+
+    def _directory_creation_location(
+        self,
+        user_path: str,
+    ) -> tuple[PurePosixPath, WorkspacePath, Path]:
+        relative = self._policy.normalize_user_path(user_path)
+        if relative == PurePosixPath("."):
+            raise WorkspaceError("invalid_path", "the workspace root cannot be created")
+        self._policy.enforce_mutation(relative, is_directory=True)
+        parent = self.resolve(relative.parent.as_posix(), expected="directory")
+        target = parent.path / relative.name
+        if not self.contains(parent.path):  # Defensive: ``resolve`` already establishes this.
+            raise WorkspaceError(
+                "path_outside_workspace",
+                f"path resolves outside the workspace: {relative.as_posix()}",
+            )
+        return relative, parent, target
+
+    def _inspect_directory_target(
+        self,
+        relative: PurePosixPath,
+        target: Path,
+    ) -> DirectoryReceipt | None:
+        try:
+            target_stat = target.lstat()
+        except FileNotFoundError:
+            return None
+        except PermissionError as exc:
+            raise WorkspaceError(
+                "permission_denied", f"permission denied: {relative.as_posix()}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceError(
+                "io_error", f"cannot inspect directory: {relative.as_posix()}"
+            ) from exc
+
+        if native.is_link_like(target):
+            raise WorkspaceError(
+                "unsafe_directory_link",
+                f"directory links cannot be created or reused: {relative.as_posix()}",
+            )
+        if not stat.S_ISDIR(target_stat.st_mode):
+            raise WorkspaceError("not_directory", f"path is not a directory: {relative.as_posix()}")
+        approved = self.resolve(relative.as_posix(), expected="directory")
+        if approved.path != target:
+            raise WorkspaceError(
+                "write_conflict", f"directory changed while inspected: {relative.as_posix()}"
+            )
+        return DirectoryReceipt(relative=approved.relative, created=False)
 
     def _mutation_location(self, user_path: str) -> tuple[PurePosixPath, Path]:
         relative = self._policy.normalize_user_path(user_path)
