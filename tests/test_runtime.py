@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from coding_agent.command import CommandPermissionMode
+from coding_agent.command import (
+    CommandPermissionMode,
+    VerificationCommandSpec,
+)
+from coding_agent.models import VerificationKind
 from coding_agent.runtime import build_runtime, system_prompt_for
 
 
@@ -24,6 +29,13 @@ def test_runtime_exposes_the_complete_m4_tool_surface(tmp_path: Path) -> None:
     ]
     assert runtime.workspace.root == tmp_path.resolve()
     assert len(runtime.verification_commands) == 1
+    assert runtime.verification_profile is not None
+    assert runtime.completion_contract is not None
+    assert runtime.verification_profile.required_labels == ("pytest",)
+    assert runtime.verification_profile.checks[0].scopes == ("tests",)
+    assert runtime.verification_profile.target_runtime.runtime_id == "configured-python"
+    assert runtime.verification_profile.target_runtime.eligible_for_task_validation is True
+    assert runtime.completion_contract.required_scopes == ("tests",)
 
 
 def test_system_prompt_names_only_exact_host_registered_verifier() -> None:
@@ -42,3 +54,55 @@ def test_system_prompt_names_only_exact_host_registered_verifier() -> None:
 
 def test_system_prompt_explains_when_no_verifier_is_configured() -> None:
     assert "remain unverified" in system_prompt_for(())
+
+
+def test_runtime_profiles_every_registered_verifier_and_target_runtime(tmp_path: Path) -> None:
+    executable = str(Path(sys.executable).absolute())
+    verifiers = (
+        VerificationCommandSpec(
+            argv=(executable, "-m", "pytest"),
+            cwd=".",
+            kind=VerificationKind.TEST,
+            label="pytest",
+        ),
+        VerificationCommandSpec(
+            argv=(executable, "-m", "build"),
+            cwd=".",
+            kind=VerificationKind.BUILD,
+            label="package-build",
+        ),
+        VerificationCommandSpec(
+            argv=(executable, "-m", "ruff", "check", "."),
+            cwd=".",
+            kind=VerificationKind.CHECK,
+            label="ruff-check",
+        ),
+    )
+
+    runtime = build_runtime(
+        tmp_path,
+        verification_commands=verifiers,
+        target_runtime_id="project-python",
+        target_runtime_eligible=False,
+    )
+
+    assert runtime.verification_profile is not None
+    assert runtime.verification_profile.required_labels == (
+        "pytest",
+        "package-build",
+        "ruff-check",
+    )
+    assert [check.scopes for check in runtime.verification_profile.checks] == [
+        ("tests",),
+        ("build",),
+        ("checks",),
+    ]
+    assert runtime.verification_profile.target_runtime.runtime_id == "project-python"
+    assert runtime.verification_profile.target_runtime.eligible_for_task_validation is False
+
+
+def test_runtime_without_verifiers_has_no_strict_completion_pair(tmp_path: Path) -> None:
+    runtime = build_runtime(tmp_path, verification_commands=())
+
+    assert runtime.verification_profile is None
+    assert runtime.completion_contract is None

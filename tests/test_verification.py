@@ -57,6 +57,7 @@ def test_passed_evidence_is_bound_to_the_current_epoch() -> None:
 
     report = ledger.report()
     assert report.status is VerificationStatus.VERIFIED
+    assert report.checks_passed is True
     assert report.verified is True
     assert report.epoch == 1
     assert len(report.evidence) == 1
@@ -88,6 +89,7 @@ def test_later_possible_write_makes_passed_evidence_stale() -> None:
 
     report = ledger.report()
     assert report.status is VerificationStatus.STALE
+    assert report.checks_passed is False
     assert report.verified is False
     assert report.epoch == 1
 

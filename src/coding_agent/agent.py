@@ -8,6 +8,11 @@ from math import isfinite
 from time import sleep
 from uuid import uuid4
 
+from coding_agent.completion import (
+    CompletionContract,
+    VerificationProfile,
+    evaluate_completion,
+)
 from coding_agent.context import ContextError, ContextManager
 from coding_agent.events import EventKind, EventSink, NullEventSink, RunEvent
 from coding_agent.model import (
@@ -89,6 +94,8 @@ class AgentRunner:
         model_retry_sleeper: Callable[[float], None] = sleep,
         context_manager: ContextManager | None = None,
         session_store: SessionStore | None = None,
+        verification_profile: VerificationProfile | None = None,
+        completion_contract: CompletionContract | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -109,6 +116,10 @@ class AgentRunner:
             or not 0 <= model_retry_base_delay_seconds <= 60
         ):
             raise ValueError("model_retry_base_delay_seconds must be between 0 and 60")
+        if (verification_profile is None) != (completion_contract is None):
+            raise ValueError(
+                "verification_profile and completion_contract must be provided together"
+            )
         self._model = model
         self._tools = tools
         self._events = event_sink or NullEventSink()
@@ -121,6 +132,8 @@ class AgentRunner:
         self._model_retry_sleeper = model_retry_sleeper
         self._context = context_manager or ContextManager(max_chars=80_000)
         self._session_store = session_store
+        self._verification_profile = verification_profile
+        self._completion_contract = completion_contract
 
     def run(
         self,
@@ -586,22 +599,36 @@ class AgentRunner:
 
             state = self._transition(run_id, state, AgentState.VERIFYING, step)
             verification_report = verification.report()
+            if self._verification_profile is not None:
+                assert self._completion_contract is not None
+                completion_report = evaluate_completion(
+                    self._verification_profile,
+                    self._completion_contract,
+                    verification_report,
+                )
+                verified = completion_report.task_validated
+                verification_data = completion_report.event_data(verification_report)
+                evaluation_message = (
+                    "Task completion contract validated"
+                    if verified
+                    else f"Completion contract is {completion_report.completion_status.value}"
+                )
+            else:
+                verified = verification_report.verified
+                verification_data = verification_report.event_data()
+                evaluation_message = (
+                    "Current verification evidence passed"
+                    if verified
+                    else f"Verification evidence is {verification_report.status.value}"
+                )
             self._emit(
                 run_id,
                 EventKind.VERIFICATION_EVALUATED,
-                (
-                    "Current verification evidence passed"
-                    if verification_report.verified
-                    else f"Verification evidence is {verification_report.status.value}"
-                ),
+                evaluation_message,
                 step,
-                verification_report.event_data(),
+                verification_data,
             )
-            terminal_state = (
-                AgentState.COMPLETED
-                if verification_report.verified
-                else AgentState.COMPLETED_UNVERIFIED
-            )
+            terminal_state = AgentState.COMPLETED if verified else AgentState.COMPLETED_UNVERIFIED
             state = self._transition(run_id, state, terminal_state, step)
             self._save_checkpoint(
                 run_id,
@@ -620,12 +647,16 @@ class AgentRunner:
                 run_id,
                 EventKind.RUN_FINISHED,
                 (
-                    "Run ended with current verification evidence"
-                    if verification_report.verified
-                    else "Run ended with an unverified final response"
+                    "Run ended with a validated completion contract"
+                    if verified and self._verification_profile is not None
+                    else (
+                        "Run ended with current verification evidence"
+                        if verified
+                        else "Run ended with an unverified final response"
+                    )
                 ),
                 step,
-                verification_report.event_data(),
+                verification_data,
             )
             return AgentResult(
                 run_id=run_id,

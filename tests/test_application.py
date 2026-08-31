@@ -42,6 +42,15 @@ def test_repository_application_service_drives_trace_and_presentation(
 
     assert result.state is AgentState.COMPLETED_UNVERIFIED
     assert presentation.events[-1].kind is EventKind.RUN_FINISHED
+    assert presentation.events[-1].data["verified"] is False
+    assert presentation.events[-1].data["checks_passed"] is False
+    assert presentation.events[-1].data["task_validated"] is False
+    assert presentation.events[-1].data["completion_status"] == "missing"
+    assert presentation.events[-1].data["required_labels"] == ["pytest"]
+    assert presentation.events[-1].data["missing_labels"] == ["pytest"]
+    assert presentation.events[-1].data["required_scopes"] == ["tests"]
+    assert presentation.events[-1].data["missing_scopes"] == ["tests"]
+    assert presentation.events[-1].data["target_runtime_id"] == "configured-python"
     trace = TraceStore(spec.paths.traces)
     assert trace.summarize(spec.run_id).status is TraceRunStatus.COMPLETED
     assert trace.read(spec.run_id) == tuple(presentation.events)

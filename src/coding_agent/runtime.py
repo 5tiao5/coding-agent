@@ -17,6 +17,12 @@ from coding_agent.command import (
     VerificationCommandSpec,
     executable_sha256,
 )
+from coding_agent.completion import (
+    CompletionContract,
+    TargetRuntime,
+    VerificationCheck,
+    VerificationProfile,
+)
 from coding_agent.models import VerificationKind
 from coding_agent.mutation import MutationSession
 from coding_agent.plan import PlanState
@@ -41,6 +47,8 @@ class RuntimeComponents:
     plan_state: PlanState
     tools: ToolRegistry
     verification_commands: tuple[VerificationCommandSpec, ...]
+    verification_profile: VerificationProfile | None
+    completion_contract: CompletionContract | None
 
 
 def default_pytest_verifier(workspace_root: Path | None = None) -> VerificationCommandSpec:
@@ -78,6 +86,9 @@ def build_runtime(
     permission_mode: CommandPermissionMode = CommandPermissionMode.SAFE,
     approver: CommandApprover | None = None,
     verification_commands: Sequence[VerificationCommandSpec] | None = None,
+    completion_contract: CompletionContract | None = None,
+    target_runtime_id: str = "configured-python",
+    target_runtime_eligible: bool = True,
 ) -> RuntimeComponents:
     workspace = Workspace(root)
     mutation_session = MutationSession(workspace)
@@ -87,6 +98,28 @@ def build_runtime(
         if verification_commands is None
         else tuple(verification_commands)
     )
+    if verifiers:
+        profile = VerificationProfile(
+            checks=tuple(
+                VerificationCheck(
+                    label=spec.label,
+                    kind=spec.kind,
+                    scopes=(_verification_scope(spec.kind),),
+                )
+                for spec in verifiers
+            ),
+            required_labels=tuple(spec.label for spec in verifiers),
+            target_runtime=TargetRuntime(
+                runtime_id=target_runtime_id,
+                eligible_for_task_validation=target_runtime_eligible,
+            ),
+        )
+        contract = completion_contract or CompletionContract(required_scopes=("tests",))
+    else:
+        if completion_contract is not None:
+            raise ValueError("completion_contract requires at least one verifier")
+        profile = None
+        contract = None
     tools = ToolRegistry(
         [
             ListFilesTool(workspace),
@@ -112,7 +145,17 @@ def build_runtime(
         plan_state=plan_state,
         tools=tools,
         verification_commands=verifiers,
+        verification_profile=profile,
+        completion_contract=contract,
     )
+
+
+def _verification_scope(kind: VerificationKind) -> str:
+    if kind is VerificationKind.TEST:
+        return "tests"
+    if kind is VerificationKind.BUILD:
+        return "build"
+    return "checks"
 
 
 def system_prompt_for(verifiers: Sequence[VerificationCommandSpec]) -> str:

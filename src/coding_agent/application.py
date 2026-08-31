@@ -92,6 +92,8 @@ def execute_repository_run(
         max_steps=spec.max_steps,
         max_model_retries=spec.max_model_retries,
         session_store=store,
+        verification_profile=runtime.verification_profile,
+        completion_contract=runtime.completion_contract,
     )
     if loaded is None:
         return runner.run(

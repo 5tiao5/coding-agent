@@ -231,7 +231,7 @@ verification evidence.
   but it is not intended for port forwarding or remote exposure.
 - Graceful Web shutdown gives an active run five seconds to drain. A longer run, forced process kill,
   or machine failure can interrupt its final trace/checkpoint write; this is not crash-safe execution.
-- M5 still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
+- Final delivery still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
 
 ## Design boundary
 

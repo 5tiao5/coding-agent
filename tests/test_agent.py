@@ -10,6 +10,12 @@ import pytest
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
+from coding_agent.completion import (
+    CompletionContract,
+    TargetRuntime,
+    VerificationCheck,
+    VerificationProfile,
+)
 from coding_agent.context import ContextManager, context_char_count
 from coding_agent.events import EventKind, MemoryEventSink
 from coding_agent.model import (
@@ -776,6 +782,110 @@ def test_current_trusted_verification_evidence_completes_the_run() -> None:
         "passed": True,
     }
     assert all("verification_label" not in (message.content or "") for message in result.messages)
+
+
+def test_completion_contract_distinguishes_passing_checks_from_task_validation() -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-1", name="verification_marker", arguments={}),)
+            ),
+            ModelResponse(content="The registered test check passed."),
+        ]
+    )
+    events = MemoryEventSink()
+    profile = VerificationProfile(
+        checks=(
+            VerificationCheck(
+                label="test-suite",
+                kind=VerificationKind.TEST,
+                scopes=("tests",),
+            ),
+        ),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime(
+            runtime_id="configured-python",
+            eligible_for_task_validation=True,
+        ),
+    )
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([VerificationMarkerTool()]),
+        event_sink=events,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests", "types")),
+    ).run("Run the available check but require type coverage too")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    evaluated = next(
+        event for event in events.events if event.kind is EventKind.VERIFICATION_EVALUATED
+    )
+    assert evaluated.data["verified"] is False
+    assert evaluated.data["status"] == "checks_only"
+    assert evaluated.data["checks_passed"] is True
+    assert evaluated.data["task_validated"] is False
+    assert evaluated.data["completion_status"] == "checks_only"
+    assert evaluated.data["required_labels"] == ["test-suite"]
+    assert evaluated.data["missing_labels"] == []
+    assert evaluated.data["required_scopes"] == ["tests", "types"]
+    assert evaluated.data["passed_scopes"] == ["tests"]
+    assert evaluated.data["missing_scopes"] == ["types"]
+    assert evaluated.data["target_runtime_id"] == "configured-python"
+    assert events.events[-1].data == evaluated.data
+
+
+def test_completion_contract_validates_only_when_every_requirement_is_satisfied() -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-1", name="verification_marker", arguments={}),)
+            ),
+            ModelResponse(content="The task contract is satisfied."),
+        ]
+    )
+    events = MemoryEventSink()
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([VerificationMarkerTool()]),
+        event_sink=events,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Verify the complete task contract")
+
+    assert result.state is AgentState.COMPLETED
+    assert events.events[-1].data["verified"] is True
+    assert events.events[-1].data["status"] == "verified"
+    assert events.events[-1].data["checks_passed"] is True
+    assert events.events[-1].data["task_validated"] is True
+    assert events.events[-1].data["completion_status"] == "validated"
+
+
+def test_completion_profile_and_contract_must_be_configured_together() -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("pytest", VerificationKind.TEST, ("tests",)),),
+        required_labels=("pytest",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        AgentRunner(
+            ScriptedModel([ModelResponse(content="unused")]),
+            ToolRegistry(),
+            verification_profile=profile,
+        )
+    with pytest.raises(ValueError, match="must be provided together"):
+        AgentRunner(
+            ScriptedModel([ModelResponse(content="unused")]),
+            ToolRegistry(),
+            completion_contract=CompletionContract(required_scopes=("tests",)),
+        )
 
 
 def test_mutation_after_passed_verification_makes_the_evidence_stale() -> None:

@@ -29,8 +29,16 @@ class VerificationReport:
     evidence: tuple[VerificationEvidence, ...] = ()
 
     @property
-    def verified(self) -> bool:
+    def checks_passed(self) -> bool:
+        """Whether all evidence currently known to this evidence-only ledger passed."""
+
         return self.status is VerificationStatus.VERIFIED
+
+    @property
+    def verified(self) -> bool:
+        """Legacy evidence-only alias retained until completion policy is integrated."""
+
+        return self.checks_passed
 
     def event_data(self) -> dict[str, object]:
         return {
