@@ -59,25 +59,17 @@ _MODEL_ERROR_PREFIXES = (
 )
 
 _CODED_ERROR_MESSAGES = {
-    "openai_client_configuration": (
-        "模型客户端配置失败。请检查 API Key、接口地址和相关环境变量。"
-    ),
+    "openai_client_configuration": ("模型客户端配置失败。请检查 API Key、接口地址和相关环境变量。"),
     "openai_request_failed": (
         "模型请求被服务端拒绝。请检查 API Key、模型名称、接口地址和账户权限。"
     ),
     "openai_request_transient": "模型服务暂时不可用，请稍后重试。",
-    "openai_invalid_function_arguments": (
-        "模型返回的工具参数格式无效，自动纠正后仍未恢复。"
-    ),
+    "openai_invalid_function_arguments": ("模型返回的工具参数格式无效，自动纠正后仍未恢复。"),
     "openai_invalid_response": "模型返回了无法识别的响应格式，请重试或更换兼容模型。",
     "openai_provider_error": "模型服务返回了错误状态。请检查模型配置后重试。",
     "openai_incomplete_response": "模型响应未完整生成，请重试。",
-    "openai_invalid_request": (
-        "模型请求上下文不符合工具调用协议，建议从最近检查点重新运行。"
-    ),
-    "openai_reasoning_continuation_unsupported": (
-        "当前模型的推理状态与无状态工具调用模式不兼容。"
-    ),
+    "openai_invalid_request": ("模型请求上下文不符合工具调用协议，建议从最近检查点重新运行。"),
+    "openai_reasoning_continuation_unsupported": ("当前模型的推理状态与无状态工具调用模式不兼容。"),
 }
 
 

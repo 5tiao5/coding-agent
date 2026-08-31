@@ -9,6 +9,7 @@ receive only allowlisted source files.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -233,6 +234,7 @@ def evaluate_case(
         repository = evaluation_root / "repository"
         repository.mkdir()
         _materialize_fixture(repository, scenario)
+        _materialize_verification_policy(repository, scenario)
 
         protected_manifest = _protected_manifest(repository, scenario)
         changed_hashes = {
@@ -471,6 +473,60 @@ def _aggregate(cases: tuple[CaseMetrics, ...]) -> AggregateMetrics:
 
 def _materialize_fixture(repository: Path, scenario: EvaluationScenario) -> None:
     _materialize_files(repository, scenario.files)
+
+
+def _materialize_verification_policy(
+    repository: Path,
+    scenario: EvaluationScenario,
+) -> None:
+    """Inject host-owned trusted checks into metadata hidden from the Agent tools."""
+
+    protected = {"tests/", *sorted(_PYTEST_CONTROL_NAMES)}
+    protected.update(
+        path for path in scenario.protected_paths if PurePosixPath(path).parts[:1] != ("tests",)
+    )
+    required_scopes = ["tests"]
+    verifier_blocks = [
+        "\n".join(
+            (
+                "[[verifiers]]",
+                'label = "pytest"',
+                'type = "pytest"',
+                'cwd = "."',
+                'scopes = ["tests"]',
+                "required = true",
+            )
+        )
+    ]
+    if scenario.runtime_module is not None:
+        verifier_blocks.append(
+            "\n".join(
+                (
+                    "[[verifiers]]",
+                    'label = "module-smoke"',
+                    'type = "python-module"',
+                    "module = " + json.dumps(scenario.runtime_module, ensure_ascii=False),
+                    'cwd = "."',
+                    'scopes = ["runtime:entrypoint"]',
+                    "required = true",
+                )
+            )
+        )
+        required_scopes.append("runtime:entrypoint")
+
+    policy = "\n\n".join(
+        (
+            "schema_version = 1",
+            "protected_paths = " + json.dumps(sorted(protected), ensure_ascii=False),
+            "[python]\nexecutable = "
+            + json.dumps(str(Path(sys.executable).absolute()), ensure_ascii=False),
+            *verifier_blocks,
+            "[completion]\nrequired_scopes = " + json.dumps(required_scopes, ensure_ascii=False),
+        )
+    )
+    metadata = repository / ".coding-agent"
+    metadata.mkdir()
+    metadata.joinpath("project.toml").write_text(policy + "\n", encoding="utf-8")
 
 
 def _materialize_files(repository: Path, fixtures: Iterable[FixtureFile]) -> None:

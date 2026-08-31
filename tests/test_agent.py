@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, TypeAdapter
 from coding_agent.agent import AgentRunner
 from coding_agent.agent_protocol import EARLY_FINAL_CORRECTION_MARKER
 from coding_agent.budget import BudgetPolicy
+from coding_agent.cancellation import CancellationSource
 from coding_agent.completion import (
     CompletionContract,
     TargetRuntime,
@@ -84,6 +85,19 @@ class EchoTool(BaseTool[EchoArgs]):
         self.calls.append(arguments)
         content = arguments.text.upper() if arguments.uppercase else arguments.text
         return ToolOutput(content=content, summary="Echoed test text")
+
+
+class CancellingEchoTool(EchoTool):
+    """Request host cancellation after one deterministic tool execution."""
+
+    def __init__(self, source: CancellationSource) -> None:
+        super().__init__()
+        self._source = source
+
+    def run(self, arguments: EchoArgs) -> ToolOutput:
+        output = super().run(arguments)
+        self._source.request_cancellation()
+        return output
 
 
 class OutcomeModel:
@@ -1262,6 +1276,153 @@ def test_keyboard_interrupt_during_tool_execution_is_a_structured_failure() -> N
     ]
     assert EventKind.TOOL_FINISHED not in [event.kind for event in events.events]
     assert events.events[-1].data == {"stop_reason": StopReason.USER_INTERRUPTED.value}
+
+
+def test_pre_requested_host_cancellation_stops_before_model_and_saves_resume_point(
+    tmp_path: Path,
+) -> None:
+    source = CancellationSource()
+    assert source.request_cancellation() is True
+    model = ScriptedModel([ModelResponse(content="must not be requested")])
+    store = SessionStore((tmp_path / "state").resolve())
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        session_store=store,
+        cancellation_token=source.token,
+    ).run("Stop before spending a model request", run_id="host-cancel-before-model")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert result.steps == 1
+    assert model.requests == []
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.stop_reason is None
+    assert checkpoint.completed_steps == 0
+    assert checkpoint.completed_tool_calls == 0
+
+
+def test_cancellation_during_blocking_model_discards_late_final_and_keeps_resume_point(
+    tmp_path: Path,
+) -> None:
+    source = CancellationSource()
+
+    class LateFinalModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[ToolSpec],
+        ) -> ModelResponse:
+            del messages, tools
+            self.calls += 1
+            source.request_cancellation()
+            return ModelResponse(content="late final must not be committed")
+
+    model = LateFinalModel()
+    store = SessionStore((tmp_path / "state").resolve())
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        session_store=store,
+        cancellation_token=source.token,
+    ).run("Do not accept a final after shutdown", run_id="host-cancel-late-final")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert result.final_text is None
+    assert model.calls == 1
+    assert [message.role for message in result.messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+    ]
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.completed_steps == 0
+
+
+def test_host_cancellation_between_tool_calls_closes_batch_and_saves_resume_point(
+    tmp_path: Path,
+) -> None:
+    source = CancellationSource()
+    tool = CancellingEchoTool(source)
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(id="echo-first", name="echo", arguments={"text": "first"}),
+                    ToolCall(id="echo-second", name="echo", arguments={"text": "second"}),
+                )
+            )
+        ]
+    )
+    store = SessionStore((tmp_path / "state").resolve())
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([tool]),
+        session_store=store,
+        cancellation_token=source.token,
+    ).run("Stop between calls", run_id="host-cancel-between-tools")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert [call.text for call in tool.calls] == ["first"]
+    tool_messages = [message for message in result.messages if message.role is MessageRole.TOOL]
+    assert [message.tool_call_id for message in tool_messages] == ["echo-first", "echo-second"]
+    cancelled = _TOOL_PAYLOAD_ADAPTER.validate_json(tool_messages[-1].content or "")
+    assert cancelled["ok"] is False
+    assert cancelled["error_code"] == "tool_call_cancelled"
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.stop_reason is None
+    assert checkpoint.completed_steps == 1
+    assert checkpoint.completed_tool_calls == 2
+    ContextManager(max_chars=100_000).prepare(checkpoint.messages)
+
+
+def test_host_cancellation_wakes_model_retry_backoff_before_another_request(
+    tmp_path: Path,
+) -> None:
+    source = CancellationSource()
+
+    class CancellingRetryModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[ToolSpec],
+        ) -> ModelResponse:
+            del messages, tools
+            self.calls += 1
+            source.request_cancellation()
+            raise RetryableModelError("provider_busy", "temporary provider failure")
+
+    model = CancellingRetryModel()
+    store = SessionStore((tmp_path / "state").resolve())
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        session_store=store,
+        cancellation_token=source.token,
+        max_model_retries=2,
+        model_retry_base_delay_seconds=60,
+    ).run("Cancel the retry", run_id="host-cancel-retry")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.USER_INTERRUPTED
+    assert model.calls == 1
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.completed_steps == 0
 
 
 def test_per_step_tool_call_limit_rejects_atomically_then_accepts_a_smaller_retry() -> None:

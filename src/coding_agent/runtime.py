@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,9 +24,16 @@ from coding_agent.completion import (
     VerificationCheck,
     VerificationProfile,
 )
+from coding_agent.integrity import check_integrity
 from coding_agent.models import VerificationKind
 from coding_agent.mutation import MutationSession
 from coding_agent.plan import PlanState
+from coding_agent.project_config import (
+    ResolvedProjectPolicy,
+    ResolvedVerifier,
+    VerifierType,
+    load_project_policy,
+)
 from coding_agent.run_memory import RunMemory
 from coding_agent.tools import (
     CreateDirectoryTool,
@@ -41,6 +49,9 @@ from coding_agent.tools import (
 )
 from coding_agent.workspace import Workspace
 
+_POLICY_ANCHOR_PREFIX = "Verification policy fingerprint: "
+_POLICY_ANCHOR_MARKER = "Verification policy fingerprint:"
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeComponents:
@@ -52,6 +63,8 @@ class RuntimeComponents:
     verification_commands: tuple[VerificationCommandSpec, ...]
     verification_profile: VerificationProfile | None
     completion_contract: CompletionContract | None
+    project_policy: ResolvedProjectPolicy
+    policy_fingerprint: str
 
 
 def default_pytest_verifier(workspace_root: Path | None = None) -> VerificationCommandSpec:
@@ -93,16 +106,49 @@ def build_runtime(
     target_runtime_id: str = "configured-python",
     target_runtime_eligible: bool = True,
 ) -> RuntimeComponents:
-    workspace = Workspace(root)
+    project_policy = load_project_policy(root)
+    protected_mutations = (
+        tuple(item.path for item in project_policy.protected_paths)
+        if verification_commands is None and project_policy.configured
+        else ()
+    )
+    workspace = Workspace(root, protected_mutation_paths=protected_mutations)
     mutation_session = MutationSession(workspace)
     run_memory = RunMemory()
     plan_state = run_memory.plan_state
-    verifiers = (
-        (default_pytest_verifier(root),)
-        if verification_commands is None
-        else tuple(verification_commands)
-    )
-    if verifiers:
+    configured_policy_active = verification_commands is None and project_policy.configured
+    if configured_policy_active and completion_contract is not None:
+        raise ValueError(
+            "completion_contract cannot override configured project verification policy"
+        )
+    integrity_guard: Callable[[], bool] | None
+    if configured_policy_active:
+        verifiers = tuple(
+            _configured_verification_command(item, project_policy)
+            for item in project_policy.verifiers
+        )
+        profile = _configured_verification_profile(project_policy)
+        contract = CompletionContract(required_scopes=project_policy.required_scopes)
+
+        def policy_integrity_is_intact() -> bool:
+            return check_integrity(project_policy).intact
+
+        integrity_guard = policy_integrity_is_intact
+        policy_fingerprint = project_policy.policy_fingerprint
+    else:
+        verifiers = (
+            (default_pytest_verifier(root),)
+            if verification_commands is None
+            else tuple(verification_commands)
+        )
+        integrity_guard = None
+        profile = None
+        contract = None
+        policy_fingerprint = ""
+
+    if verifiers and profile is None:
+        runtime_id = "unconfigured-python" if verification_commands is None else target_runtime_id
+        runtime_eligible = False if verification_commands is None else target_runtime_eligible
         profile = VerificationProfile(
             checks=tuple(
                 VerificationCheck(
@@ -114,16 +160,23 @@ def build_runtime(
             ),
             required_labels=tuple(spec.label for spec in verifiers),
             target_runtime=TargetRuntime(
-                runtime_id=target_runtime_id,
-                eligible_for_task_validation=target_runtime_eligible,
+                runtime_id=runtime_id,
+                eligible_for_task_validation=runtime_eligible,
             ),
         )
         contract = completion_contract or CompletionContract(required_scopes=("tests",))
-    else:
+    elif not verifiers:
         if completion_contract is not None:
             raise ValueError("completion_contract requires at least one verifier")
         profile = None
         contract = None
+    if not policy_fingerprint:
+        policy_fingerprint = _override_policy_fingerprint(
+            project_policy=project_policy,
+            verifiers=verifiers,
+            profile=profile,
+            contract=contract,
+        )
     tools = ToolRegistry(
         [
             ListFilesTool(workspace),
@@ -136,6 +189,7 @@ def build_runtime(
                     verification_commands=verifiers,
                 ),
                 approver=approver,
+                verification_integrity_guard=integrity_guard,
             ),
             CreateDirectoryTool(workspace),
             WriteFileTool(mutation_session),
@@ -153,7 +207,89 @@ def build_runtime(
         verification_commands=verifiers,
         verification_profile=profile,
         completion_contract=contract,
+        project_policy=project_policy,
+        policy_fingerprint=policy_fingerprint,
     )
+
+
+def _configured_verification_command(
+    verifier: ResolvedVerifier,
+    policy: ResolvedProjectPolicy,
+) -> VerificationCommandSpec:
+    interpreter = policy.interpreter
+    if interpreter is None:  # pragma: no cover - configured policy validation guarantees this.
+        raise ValueError("configured verification policy requires an interpreter")
+    return VerificationCommandSpec(
+        argv=verifier.argv,
+        cwd=verifier.cwd,
+        kind=verifier.kind,
+        label=verifier.label,
+        workspace_executable_sha256=interpreter.sha256,
+        python_module=(
+            verifier.module if verifier.verifier_type is VerifierType.PYTHON_MODULE else None
+        ),
+    )
+
+
+def _configured_verification_profile(
+    policy: ResolvedProjectPolicy,
+) -> VerificationProfile:
+    integrity_scope = ("integrity:protected",) if policy.protected_paths else ()
+    return VerificationProfile(
+        checks=tuple(
+            VerificationCheck(
+                label=verifier.label,
+                kind=verifier.kind,
+                scopes=tuple(dict.fromkeys((*verifier.scopes, *integrity_scope))),
+            )
+            for verifier in policy.verifiers
+        ),
+        required_labels=policy.required_labels,
+        target_runtime=TargetRuntime(
+            runtime_id=policy.target_runtime_id,
+            eligible_for_task_validation=policy.target_runtime_eligible,
+        ),
+    )
+
+
+def _override_policy_fingerprint(
+    *,
+    project_policy: ResolvedProjectPolicy,
+    verifiers: tuple[VerificationCommandSpec, ...],
+    profile: VerificationProfile | None,
+    contract: CompletionContract | None,
+) -> str:
+    payload = {
+        "project_policy": project_policy.policy_fingerprint,
+        "verifiers": [
+            {
+                "argv": list(spec.argv),
+                "cwd": spec.cwd,
+                "kind": spec.kind.value,
+                "label": spec.label,
+                "executable_sha256": spec.workspace_executable_sha256,
+                "python_module": spec.python_module,
+            }
+            for spec in verifiers
+        ],
+        "target_runtime": (
+            None
+            if profile is None
+            else {
+                "id": profile.target_runtime.runtime_id,
+                "eligible": profile.target_runtime.eligible_for_task_validation,
+            }
+        ),
+        "required_scopes": [] if contract is None else list(contract.required_scopes),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _verification_scope(kind: VerificationKind) -> str:
@@ -164,22 +300,65 @@ def _verification_scope(kind: VerificationKind) -> str:
     return "checks"
 
 
-def system_prompt_for(verifiers: Sequence[VerificationCommandSpec]) -> str:
+def system_prompt_for(
+    verifiers: Sequence[VerificationCommandSpec],
+    *,
+    policy_fingerprint: str | None = None,
+    target_runtime_eligible: bool | None = None,
+) -> str:
     lines = [DEFAULT_SYSTEM_PROMPT]
     if not verifiers:
         lines.append(
             "No trusted verification capability is configured; be explicit that completion "
             "will remain unverified."
         )
-        return "\n\n".join(lines)
+        prompt = "\n\n".join(lines)
+        return _append_policy_anchor(prompt, policy_fingerprint)
 
     lines.append(
         "Trusted verification capabilities are listed below. Use the exact argv and cwd; "
         "nearby commands may run but cannot issue verification evidence."
     )
+    if target_runtime_eligible is False:
+        lines.append(
+            "These checks may pass, but they cannot validate task completion until an "
+            "explicit project interpreter policy is configured. Report that limit plainly."
+        )
     lines.extend(
         f"- {spec.label}: cwd={json.dumps(spec.cwd)}, "
         f"argv={json.dumps(list(spec.argv), ensure_ascii=False)}"
         for spec in verifiers
     )
-    return "\n".join(lines)
+    return _append_policy_anchor("\n".join(lines), policy_fingerprint)
+
+
+def _append_policy_anchor(prompt: str, policy_fingerprint: str | None) -> str:
+    if policy_fingerprint is None:
+        return prompt
+    if len(policy_fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in policy_fingerprint
+    ):
+        raise ValueError("policy fingerprint must be lowercase SHA-256")
+    return prompt + "\n" + _POLICY_ANCHOR_PREFIX + policy_fingerprint
+
+
+def policy_fingerprint_from_prompt(prompt: str) -> str | None:
+    """Extract one canonical host anchor from a checkpoint system prompt.
+
+    Runtime-limit text may be appended after the anchor.  Duplicate or malformed anchors are
+    rejected so a checkpoint cannot smuggle an ambiguous policy identity across resume.
+    """
+
+    candidates = [line for line in prompt.splitlines() if _POLICY_ANCHOR_MARKER in line]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError("system prompt contains multiple policy fingerprints")
+    if not candidates[0].startswith(_POLICY_ANCHOR_PREFIX):
+        raise ValueError("system prompt contains a malformed policy fingerprint")
+    fingerprint = candidates[0].removeprefix(_POLICY_ANCHOR_PREFIX)
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise ValueError("system prompt contains an invalid policy fingerprint")
+    return fingerprint

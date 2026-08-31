@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coding_agent.application import RepositoryRunSpec
+from coding_agent.cancellation import CancellationToken
 from coding_agent.cli import _ensure_run_catalog_entry
 from coding_agent.command import CommandPermissionMode
 from coding_agent.events import EventKind, EventSink, RunEvent
@@ -105,6 +106,57 @@ def _completed_result(run_id: str, task: str) -> AgentResult:
             ChatMessage(role=MessageRole.ASSISTANT, content=final_text),
         ),
     )
+
+
+def _interrupted_result(run_id: str, task: str) -> AgentResult:
+    return AgentResult(
+        run_id=run_id,
+        state=AgentState.FAILED,
+        stop_reason=StopReason.USER_INTERRUPTED,
+        steps=1,
+        error="Run interrupted by host",
+        messages=(
+            ChatMessage(role=MessageRole.SYSTEM, content="system"),
+            ChatMessage(role=MessageRole.USER, content=task),
+        ),
+    )
+
+
+def test_workbench_shutdown_passes_cooperative_cancellation_to_repository_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    started = Event()
+    received_tokens: list[CancellationToken] = []
+
+    def fake_execute(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink,
+        approver: object,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink, approver
+        received_tokens.append(cancellation_token)
+        started.set()
+        assert cancellation_token.wait(timeout=2)
+        return _interrupted_result(spec.run_id, spec.task)
+
+    monkeypatch.setattr("coding_agent.web.workbench.execute_repository_run", fake_execute)
+    workbench = _workbench(tmp_path)
+    workbench.register_project(root=workspace)
+
+    assert workbench.start("cooperatively stop this run")["status"] == "running"
+    assert started.wait(timeout=2)
+    assert workbench.shutdown(timeout=0.01) is True
+
+    assert len(received_tokens) == 1
+    assert received_tokens[0].is_cancellation_requested is True
+    state = workbench.state()
+    assert state["status"] == "failed"
+    assert state["error"] == "任务已由用户中断。"
 
 
 def test_native_folder_picker_is_token_protected_and_distinguishes_cancel(
@@ -248,8 +300,9 @@ def test_native_folder_picker_is_not_opened_during_an_active_run(
         *,
         event_sink: EventSink,
         approver: object,
+        cancellation_token: CancellationToken,
     ) -> AgentResult:
-        del event_sink, approver
+        del event_sink, approver, cancellation_token
         run_started.set()
         assert release_run.wait(timeout=2)
         return _completed_result(spec.run_id, spec.task)
@@ -616,8 +669,9 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         *,
         event_sink: EventSink,
         approver: object,
+        cancellation_token: CancellationToken,
     ) -> AgentResult:
-        del approver
+        del approver, cancellation_token
         captured.append(spec)
         trace = TraceStore(spec.paths.traces)
 
@@ -876,8 +930,9 @@ def test_long_task_whose_title_cut_lands_on_space_starts_normally(
         *,
         event_sink: EventSink,
         approver: object,
+        cancellation_token: CancellationToken,
     ) -> AgentResult:
-        del event_sink, approver
+        del event_sink, approver, cancellation_token
         received_tasks.append(spec.task)
         return _completed_result(spec.run_id, spec.task)
 

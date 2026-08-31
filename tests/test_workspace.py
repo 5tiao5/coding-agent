@@ -37,6 +37,27 @@ def workspace_root(tmp_path: Path) -> Path:
     return root
 
 
+def test_protected_mutation_paths_remain_readable_but_reject_exact_and_descendant_writes(
+    workspace_root: Path,
+) -> None:
+    _write(workspace_root / "tests" / "test_public.py", "def test_public(): pass\n")
+    _write(workspace_root / "pyproject.toml", "[tool.pytest.ini_options]\n")
+    workspace = Workspace(
+        workspace_root,
+        protected_mutation_paths=("tests/", "pyproject.toml"),
+    )
+
+    public_test = workspace.resolve("tests/test_public.py", expected="file")
+    assert workspace.read_bytes(public_test, max_bytes=1_000).startswith(b"def test_public")
+    with pytest.raises(WorkspaceError, match="trusted verification paths") as descendant:
+        workspace.snapshot_for_write("tests/test_public.py", max_bytes=1_000)
+    with pytest.raises(WorkspaceError, match="trusted verification paths") as exact:
+        workspace.snapshot_for_write("pyproject.toml", max_bytes=1_000)
+
+    assert descendant.value.code == "protected_path"
+    assert exact.value.code == "protected_path"
+
+
 @pytest.mark.parametrize(
     "unsafe_path",
     [

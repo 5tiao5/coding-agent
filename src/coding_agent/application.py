@@ -14,13 +14,18 @@ from typing import Protocol
 
 from coding_agent.agent import AgentRunner
 from coding_agent.approval import CommandApprover
+from coding_agent.cancellation import CancellationToken
 from coding_agent.command import CommandPermissionMode
 from coding_agent.events import BestEffortEventSink, CompositeEventSink, EventSink
 from coding_agent.model import ModelAdapter
 from coding_agent.models import AgentResult
 from coding_agent.openai_model import ReasoningEffort, create_openai_responses_model
-from coding_agent.runtime import build_runtime, system_prompt_for
-from coding_agent.session import LoadedSession, SessionStore
+from coding_agent.runtime import (
+    build_runtime,
+    policy_fingerprint_from_prompt,
+    system_prompt_for,
+)
+from coding_agent.session import LoadedSession, SessionError, SessionStore
 from coding_agent.state import StatePaths
 from coding_agent.trace import JsonlEventSink
 
@@ -62,6 +67,7 @@ def execute_repository_run(
     session_store: SessionStore | None = None,
     loaded: LoadedSession | None = None,
     model_factory: ModelFactory | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> AgentResult:
     """Execute or resume one run while preserving trace-first event ordering."""
 
@@ -71,6 +77,23 @@ def execute_repository_run(
         approver=approver,
     )
     store = session_store or SessionStore(spec.paths.sessions, workspace_root=spec.root)
+    system_prompt = system_prompt_for(
+        runtime.verification_commands,
+        policy_fingerprint=runtime.policy_fingerprint,
+        target_runtime_eligible=(
+            None
+            if runtime.verification_profile is None
+            else runtime.verification_profile.target_runtime.eligible_for_task_validation
+        ),
+    )
+    if loaded is not None:
+        _require_resume_policy(
+            loaded,
+            run_id=spec.run_id,
+            policy_fingerprint=runtime.policy_fingerprint,
+            configured=runtime.project_policy.configured,
+        )
+
     factory = model_factory or create_openai_responses_model
     model = factory(
         model=spec.model_name,
@@ -95,13 +118,45 @@ def execute_repository_run(
         run_memory=runtime.run_memory,
         verification_profile=runtime.verification_profile,
         completion_contract=runtime.completion_contract,
+        cancellation_token=cancellation_token,
     )
     if loaded is None:
         return runner.run(
             spec.task,
-            system_prompt=system_prompt_for(runtime.verification_commands),
+            system_prompt=system_prompt,
             run_id=spec.run_id,
         )
-    if loaded.checkpoint.run_id != spec.run_id:
-        raise ValueError("loaded checkpoint does not match the leased run ID")
     return runner.resume(loaded)
+
+
+def _require_resume_policy(
+    loaded: LoadedSession,
+    *,
+    run_id: str,
+    policy_fingerprint: str,
+    configured: bool,
+) -> None:
+    if loaded.checkpoint.run_id != run_id:
+        raise ValueError("loaded checkpoint does not match the leased run ID")
+    try:
+        checkpoint_policy_fingerprint = policy_fingerprint_from_prompt(
+            loaded.checkpoint.system_prompt
+        )
+    except ValueError as exc:
+        raise SessionError(
+            "checkpoint_policy_mismatch",
+            "checkpoint verification policy identity is invalid",
+        ) from exc
+    if checkpoint_policy_fingerprint is None and configured:
+        raise SessionError(
+            "checkpoint_policy_mismatch",
+            "checkpoint predates the configured project verification policy",
+        )
+    if (
+        checkpoint_policy_fingerprint is not None
+        and checkpoint_policy_fingerprint != policy_fingerprint
+    ):
+        raise SessionError(
+            "checkpoint_policy_mismatch",
+            "checkpoint verification policy does not match the current project",
+        )

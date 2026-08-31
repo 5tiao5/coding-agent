@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, Timer, current_thread
+from threading import Barrier, Event, Thread, Timer, current_thread
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.errors import CodedError
 from coding_agent.events import EventKind, EventSink, RunEvent
 from coding_agent.models import (
@@ -19,7 +20,11 @@ from coding_agent.models import (
     StopReason,
 )
 from coding_agent.web.app import DEFAULT_SHUTDOWN_DRAIN_SECONDS, create_app
-from coding_agent.web.service import WebRunService, WebServiceClosedError
+from coding_agent.web.service import (
+    MAX_CANCELLATION_GRACE_SECONDS,
+    WebRunService,
+    WebServiceClosedError,
+)
 
 
 def _test_client(app: FastAPI) -> TestClient:
@@ -723,6 +728,210 @@ def test_shutdown_timeout_closes_admission_and_leaves_a_daemon_fallback() -> Non
     release.set()
     assert service.wait(timeout=2)
     assert service.state()["status"] == "completed"
+
+
+def test_legacy_runner_is_only_drained_and_never_assumed_cancellable() -> None:
+    started = Event()
+    release = Event()
+
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        del event_sink
+        started.set()
+        assert release.wait(timeout=2)
+        return _completed_result(run_id, task)
+
+    service = WebRunService(runner)
+    service.start("legacy drain")
+    assert started.wait(timeout=2)
+
+    assert service.shutdown(timeout=0.01) is False
+    assert service.state()["status"] == "running"
+
+    release.set()
+    assert service.wait(timeout=2)
+    assert service.state()["status"] == "completed"
+
+
+@pytest.mark.parametrize("grace", [-0.01, float("nan"), float("inf"), 1.01])
+def test_cancellation_cleanup_grace_is_short_and_bounded(grace: float) -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        del event_sink
+        return _completed_result(run_id, task)
+
+    with pytest.raises(ValueError, match="must be between"):
+        WebRunService(runner, cancellation_grace_seconds=grace)
+    assert MAX_CANCELLATION_GRACE_SECONDS == 1.0
+
+
+def test_zero_timeout_probe_does_not_cancel_an_opted_in_runner() -> None:
+    source = CancellationSource()
+    started = Event()
+    release = Event()
+    received_tokens: list[CancellationToken] = []
+
+    def runner(
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink
+        received_tokens.append(cancellation_token)
+        started.set()
+        assert release.wait(timeout=2)
+        return _completed_result(run_id, task)
+
+    service = WebRunService(runner, cancellation_source=source)
+    service.start("non-blocking probe")
+    assert started.wait(timeout=2)
+
+    assert service.shutdown(timeout=0) is False
+    assert received_tokens == [source.token]
+    assert source.token.is_cancellation_requested is False
+
+    release.set()
+    assert service.wait(timeout=2)
+
+
+def test_cancellable_runner_receives_token_and_exits_during_shutdown_cleanup() -> None:
+    source = CancellationSource()
+    started = Event()
+    observed_cancellation = Event()
+
+    def runner(
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink
+        assert cancellation_token is source.token
+        started.set()
+        assert cancellation_token.wait(timeout=2)
+        observed_cancellation.set()
+        return _completed_result(run_id, task, final_text="Stopped cooperatively")
+
+    service = WebRunService(
+        runner,
+        cancellation_source=source,
+        cancellation_grace_seconds=0.5,
+    )
+    service.start("cooperative shutdown")
+    assert started.wait(timeout=2)
+
+    assert service.shutdown(timeout=0.01) is True
+    assert observed_cancellation.is_set()
+    assert source.token.is_cancellation_requested is True
+    assert service.state()["status"] == "completed"
+    assert service.state()["final_text"] == "Stopped cooperatively"
+    with pytest.raises(WebServiceClosedError, match="正在关闭"):
+        service.start("must remain closed")
+
+
+def test_repeated_shutdown_requests_cooperative_cancellation_only_once() -> None:
+    class CountingCancellationSource(CancellationSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests = 0
+
+        def request_cancellation(self) -> bool:
+            requested = super().request_cancellation()
+            if requested:
+                self.requests += 1
+            return requested
+
+    source = CountingCancellationSource()
+    started = Event()
+    release = Event()
+
+    def runner(
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink
+        started.set()
+        assert cancellation_token.wait(timeout=2)
+        assert release.wait(timeout=2)
+        return _completed_result(run_id, task)
+
+    service = WebRunService(
+        runner,
+        cancellation_source=source,
+        cancellation_grace_seconds=0,
+    )
+    service.start("repeat shutdown")
+    assert started.wait(timeout=2)
+
+    assert service.shutdown(timeout=0.01) is False
+    assert service.shutdown(timeout=0.01) is False
+    assert source.requests == 1
+
+    release.set()
+    assert service.wait(timeout=2)
+    assert service.shutdown(timeout=0) is True
+    assert source.requests == 1
+
+
+def test_start_shutdown_race_has_no_orphan_run_or_reopened_admission() -> None:
+    source = CancellationSource()
+    race = Barrier(2)
+    runner_started = Event()
+    start_states: list[str] = []
+    start_errors: list[type[BaseException]] = []
+    shutdown_results: list[bool] = []
+
+    def runner(
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink
+        runner_started.set()
+        assert cancellation_token.wait(timeout=2)
+        return _completed_result(run_id, task)
+
+    service = WebRunService(
+        runner,
+        cancellation_source=source,
+        cancellation_grace_seconds=0.5,
+    )
+
+    def start_during_race() -> None:
+        race.wait()
+        try:
+            start_states.append(service.start("race")["status"])
+        except BaseException as exc:
+            start_errors.append(type(exc))
+
+    def shutdown_during_race() -> None:
+        race.wait()
+        shutdown_results.append(service.shutdown(timeout=0.01))
+
+    start_thread = Thread(target=start_during_race)
+    shutdown_thread = Thread(target=shutdown_during_race)
+    start_thread.start()
+    shutdown_thread.start()
+    start_thread.join(timeout=2)
+    shutdown_thread.join(timeout=2)
+
+    assert not start_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert shutdown_results == [True]
+    if start_states:
+        assert start_states == ["running"]
+        assert start_errors == []
+        assert runner_started.is_set()
+        assert source.token.is_cancellation_requested is True
+        assert service.state()["status"] == "completed"
+    else:
+        assert start_errors == [WebServiceClosedError]
+        assert runner_started.is_set() is False
+        assert service.state()["status"] == "idle"
+    with pytest.raises(WebServiceClosedError, match="正在关闭"):
+        service.start("cannot reopen")
 
 
 def test_app_lifespan_uses_a_finite_shutdown_drain(

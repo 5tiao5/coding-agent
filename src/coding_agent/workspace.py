@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+from collections.abc import Sequence
 from contextlib import suppress
 from hashlib import sha256
 from itertools import islice
@@ -45,7 +46,12 @@ _MAX_RAW_DIRECTORY_ENTRIES = 20_000
 class Workspace:
     """Resolve and enumerate paths without allowing access outside one root."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        protected_mutation_paths: Sequence[str] = (),
+    ) -> None:
         try:
             resolved_root = Path(root).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -56,7 +62,11 @@ class Workspace:
             raise WorkspaceError("invalid_workspace", "workspace root is inside excluded metadata")
 
         self._root = resolved_root
-        self._policy = WorkspacePolicy(resolved_root, self._read_approved_file)
+        self._policy = WorkspacePolicy(
+            resolved_root,
+            self._read_approved_file,
+            protected_mutation_paths=protected_mutation_paths,
+        )
         self._policy.initialize()
 
     @property

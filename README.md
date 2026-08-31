@@ -12,8 +12,11 @@ The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bo
 
 ## Quick start
 
+Prerequisites: Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). Install exactly the
+locked development environment before running the checks:
+
 ```powershell
-uv sync --all-groups
+uv sync --locked --all-groups
 uv run coding-agent demo
 uv run coding-agent web --demo
 uv run coding-agent evaluate --help
@@ -70,6 +73,48 @@ uv run coding-agent web --model <model> --mode safe
 # Optional shortcut: register and select this directory immediately.
 uv run coding-agent web --root . --model <model> --mode safe
 ```
+
+### Trusted project verification
+
+A repository without `.coding-agent/project.toml` can still run the default pytest check, but that
+check is deliberately reported as `checks_only`: the host Python is not assumed to be the project's
+real runtime, so CLI completion exits `3` instead of showing `VERIFIED`. To opt into task validation,
+declare the exact project interpreter and typed checks. The Agent's workspace file tools cannot read or
+change this metadata. Ordinary commands are not an OS sandbox, so every configured verifier rechecks
+the policy and protected paths immediately before and after it runs.
+
+```toml
+schema_version = 1
+protected_paths = ["tests/", "conftest.py", "pyproject.toml"]
+
+[python]
+# Windows (forward slashes avoid TOML backslash escaping):
+executable = ".venv/Scripts/python.exe"
+# macOS/Linux: replace the line above with executable = ".venv/bin/python"
+
+[[verifiers]]
+label = "pytest"
+type = "pytest"
+cwd = "."
+scopes = ["tests"]
+required = true
+
+[completion]
+required_scopes = ["tests"]
+```
+
+Create the environment first (`uv sync` is sufficient for this repository) and make the configured
+path match the interpreter you actually intend to demonstrate; no interpreter is auto-discovered or
+silently upgraded to trusted status. A runnable package may add a second verifier with
+`type = "python-module"`, `module = "your_package"`, and a scope such as `runtime:entrypoint`.
+That form always means the fixed no-argument smoke command `python -B -m your_package`; arbitrary
+shell text, argv, or module arguments are not supported.
+
+For a quick manual check, run the same task once without the file and observe `checks_only`/exit `3`,
+then add the file and rerun `uv run coding-agent run ... --root .` or the Web workbench. A configured
+run reaches `VERIFIED` only after every required typed verifier passes and the configuration,
+interpreter hash, and protected paths remain unchanged. Resume also binds to this policy fingerprint;
+a changed policy requires a fresh run.
 
 On Windows, “打开项目” first opens the native folder chooser; manual absolute-path input remains as
 a fallback. “新建项目” can browse for its parent and then creates exactly one previously absent empty
@@ -175,13 +220,14 @@ For `run` and `resume`, exit codes distinguish control outcomes:
 - A real `run` command, interactive task entry, `safe`/`auto` selection, exact-argv approval panel, and environment-only credential flow.
 - A passive Rich dashboard with plan/diff previews, tool durations, verification evidence, and an explicit `VERIFIED`/`UNVERIFIED` final card.
 - Bounded per-run JSONL traces plus read-only `runs` and `inspect` commands.
-- Schema-v2 checkpoints bound to an opaque workspace identity, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
+- Schema-v3 checkpoints with conservative v2 migration, opaque workspace binding, bounded RunMemory, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
 - A deployment-safe pytest capability: if Python itself lives inside the repository, its exact executable hash is bound before it may issue verification evidence.
 
-The default live runtime registers only the exact current-Python
-`-I -B -m pytest -q -p no:cacheprovider` capability. The bytecode and cache-provider flags keep
-trusted verification observational: running it does not create Python or pytest cache files in the
-workspace. Other
+The unconfigured live runtime registers only the exact current-Python
+`-I -B -m pytest -q -p no:cacheprovider` check. The bytecode and cache-provider flags keep it
+observational: running it does not create Python or pytest cache files in the workspace. It can
+produce `checks_only`, but only the explicit project policy above makes its interpreter eligible for
+task validation. Other
 commands may run under the selected permission mode, but their output cannot manufacture
 verification evidence.
 
@@ -220,6 +266,9 @@ verification evidence.
   change outside the scenario allowlist, and a separate sibling regression oracle. JSON reports
   expose the bounded scope proof as `coding-agent.eval.v2` and count
   `verified_but_oracle_failed` false-green claims explicitly.
+- Every evaluation repository receives hidden host-authored trusted policy. All five require pytest;
+  the runtime-integration case additionally requires the typed module smoke check. The separate
+  sibling oracle remains the final independent judge and receives only allowlisted source files.
 - Case results distinguish `passed`, `failed`, and `error`; aggregate metrics include success rate,
   steps, duration, and tool failures.
 - On 2026-08-29, `deepseek-v4-flash` passed the original four categories individually and again in
@@ -233,14 +282,18 @@ verification evidence.
   function calls because safely continuing that turn requires encrypted provider state that this
   provider-neutral checkpoint deliberately does not persist. Use a Responses-compatible model that
   does not emit reasoning items during tool turns.
-- Resume restores the canonical transcript, not `PlanState`, the in-memory undo journal, approval decisions, or old verification evidence. Fresh verification is mandatory.
+- Resume restores the canonical transcript plus bounded RunMemory such as the structured plan,
+  change summaries, and failure facts. It does not restore the in-memory undo journal, approval
+  decisions, provider-private state, or fresh verification evidence; every resume must verify again.
 - Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
 - A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
 - The local Web view is not authenticated for hostile same-machine users. It binds to loopback,
   requires a per-process control token for mutations, and applies Host/Origin/header restrictions,
   but it is not intended for port forwarding or remote exposure.
-- Graceful Web shutdown gives an active run five seconds to drain. A longer run, forced process kill,
-  or machine failure can interrupt its final trace/checkpoint write; this is not crash-safe execution.
+- Graceful Web shutdown first gives an active run five seconds to drain, then requests cooperative
+  cancellation and waits briefly for a safe model/tool boundary. It never force-kills a blocking
+  model or command call; a forced process kill or machine failure can still interrupt final
+  trace/checkpoint persistence, so this is not crash-safe execution.
 - Final delivery still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
 
 ## Design boundary

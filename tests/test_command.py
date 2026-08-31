@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -136,6 +137,7 @@ def _execute(
     runner: RecordingRunner | LocalCommandRunner,
     permission_mode: CommandPermissionMode = CommandPermissionMode.SAFE,
     verification_commands: tuple[VerificationCommandSpec, ...] = (),
+    integrity_guard: Callable[[], bool] | None = None,
     approver: CommandApprover | None = None,
     max_output_chars: int = 16_000,
 ) -> ToolExecution:
@@ -147,6 +149,7 @@ def _execute(
             verification_commands=verification_commands,
         ),
         approver=approver,
+        verification_integrity_guard=integrity_guard,
         max_output_chars=max_output_chars,
     )
     return ToolRegistry([tool]).execute(
@@ -414,6 +417,174 @@ def test_generic_or_interpreted_commands_cannot_be_registered_as_verifiers(
 
     assert classification.command_class is CommandClass.GENERAL
     assert classification.verification_kind is None
+
+
+def test_typed_python_module_smoke_is_exact_and_cannot_generalize() -> None:
+    executable = str(Path(sys.executable).absolute())
+    typed = VerificationCommandSpec(
+        argv=(executable, "-B", "-m", "sample_app"),
+        cwd=".",
+        kind=VerificationKind.CHECK,
+        label="module-smoke",
+        python_module="sample_app",
+    )
+    generic = VerificationCommandSpec(
+        argv=typed.argv,
+        cwd=".",
+        kind=VerificationKind.CHECK,
+        label="generic-module",
+    )
+
+    typed_classification = CommandPolicy(
+        CommandPermissionMode.AUTO,
+        verification_commands=(typed,),
+    ).classify(typed.argv)
+    generic_classification = CommandPolicy(
+        CommandPermissionMode.AUTO,
+        verification_commands=(generic,),
+    ).classify(generic.argv)
+
+    assert typed_classification.command_class is CommandClass.VERIFIER
+    assert typed_classification.verification_kind is VerificationKind.CHECK
+    assert generic_classification.command_class is CommandClass.GENERAL
+    with pytest.raises(ValueError, match="exact typed smoke-test"):
+        VerificationCommandSpec(
+            argv=(*typed.argv, "--extra"),
+            cwd=".",
+            kind=VerificationKind.CHECK,
+            label="broadened-module",
+            python_module="sample_app",
+        )
+
+
+@pytest.mark.parametrize("executable_name", ["python3.11", "python3.12", "pypy3.10"])
+def test_versioned_python_executables_keep_trusted_semantics(
+    executable_name: str,
+) -> None:
+    host_executable = Path(sys.executable)
+    executable = str(host_executable.with_name(executable_name + host_executable.suffix).absolute())
+    pytest_spec = VerificationCommandSpec(
+        argv=(executable, "-m", "pytest", "-q"),
+        cwd=".",
+        kind=VerificationKind.TEST,
+        label="pytest",
+    )
+    module_spec = VerificationCommandSpec(
+        argv=(executable, "-B", "-m", "sample_app"),
+        cwd=".",
+        kind=VerificationKind.CHECK,
+        label="module-smoke",
+        python_module="sample_app",
+    )
+    policy = CommandPolicy(
+        CommandPermissionMode.AUTO,
+        verification_commands=(pytest_spec, module_spec),
+    )
+
+    pytest_classification = policy.classify(pytest_spec.argv)
+    module_classification = policy.classify(module_spec.argv)
+
+    assert pytest_classification.command_class is CommandClass.VERIFIER
+    assert pytest_classification.verification_kind is VerificationKind.TEST
+    assert module_classification.command_class is CommandClass.VERIFIER
+    assert module_classification.verification_kind is VerificationKind.CHECK
+
+
+def test_verification_spec_rejects_malformed_trust_boundaries() -> None:
+    executable = str(Path(sys.executable).absolute())
+
+    with pytest.raises(ValueError, match="argv cannot be empty"):
+        VerificationCommandSpec(
+            argv=(),
+            cwd=".",
+            kind=VerificationKind.TEST,
+            label="pytest",
+        )
+    with pytest.raises(ValueError, match="workspace-relative"):
+        VerificationCommandSpec(
+            argv=(executable, "-m", "pytest"),
+            cwd="../outside",
+            kind=VerificationKind.TEST,
+            label="pytest",
+        )
+    with pytest.raises(ValueError, match="1-120"):
+        VerificationCommandSpec(
+            argv=(executable, "-m", "pytest"),
+            cwd=".",
+            kind=VerificationKind.TEST,
+            label=" ",
+        )
+    with pytest.raises(ValueError, match="SHA-256"):
+        VerificationCommandSpec(
+            argv=(executable, "-m", "pytest"),
+            cwd=".",
+            kind=VerificationKind.TEST,
+            label="pytest",
+            workspace_executable_sha256="0" * 63,
+        )
+    with pytest.raises(ValueError, match="importable module"):
+        VerificationCommandSpec(
+            argv=(executable, "-B", "-m", "bad-module"),
+            cwd=".",
+            kind=VerificationKind.CHECK,
+            label="module-smoke",
+            python_module="bad-module",
+        )
+    with pytest.raises(ValueError, match="printable"):
+        VerificationCommandSpec(
+            argv=(executable, "-m", "pytest"),
+            cwd=".",
+            kind=VerificationKind.TEST,
+            label="pytest\n",
+        )
+
+
+def test_integrity_guard_rejects_verifier_before_process_start(repository: Path) -> None:
+    spec = _trusted_spec(["pytest", "-q"], VerificationKind.TEST, "pytest")
+    runner = RecordingRunner(_result())
+
+    execution = _execute(
+        repository,
+        {"argv": list(spec.argv), "cwd": "."},
+        runner=runner,
+        permission_mode=CommandPermissionMode.AUTO,
+        verification_commands=(spec,),
+        integrity_guard=lambda: False,
+    )
+
+    assert runner.requests == []
+    assert execution.ok is True
+    assert execution.control.verification is VerificationSignal.FAILED
+    assert execution.control.invalidates_verification is True
+    assert execution.metadata["integrity_phase"] == "before"
+    assert execution.output is not None
+    assert execution.output.startswith("Status: trusted verification rejected")
+
+
+def test_integrity_guard_rejects_large_success_after_process_without_hiding_reason(
+    repository: Path,
+) -> None:
+    spec = _trusted_spec(["pytest", "-q"], VerificationKind.TEST, "pytest")
+    runner = RecordingRunner(_result(output=b"x" * 4_000))
+    checks = iter((True, False))
+
+    execution = _execute(
+        repository,
+        {"argv": list(spec.argv), "cwd": "."},
+        runner=runner,
+        permission_mode=CommandPermissionMode.AUTO,
+        verification_commands=(spec,),
+        integrity_guard=lambda: next(checks),
+        max_output_chars=512,
+    )
+
+    assert len(runner.requests) == 1
+    assert execution.control.verification is VerificationSignal.FAILED
+    assert execution.metadata["integrity_phase"] == "after"
+    assert execution.output is not None
+    assert execution.output.startswith("Status: trusted verification rejected")
+    assert "project verification policy integrity changed" in execution.output
+    assert len(execution.output) <= 512
 
 
 def test_workspace_owned_executable_cannot_issue_verification(repository: Path) -> None:

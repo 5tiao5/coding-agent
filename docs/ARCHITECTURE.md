@@ -57,6 +57,7 @@ The important separation is semantic, not cosmetic:
 | `WebRunService` | one worker and whitelisted browser snapshots | expose raw events/messages or execute tools itself |
 | `WebWorkbench` | active project, global run admission, catalog navigation | become a second Agent loop or change roots mid-run |
 | `ProjectRegistry` / `RunCatalog` | bounded navigation metadata | authorize tools, verification, or transcript resume |
+| `ResolvedProjectPolicy` / integrity guard | typed verifier capabilities, target runtime identity, protected manifest | accept arbitrary commands or trust exit zero after policy drift |
 
 This prevents a pretty UI, stale trace, or loaded JSON file from becoming an accidental authority.
 
@@ -65,6 +66,8 @@ This prevents a pretty UI, stale trace, or loaded JSON file from becoming an acc
 - `ModelAdapter.complete()` isolates provider protocols from the loop.
 - `ToolDispatcher.specs()/execute()` isolates validation and tool implementation.
 - `CommandPolicy.classify()` separates permission/evidence decisions from process launch.
+- `load_project_policy()` compiles one strict repository declaration into exact verifier capabilities;
+  `check_integrity()` guards the inputs around each configured verifier.
 - `EventSink.emit()` separates runtime facts from storage and presentation.
 - `execute_repository_run()` owns shared repository-run composition for both CLI and Web hosts.
 - `evaluate_case()` owns fixture isolation and independent regression judgement while reusing
@@ -116,9 +119,10 @@ its previous physical identity's runs and rejects stale direct-history URLs rath
 them. A nonterminal trace from a previous process is reported as interrupted, not still running.
 
 `WebRunService` adds only a one-worker lifecycle and folds live events through `DashboardProjection`.
-The FastAPI lifespan first closes admission and gives the current run a finite best-effort drain
-window. The worker is daemonized as a final process-exit bound; normally completed runs still flush
-their trace and checkpoint, while a shutdown that outlasts the window may interrupt them.
+The FastAPI lifespan first closes admission and gives the current run a finite drain window. If the
+run remains active, a host token requests cooperative cancellation; the Agent observes it at safe
+model/tool boundaries and saves a resumable checkpoint. A blocking external call is not force-killed,
+and the daemon worker remains the final process-exit bound.
 The runtime-to-browser document is an explicit read-only whitelist: task label, phase, bounded
 counters and active-tool names, sanitized file-mutation summaries, current structured verifier
 evidence and revision, outcome, plan lines, recent timeline, and latest Diff. The terminal response
@@ -157,9 +161,9 @@ tool calls enters the Verification Gate. The terminal checkpoint event is emitte
 
 | Area | Main modules |
 |---|---|
-| orchestration | `agent.py`, `agent_protocol.py`, `budget.py`, `completion.py`, `run_memory.py`, `models.py`, `context.py`, `stopping.py`, `verification.py` |
+| orchestration | `agent.py`, `agent_protocol.py`, `cancellation.py`, `budget.py`, `completion.py`, `run_memory.py`, `models.py`, `context.py`, `stopping.py`, `verification.py` |
 | provider boundary | `model.py`, `openai_model.py` |
-| tools and policy | `tools/`, `workspace.py`, `mutation.py`, `command.py`, `approval.py` |
+| tools and policy | `tools/`, `workspace.py`, `mutation.py`, `command.py`, `command_verification.py`, `project_config.py`, `integrity.py`, `approval.py` |
 | application wiring | `application.py`, `runtime.py`, `cli.py`, `local_config.py`, `demo.py`, `web/runtime.py`, `web/workbench.py` |
 | evaluation | `evaluation.py`, `evaluation_scenarios.py`, `evaluation_cli.py` |
 | persistence | `session.py`, `trace.py`, `state.py`, `projects.py`, `run_catalog.py`, `lease.py`, `run_id.py` |

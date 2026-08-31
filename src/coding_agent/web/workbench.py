@@ -15,6 +15,7 @@ from threading import RLock
 from typing import TypedDict
 
 from coding_agent.application import RepositoryRunSpec, execute_repository_run
+from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.command import CommandPermissionMode
 from coding_agent.dashboard import DashboardProjection
 from coding_agent.events import EventKind, EventSink, RunEvent
@@ -295,7 +296,10 @@ class WebWorkbench:
         return service.shutdown(timeout)
 
     def _new_service(self) -> WebRunService:
-        return WebRunService(self._run_repository)
+        return WebRunService(
+            self._run_repository,
+            cancellation_source=CancellationSource(),
+        )
 
     def _activate_locked(self, record: ProjectRecord) -> None:
         if self._active is not None and self._active.project_id == record.project_id:
@@ -321,6 +325,7 @@ class WebWorkbench:
         run_id: str,
         task: str,
         event_sink: EventSink,
+        cancellation_token: CancellationToken,
     ) -> AgentResult:
         with self._lock:
             if self._active is None:  # Selection cannot change while status is running.
@@ -350,7 +355,12 @@ class WebWorkbench:
             )
             with RunLease(config.paths.root / "leases", run_id):
                 # Safe Web mode remains fail-closed until an approval broker is added.
-                return execute_repository_run(spec, event_sink=event_sink, approver=None)
+                return execute_repository_run(
+                    spec,
+                    event_sink=event_sink,
+                    approver=None,
+                    cancellation_token=cancellation_token,
+                )
         except BaseException:
             self._record_host_failure(run_id, event_sink)
             raise

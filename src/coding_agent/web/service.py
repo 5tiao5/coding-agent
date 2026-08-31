@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from math import isfinite
 from threading import RLock, Thread
-from typing import Literal, Protocol, TypedDict
+from typing import Literal, Protocol, TypedDict, cast, overload
 from uuid import uuid4
 
+from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.dashboard import DashboardProjection, DashboardSnapshot, TimelineEntry
 from coding_agent.errors import CodedError
 from coding_agent.events import EventSink, RunEvent
@@ -14,6 +16,9 @@ from coding_agent.models import AgentResult, AgentState
 from coding_agent.public_errors import public_coded_error, public_result_error
 
 WebRunStatus = Literal["idle", "running", "completed", "completed_unverified", "failed"]
+DEFAULT_CANCELLATION_GRACE_SECONDS = 0.25
+MAX_CANCELLATION_GRACE_SECONDS = 1.0
+
 
 class TimelinePayload(TypedDict):
     """Whitelisted presentation fields for one projected timeline entry."""
@@ -96,6 +101,18 @@ class WebRunner(Protocol):
     def __call__(self, run_id: str, task: str, event_sink: EventSink) -> AgentResult: ...
 
 
+class CancellableWebRunner(Protocol):
+    """Opt-in runner that cooperatively observes a host-owned cancellation token."""
+
+    def __call__(
+        self,
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult: ...
+
+
 class RunAlreadyActiveError(RuntimeError):
     """A second run was requested while the sole worker was occupied."""
 
@@ -127,16 +144,52 @@ class WebRunService:
     values.
     """
 
+    @overload
     def __init__(
         self,
         runner: WebRunner | Callable[[str, str, EventSink], AgentResult],
         *,
         max_timeline: int = 10,
+        cancellation_source: None = None,
+        cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        runner: CancellableWebRunner
+        | Callable[[str, str, EventSink, CancellationToken], AgentResult],
+        *,
+        max_timeline: int = 10,
+        cancellation_source: CancellationSource,
+        cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        runner: WebRunner
+        | CancellableWebRunner
+        | Callable[[str, str, EventSink], AgentResult]
+        | Callable[[str, str, EventSink, CancellationToken], AgentResult],
+        *,
+        max_timeline: int = 10,
+        cancellation_source: CancellationSource | None = None,
+        cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
     ) -> None:
         if max_timeline < 1:
             raise ValueError("max_timeline must be at least 1")
+        if (
+            not isfinite(cancellation_grace_seconds)
+            or cancellation_grace_seconds < 0
+            or cancellation_grace_seconds > MAX_CANCELLATION_GRACE_SECONDS
+        ):
+            raise ValueError(
+                f"cancellation_grace_seconds must be between 0 and {MAX_CANCELLATION_GRACE_SECONDS}"
+            )
         self._runner = runner
         self._max_timeline = max_timeline
+        self._cancellation_source = cancellation_source
+        self._cancellation_grace_seconds = cancellation_grace_seconds
         self._lock = RLock()
         self._status: WebRunStatus = "idle"
         self._run_id: str | None = None
@@ -146,6 +199,7 @@ class WebRunService:
         self._projection: DashboardProjection | None = None
         self._worker: Thread | None = None
         self._accepting_runs = True
+        self._cancellation_requested = False
 
     def start(self, task: str) -> WebRunStatePayload:
         """Start one run immediately and reject overlap with the active worker."""
@@ -168,6 +222,7 @@ class WebRunService:
                 task_label=normalized_task,
                 max_timeline=self._max_timeline,
             )
+            self._cancellation_requested = False
             worker = Thread(
                 target=self._run,
                 args=(run_id, normalized_task),
@@ -199,14 +254,55 @@ class WebRunService:
         return not worker.is_alive()
 
     def shutdown(self, timeout: float | None = None) -> bool:
-        """Stop accepting work and best-effort drain the active run within ``timeout``."""
+        """Close admission, drain, then cooperatively cancel an opted-in runner.
+
+        A zero-second timeout is used by hosts as a non-blocking busy probe. It closes
+        admission as before, but deliberately does not emit a cancellation request.
+        Positive drain timeouts may request cancellation only when a source was supplied;
+        the following cleanup wait is always short and bounded.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout cannot be negative")
         with self._lock:
             self._accepting_runs = False
-        return self.wait(timeout)
+            worker = self._worker
+        if worker is None:
+            return True
+
+        worker.join(timeout)
+        if not worker.is_alive():
+            return True
+        if timeout is None or timeout == 0:
+            return False
+
+        source: CancellationSource | None
+        request_now = False
+        with self._lock:
+            source = self._cancellation_source
+            if source is not None and not self._cancellation_requested:
+                self._cancellation_requested = True
+                request_now = True
+        if source is None:
+            return False
+        if request_now:
+            source.request_cancellation()
+        worker.join(self._cancellation_grace_seconds)
+        return not worker.is_alive()
 
     def _run(self, run_id: str, task: str) -> None:
         try:
-            result = self._runner(run_id, task, _ProjectionSink(self, run_id))
+            sink = _ProjectionSink(self, run_id)
+            if self._cancellation_source is None:
+                runner = cast(WebRunner, self._runner)
+                result = runner(run_id, task, sink)
+            else:
+                cancellable_runner = cast(CancellableWebRunner, self._runner)
+                result = cancellable_runner(
+                    run_id,
+                    task,
+                    sink,
+                    self._cancellation_source.token,
+                )
             if result.run_id != run_id:
                 raise ValueError("runner returned a result for a different run")
         except BaseException as exc:  # Worker failures must always leave a terminal Web state.
@@ -222,9 +318,7 @@ class WebRunService:
                 return
             self._status = _result_status(result)
             self._final_text = result.final_text
-            self._error = (
-                public_result_error(result) if result.state is AgentState.FAILED else None
-            )
+            self._error = public_result_error(result) if result.state is AgentState.FAILED else None
 
     def _apply_event(self, expected_run_id: str, event: RunEvent) -> None:
         if event.run_id != expected_run_id:

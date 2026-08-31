@@ -9,6 +9,11 @@ from uuid import uuid4
 from coding_agent import agent_protocol as protocol
 from coding_agent.agent_protocol import DEFAULT_SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
 from coding_agent.budget import BudgetPolicy, BudgetPurpose, BudgetUsage
+from coding_agent.cancellation import (
+    CancellationToken,
+    cancellation_requested,
+    wait_for_retry_or_cancellation,
+)
 from coding_agent.completion import (
     CompletionContract,
     VerificationProfile,
@@ -26,6 +31,7 @@ from coding_agent.models import (
     ChatMessage,
     MessageRole,
     StopReason,
+    ToolCall,
     ToolExecution,
 )
 from coding_agent.run_id import require_run_id
@@ -62,6 +68,7 @@ class AgentRunner:
         run_memory: RunMemory | None = None,
         verification_profile: VerificationProfile | None = None,
         completion_contract: CompletionContract | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> None:
         if (verification_profile is None) != (completion_contract is None):
             raise ValueError(
@@ -93,6 +100,7 @@ class AgentRunner:
         self._memory = run_memory or RunMemory(max_chars=selected_budget.memory_chars)
         self._verification_profile = verification_profile
         self._completion_contract = completion_contract
+        self._cancellation_token = cancellation_token
 
     def run(
         self,
@@ -247,6 +255,39 @@ class AgentRunner:
                     "limits": limits,
                 },
             )
+
+        def interrupt_at_ready_boundary(
+            error: str,
+            step: int,
+            *,
+            pending_calls: Sequence[ToolCall] = (),
+            tool_error_message: str = "the host requested cooperative cancellation",
+        ) -> AgentResult:
+            if pending_calls:
+                protocol.append_cancelled_tool_results(
+                    messages,
+                    pending_calls,
+                    error_code="tool_call_cancelled",
+                    error_message=tool_error_message,
+                )
+            self._save_checkpoint(
+                run_id,
+                task,
+                system_prompt,
+                messages,
+                SessionBoundary.READY_FOR_MODEL,
+                step,
+                budget_usage=budget_state.usage,
+            )
+            return self._failure(
+                run_id,
+                state,
+                StopReason.USER_INTERRUPTED,
+                step,
+                messages,
+                error,
+            )
+
         verification = VerificationLedger()
         repetition = RepeatedToolCallGuard(max_identical=self._max_repeated_tool_results)
         seen_tool_call_ids = {
@@ -333,6 +374,11 @@ class AgentRunner:
                 )
             max_attempts = self._max_model_retries + 1
             for attempt in range(1, max_attempts + 1):
+                if cancellation_requested(self._cancellation_token):
+                    return interrupt_at_ready_boundary(
+                        "Run interrupted by host before a model request",
+                        step,
+                    )
                 self._emit(
                     run_id,
                     EventKind.MODEL_REQUESTED,
@@ -343,13 +389,9 @@ class AgentRunner:
                 try:
                     response = self._model.complete(request_view, tool_specs)
                 except KeyboardInterrupt:
-                    return self._failure(
-                        run_id,
-                        state,
-                        StopReason.USER_INTERRUPTED,
-                        step,
-                        messages,
+                    return interrupt_at_ready_boundary(
                         "Run interrupted by user",
+                        step,
                     )
                 except RetryableModelError:
                     if attempt == max_attempts:
@@ -380,15 +422,20 @@ class AgentRunner:
                         },
                     )
                     try:
-                        self._model_retry_sleeper(delay_seconds)
+                        cancelled_during_delay = wait_for_retry_or_cancellation(
+                            self._cancellation_token,
+                            delay_seconds,
+                            self._model_retry_sleeper,
+                        )
                     except KeyboardInterrupt:
-                        return self._failure(
-                            run_id,
-                            state,
-                            StopReason.USER_INTERRUPTED,
-                            step,
-                            messages,
+                        return interrupt_at_ready_boundary(
                             "Run interrupted by user during model retry delay",
+                            step,
+                        )
+                    if cancelled_during_delay:
+                        return interrupt_at_ready_boundary(
+                            "Run interrupted by host during model retry delay",
+                            step,
                         )
                 except RecoverableModelResponseError:
                     if attempt == max_attempts:
@@ -446,6 +493,15 @@ class AgentRunner:
                 else:
                     break
             assert response is not None
+
+            # A model call is one atomic external operation. If shutdown arrived while
+            # it was blocking, discard the not-yet-committed response and resume later
+            # from the preceding stable transcript instead of accepting a late final.
+            if cancellation_requested(self._cancellation_token):
+                return interrupt_at_ready_boundary(
+                    "Run interrupted by host after the model request completed",
+                    step,
+                )
 
             self._emit(
                 run_id,
@@ -649,6 +705,12 @@ class AgentRunner:
                 )
                 state = self._transition(run_id, state, AgentState.OBSERVING, step)
                 for call_index, call in enumerate(response.tool_calls):
+                    if cancellation_requested(self._cancellation_token):
+                        return interrupt_at_ready_boundary(
+                            "Run interrupted by host between tool calls",
+                            step,
+                            pending_calls=response.tool_calls[call_index:],
+                        )
                     self._emit(
                         run_id,
                         EventKind.TOOL_STARTED,
@@ -659,28 +721,11 @@ class AgentRunner:
                     try:
                         raw_execution = self._tools.execute(call)
                     except KeyboardInterrupt:
-                        protocol.append_cancelled_tool_results(
-                            messages,
-                            response.tool_calls[call_index:],
-                            error_code="tool_call_cancelled",
-                            error_message="run was interrupted during tool execution",
-                        )
-                        self._save_stopped_batch_checkpoint(
-                            run_id,
-                            task,
-                            system_prompt,
-                            messages,
-                            step,
-                            budget_usage=budget_state.usage,
-                            reason=StopReason.USER_INTERRUPTED,
-                        )
-                        return self._failure(
-                            run_id,
-                            state,
-                            StopReason.USER_INTERRUPTED,
-                            step,
-                            messages,
+                        return interrupt_at_ready_boundary(
                             "Run interrupted by user during tool execution",
+                            step,
+                            pending_calls=response.tool_calls[call_index:],
+                            tool_error_message="run was interrupted during tool execution",
                         )
                     execution = observation_turn.fit(
                         raw_execution,
@@ -716,14 +761,15 @@ class AgentRunner:
                             error_code="tool_call_cancelled",
                             error_message="an earlier tool forced a terminal safety stop",
                         )
-                        self._save_stopped_batch_checkpoint(
+                        self._save_checkpoint(
                             run_id,
                             task,
                             system_prompt,
                             messages,
+                            SessionBoundary.TERMINAL,
                             step,
                             budget_usage=budget_state.usage,
-                            reason=StopReason.COMMAND_CONTROL_FAILED,
+                            stop_reason=StopReason.COMMAND_CONTROL_FAILED,
                         )
                         return self._failure(
                             run_id,
@@ -741,14 +787,15 @@ class AgentRunner:
                             error_code="tool_call_cancelled",
                             error_message="the repeated-call stop policy cancelled this call",
                         )
-                        self._save_stopped_batch_checkpoint(
+                        self._save_checkpoint(
                             run_id,
                             task,
                             system_prompt,
                             messages,
+                            SessionBoundary.TERMINAL,
                             step,
                             budget_usage=budget_state.usage,
-                            reason=StopReason.REPEATED_TOOL_CALL,
+                            stop_reason=StopReason.REPEATED_TOOL_CALL,
                         )
                         return self._failure(
                             run_id,
@@ -825,29 +872,6 @@ class AgentRunner:
             policy.max_model_turns,
             messages,
             f"Maximum step count reached: {policy.max_model_turns}",
-        )
-
-    def _save_stopped_batch_checkpoint(
-        self,
-        run_id: str,
-        task: str,
-        system_prompt: str,
-        messages: Sequence[ChatMessage],
-        step: int,
-        *,
-        budget_usage: BudgetUsage,
-        reason: StopReason,
-    ) -> None:
-        resumable = reason is StopReason.USER_INTERRUPTED
-        self._save_checkpoint(
-            run_id,
-            task,
-            system_prompt,
-            messages,
-            SessionBoundary.READY_FOR_MODEL if resumable else SessionBoundary.TERMINAL,
-            step,
-            budget_usage=budget_usage,
-            stop_reason=None if resumable else reason,
         )
 
     def _save_checkpoint(

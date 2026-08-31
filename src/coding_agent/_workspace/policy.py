@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 from unicodedata import category
@@ -52,10 +53,19 @@ class ApprovedFileReader(Protocol):
 class WorkspacePolicy:
     """Own path normalization and all repository visibility rules for one root."""
 
-    def __init__(self, root: Path, read_approved_file: ApprovedFileReader) -> None:
+    def __init__(
+        self,
+        root: Path,
+        read_approved_file: ApprovedFileReader,
+        *,
+        protected_mutation_paths: Sequence[str] = (),
+    ) -> None:
         self._root = root
         self._read_approved_file = read_approved_file
         self._ignore_cache: dict[str, tuple[IgnoreSignature, GitIgnoreSpec]] = {}
+        self._protected_mutation_paths = self._normalize_protected_mutations(
+            protected_mutation_paths
+        )
 
     def initialize(self) -> None:
         """Validate and cache the root ignore policy after the owner is fully constructed."""
@@ -150,6 +160,11 @@ class WorkspacePolicy:
         is_directory: bool = False,
     ) -> None:
         """Apply mutation-only policy without resolving a potentially missing leaf."""
+        if self._is_protected_mutation(relative):
+            raise WorkspaceError(
+                "protected_path",
+                f"trusted verification paths cannot be changed: {relative.as_posix()}",
+            )
         if relative.name.casefold() == ".gitignore":
             raise WorkspaceError("path_ignored", "repository ignore-policy files cannot be changed")
         if self._is_hard_excluded(relative):
@@ -189,6 +204,27 @@ class WorkspacePolicy:
 
     def resolved_relative(self, resolved: Path) -> PurePosixPath:
         return PurePosixPath(resolved.relative_to(self._root).as_posix())
+
+    def _normalize_protected_mutations(
+        self,
+        values: Sequence[str],
+    ) -> tuple[tuple[tuple[str, ...], bool], ...]:
+        normalized: list[tuple[tuple[str, ...], bool]] = []
+        for value in values:
+            is_directory = value.endswith("/")
+            raw = value[:-1] if is_directory else value
+            relative = self.normalize_user_path(raw)
+            if relative == PurePosixPath(".") or relative.as_posix() != raw:
+                raise ValueError("protected mutation paths must be canonical relative paths")
+            normalized.append((tuple(part.casefold() for part in relative.parts), is_directory))
+        return tuple(normalized)
+
+    def _is_protected_mutation(self, relative: PurePosixPath) -> bool:
+        candidate = tuple(part.casefold() for part in relative.parts)
+        return any(
+            candidate == protected or (is_directory and candidate[: len(protected)] == protected)
+            for protected, is_directory in self._protected_mutation_paths
+        )
 
     @staticmethod
     def join_relative(parent: str, child: str) -> str:

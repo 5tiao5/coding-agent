@@ -67,6 +67,17 @@ instead of misreporting an already-applied change as a normal failure.
   executable inside the workspace is accepted only when the host registers its exact SHA-256 and
   the digest still matches immediately before classification. Output text is never parsed to decide
   success.
+- Project trust is opt-in through exactly `<root>/.coding-agent/project.toml`; parent directories are
+  never searched. The strict schema exposes only pytest and a fixed no-argument Python-module smoke
+  form, not shell text or arbitrary argv. Without an explicitly declared interpreter, passing checks
+  remain `checks_only` and cannot validate the target runtime.
+- At run start the host binds the policy bytes, selected interpreter hash, and a bounded manifest of
+  protected paths. Model-facing mutation tools reject protected files while reads remain available;
+  commands are still treated as potentially hostile, so every configured verifier rechecks integrity
+  both before and after its process. Drift rejects the evidence even if the process exits zero.
+- A content-free policy fingerprint is embedded in the host system prompt checkpoint. Configured
+  projects reject missing, malformed, duplicate, or changed anchors on resume; old verification
+  evidence is never persisted or restored.
 - The runner owns the command lifetime and attempts to terminate descendants on every exit path.
   A root process that exits while descendants remain after a short launcher-settle window is
   incomplete, even when its exit code is zero. If membership, containment, or cleanup cannot be
@@ -116,9 +127,12 @@ instead of misreporting an already-applied change as a normal failure.
 - Web `safe` mode is deliberately fail-closed: there is no browser approval broker, so an ordinary
   command that requires approval is denied. Exact host-registered verification commands retain
   their capability-based path. `auto` must be selected explicitly and still is not a sandbox.
-- Graceful shutdown closes run admission and gives the daemon worker a five-second best-effort drain
-  window. A longer run, forced kill, host crash, or power loss can interrupt final trace/checkpoint
-  persistence; the Web host does not claim crash-safe execution.
+- Graceful shutdown closes run admission and gives the worker a five-second drain window. If it is
+  still active, the host requests cooperative cancellation and waits for a short bounded cleanup
+  window. The Agent observes that token before model requests, after a blocking model response, and
+  between tool calls; it saves a ready checkpoint rather than accepting late work. The host never
+  force-kills a model or command call already in progress, and a forced kill, crash, or power loss can
+  still interrupt persistence. The Web host does not claim crash-safe execution.
 
 Loopback binding and request headers do not protect against an already-hostile process or user on
 the same machine. Do not port-forward, reverse-proxy, or otherwise expose this local session view.
@@ -191,18 +205,20 @@ evidence; a resumed run must verify again. The store rejects known credential pa
 reasoning fields, but the canonical transcript can still contain source and command output. Its state
 directory must therefore be private and outside the workspace.
 
-Schema-v2 checkpoints carry an opaque digest of the resolved workspace path and filesystem identity.
+Schema-v3 checkpoints carry an opaque digest of the resolved workspace path and filesystem identity,
+plus bounded RunMemory; schema-v2 payloads migrate conservatively on load.
 The CLI requires an explicit repository for resume and rejects a mismatch before constructing a
 model client. It also refuses a ready checkpoint when the latest trace says the run already
 completed. A new run preallocates its ID and holds a non-blocking OS file lease before constructing
 the runtime; resume takes that same per-run lease. The original process and a same-ID resume therefore
 cannot execute concurrently.
 
-M4 still restores the canonical transcript only. `PlanState`, the mutation undo journal, interactive
-approval decisions, and verification evidence are not persisted across processes. Resume is not an
-exactly-once transaction: if a process dies after a tool changes disk but before the ready checkpoint
-is replaced, the workspace may be newer than the transcript. Revision checks and fresh observation
-reduce that risk but cannot erase it.
+Resume restores the canonical transcript and bounded RunMemory, including the structured plan,
+change summaries, and selected failure facts. The mutation undo journal, interactive approval
+decisions, provider-private state, and fresh verification evidence are not restored across processes.
+Resume is not an exactly-once transaction: if a process dies after a tool changes disk but before the
+ready checkpoint is replaced, the workspace may be newer than the transcript. Revision checks and
+fresh observation reduce that risk but cannot erase it.
 
 ## Trace and presentation boundary
 

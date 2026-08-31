@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Protocol
 
@@ -24,6 +24,13 @@ from coding_agent._command_process import (
     ProcessContainment,
     ProcessControlError,
     start_contained_process,
+)
+from coding_agent.command_verification import VerificationCommandSpec as VerificationCommandSpec
+from coding_agent.command_verification import (
+    is_non_verifying_invocation,
+    normalized_argv,
+    normalized_executable,
+    verification_kind_for_spec,
 )
 from coding_agent.errors import CodedError
 from coding_agent.models import VerificationKind
@@ -112,8 +119,6 @@ _VERIFIER_ENV_NAMES = frozenset(
     }
 )
 
-_EXECUTABLE_SUFFIXES = (".exe", ".com", ".cmd", ".bat")
-_PYTHON_EXECUTABLES = frozenset({"py", "pypy", "pypy3", "python", "python3"})
 _DENIED_EXECUTABLES = frozenset(
     {
         "bash",
@@ -203,48 +208,6 @@ class CommandClassification:
 
 
 @dataclass(frozen=True, slots=True)
-class VerificationCommandSpec:
-    """One host-granted capability that may produce verification evidence.
-
-    The model cannot broaden this capability: executable, arguments, working directory,
-    evidence kind, and label are fixed before the run starts.
-    """
-
-    argv: tuple[str, ...]
-    cwd: str
-    kind: VerificationKind
-    label: str
-    workspace_executable_sha256: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.argv:
-            raise ValueError("verification command argv cannot be empty")
-        if not Path(self.argv[0]).is_absolute():
-            raise ValueError("verification command executable must be an absolute path")
-        portable_cwd = PurePosixPath(self.cwd.replace("\\", "/"))
-        if not self.cwd or portable_cwd.is_absolute() or ".." in portable_cwd.parts:
-            raise ValueError("verification command cwd must be workspace-relative")
-        if not self.label.strip() or len(self.label) > 120:
-            raise ValueError("verification command label must contain 1-120 characters")
-        if self.workspace_executable_sha256 is not None and (
-            len(self.workspace_executable_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.workspace_executable_sha256
-            )
-        ):
-            raise ValueError(
-                "workspace executable SHA-256 must be 64 lowercase hexadecimal characters"
-            )
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for value in (*self.argv, self.cwd, self.label)
-            for character in value
-        ):
-            raise ValueError("verification command fields must contain printable text")
-
-
-@dataclass(frozen=True, slots=True)
 class CommandRequest:
     argv: tuple[str, ...]
     cwd: Path
@@ -320,7 +283,7 @@ class CommandPolicy:
                 metadata={"reason": "implicit_shell"},
             )
 
-        normalized = _normalized_argv(argv)
+        normalized = normalized_argv(argv)
         executable = normalized[0]
         arguments = normalized[1:]
         if executable in _DENIED_EXECUTABLES or executable.startswith("mkfs."):
@@ -340,31 +303,66 @@ class CommandPolicy:
                     "command is blocked by the local destructive-command policy",
                     metadata={"reason": "destructive_git_operation"},
                 )
-        if _is_non_verifying_invocation(executable, arguments):
+        if is_non_verifying_invocation(executable, arguments):
             return self._general_or_require_approval(approved=approved)
 
         requested_argv = tuple(argv)
-        for spec in self._verification_commands:
-            if spec.argv == requested_argv and spec.cwd == cwd:
-                if _recognized_verification_kind(executable, arguments) is not spec.kind:
-                    return self._general_or_require_approval(approved=approved)
-                executable_path = Path(requested_argv[0])
-                if spec.workspace_executable_sha256 is not None and not _matches_sha256(
-                    executable_path, spec.workspace_executable_sha256
-                ):
-                    return self._general_or_require_approval(approved=approved)
-                if (
-                    workspace_root is not None
-                    and _is_within_workspace(executable_path, workspace_root)
-                    and spec.workspace_executable_sha256 is None
-                ):
-                    return self._general_or_require_approval(approved=approved)
-                return CommandClassification(
-                    command_class=CommandClass.VERIFIER,
-                    verification_kind=spec.kind,
-                    verification_label=spec.label,
-                )
+        declared = self.declared_verifier(requested_argv, cwd=cwd)
+        if declared is not None:
+            spec = self._matching_verification_spec(requested_argv, cwd=cwd)
+            assert spec is not None
+            executable_path = Path(requested_argv[0])
+            if spec.workspace_executable_sha256 is not None and not _matches_sha256(
+                executable_path, spec.workspace_executable_sha256
+            ):
+                return self._general_or_require_approval(approved=approved)
+            if (
+                workspace_root is not None
+                and _is_within_workspace(executable_path, workspace_root)
+                and spec.workspace_executable_sha256 is None
+            ):
+                return self._general_or_require_approval(approved=approved)
+            return declared
         return self._general_or_require_approval(approved=approved)
+
+    def declared_verifier(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+    ) -> CommandClassification | None:
+        """Return an exact typed capability without consulting mutable filesystem state.
+
+        This is intentionally narrower than authorization: callers use it only to attach
+        fail-closed integrity results to a verifier whose executable may already have drifted.
+        ``classify`` remains the sole authority that may allow the process to start.
+        """
+
+        spec = self._matching_verification_spec(tuple(argv), cwd=cwd)
+        if spec is None:
+            return None
+        normalized = normalized_argv(argv)
+        executable, arguments = normalized[0], normalized[1:]
+        if is_non_verifying_invocation(executable, arguments):
+            return None
+        if verification_kind_for_spec(spec, executable, arguments) is not spec.kind:
+            return None
+        return CommandClassification(
+            command_class=CommandClass.VERIFIER,
+            verification_kind=spec.kind,
+            verification_label=spec.label,
+        )
+
+    def _matching_verification_spec(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: str,
+    ) -> VerificationCommandSpec | None:
+        return next(
+            (spec for spec in self._verification_commands if spec.argv == argv and spec.cwd == cwd),
+            None,
+        )
 
     def is_verification_call(
         self,
@@ -734,27 +732,8 @@ def _is_sensitive_environment_name(name: str) -> bool:
     )
 
 
-def _normalized_argv(argv: Sequence[str]) -> tuple[str, ...]:
-    normalized = tuple(argv)
-    executable = _normalized_executable(normalized[0])
-    if executable == "uv" and len(normalized) >= 3 and normalized[1].casefold() == "run":
-        return (
-            _normalized_executable(normalized[2]),
-            *normalized[3:],
-        )
-    return (executable, *normalized[1:])
-
-
-def _normalized_executable(value: str) -> str:
-    name = value.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
-    for suffix in _EXECUTABLE_SUFFIXES:
-        if name.endswith(suffix):
-            return name[: -len(suffix)]
-    return name
-
-
 def _safe_executable_name(value: str) -> str:
-    normalized = _normalized_executable(value)
+    normalized = normalized_executable(value)
     return normalized[:120] or "unknown"
 
 
@@ -773,112 +752,6 @@ def _git_subcommand(arguments: Sequence[str]) -> str | None:
             index += 1
             continue
         return argument
-    return None
-
-
-def _is_non_verifying_invocation(executable: str, arguments: Sequence[str]) -> bool:
-    if executable in _PYTHON_EXECUTABLES and "-m" in arguments:
-        module_index = arguments.index("-m")
-        if module_index + 1 < len(arguments):
-            executable = _normalized_executable(arguments[module_index + 1])
-            arguments = arguments[module_index + 2 :]
-
-    common = {"--help", "--version", "-h", "help", "version"}
-    if any(argument in common for argument in arguments):
-        return True
-    if executable in _PYTHON_EXECUTABLES and arguments == ("-V",):
-        return True
-    if executable == "pytest" and any(
-        argument
-        in {
-            "--cache-show",
-            "--co",
-            "--collect-only",
-            "--fixtures",
-            "--fixtures-per-test",
-            "--markers",
-            "--setup-only",
-            "--setup-plan",
-        }
-        for argument in arguments
-    ):
-        return True
-    return executable == "cargo" and "--no-run" in arguments
-
-
-def _recognized_verification_kind(
-    executable: str,
-    arguments: Sequence[str],
-) -> VerificationKind | None:
-    """Accept only bounded, recognizable verifier entry points.
-
-    Exact host registration remains the authority.  This semantic check is a second lock:
-    generic interpreters, workspace scripts, and arbitrary executables cannot become evidence
-    merely because a host accidentally registered their argv.
-    """
-    if executable in _PYTHON_EXECUTABLES:
-        if "-c" in arguments or "-m" not in arguments:
-            return None
-        module_index = arguments.index("-m")
-        if module_index + 1 >= len(arguments):
-            return None
-        executable = _normalized_executable(arguments[module_index + 1])
-        arguments = arguments[module_index + 2 :]
-
-    if executable in {"pytest", "unittest"}:
-        return VerificationKind.TEST
-    if executable in {"mypy", "pyright"}:
-        return VerificationKind.CHECK
-    if executable == "ruff":
-        if arguments[:1] == ("check",) or (arguments[:1] == ("format",) and "--check" in arguments):
-            return VerificationKind.CHECK
-        return None
-    if executable == "cargo":
-        return _kind_for_named_action(
-            arguments,
-            tests={"test"},
-            builds={"build"},
-            checks={"check", "clippy", "fmt"},
-        )
-    if executable == "go":
-        return _kind_for_named_action(
-            arguments,
-            tests={"test"},
-            builds={"build"},
-            checks={"vet"},
-        )
-    if executable in {"npm", "pnpm", "yarn"}:
-        action_arguments = arguments[1:] if arguments[:1] == ("run",) else arguments
-        return _kind_for_named_action(
-            action_arguments,
-            tests={"test"},
-            builds={"build"},
-            checks={"check", "lint", "typecheck"},
-        )
-    if executable in {"make", "ninja"}:
-        return _kind_for_named_action(
-            arguments,
-            tests={"test", "tests"},
-            builds={"build", "compile"},
-            checks={"check", "lint", "typecheck"},
-        )
-    return None
-
-
-def _kind_for_named_action(
-    arguments: Sequence[str],
-    *,
-    tests: set[str],
-    builds: set[str],
-    checks: set[str],
-) -> VerificationKind | None:
-    action = next((value.casefold() for value in arguments if not value.startswith("-")), None)
-    if action in tests:
-        return VerificationKind.TEST
-    if action in builds:
-        return VerificationKind.BUILD
-    if action in checks:
-        return VerificationKind.CHECK
     return None
 
 

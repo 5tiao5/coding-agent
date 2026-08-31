@@ -13,6 +13,7 @@ from coding_agent.application import ModelFactory, RepositoryRunSpec
 from coding_agent.evaluation import (
     EvaluationConfig,
     EvaluationOutcome,
+    _materialize_verification_policy,
     _run_host_pytest,
     _workspace_manifest,
     evaluate_case,
@@ -46,6 +47,7 @@ class RepairingRunner:
     ) -> None:
         self.roots: list[Path] = []
         self.model_factories: list[ModelFactory | None] = []
+        self.policy_texts: list[str] = []
         self._tamper_with_tests = tamper_with_tests
         self._agent_state = agent_state
 
@@ -58,6 +60,9 @@ class RepairingRunner:
     ) -> AgentResult:
         self.roots.append(spec.root)
         self.model_factories.append(model_factory)
+        self.policy_texts.append(
+            spec.root.joinpath(".coding-agent/project.toml").read_text(encoding="utf-8")
+        )
         steps = self._repair(spec.root, spec.run_id, event_sink)
         if self._tamper_with_tests:
             protected = next(spec.root.glob("tests/test_*.py"))
@@ -210,6 +215,12 @@ def test_built_in_suite_runs_five_isolated_red_to_green_cases(tmp_path: Path) ->
     assert len(set(runner.roots)) == 5
     assert all(not root.exists() for root in runner.roots)
     assert runner.model_factories == [_offline_model_factory] * 5
+    assert all('label = "pytest"' in policy for policy in runner.policy_texts)
+    assert all('protected_paths = ["conftest.py"' in policy for policy in runner.policy_texts)
+    assert all('"tests/"' in policy for policy in runner.policy_texts)
+    assert all('type = "python-module"' not in policy for policy in runner.policy_texts[:-1])
+    assert 'module = "telemetry_app"' in runner.policy_texts[-1]
+    assert 'required_scopes = ["tests", "runtime:entrypoint"]' in runner.policy_texts[-1]
 
 
 def test_runtime_oracle_rejects_a_shallow_verified_fix(tmp_path: Path) -> None:
@@ -258,6 +269,39 @@ def test_runtime_oracle_rejects_a_shallow_verified_fix(tmp_path: Path) -> None:
     assert "Agent reported verified completion but the independent oracle failed" in (
         metrics.failure_reasons
     )
+
+
+def test_runtime_verifier_is_declared_by_scenario_data_not_case_id(tmp_path: Path) -> None:
+    ordinary = built_in_scenarios()[0]
+
+    declared_root = tmp_path / "declared"
+    declared_root.mkdir()
+    _materialize_verification_policy(
+        declared_root,
+        replace(
+            ordinary,
+            case_id="renamed_runtime_case",
+            runtime_module="calculator",
+        ),
+    )
+    declared_policy = declared_root.joinpath(".coding-agent/project.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'type = "python-module"' in declared_policy
+    assert 'module = "calculator"' in declared_policy
+    assert 'required_scopes = ["tests", "runtime:entrypoint"]' in declared_policy
+
+    undeclared_root = tmp_path / "undeclared"
+    undeclared_root.mkdir()
+    _materialize_verification_policy(
+        undeclared_root,
+        replace(ordinary, case_id="runtime_integration", runtime_module=None),
+    )
+    undeclared_policy = undeclared_root.joinpath(".coding-agent/project.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'type = "python-module"' not in undeclared_policy
+    assert 'required_scopes = ["tests"]' in undeclared_policy
 
 
 def test_host_oracle_rejects_a_runner_that_modifies_protected_tests(tmp_path: Path) -> None:
@@ -810,6 +854,7 @@ def test_scenario_schema_rejects_ambiguous_or_unchecked_fixtures() -> None:
         ("task", {"task": " "}),
         ("at least one fixture", {"files": ()}),
         ("host oracle", {"oracle_files": ()}),
+        ("runtime_module", {"runtime_module": "not-a-module"}),
         ("fixture paths must be unique", {"files": scenario.files + scenario.files[:1]}),
         (
             "fixture paths must be unique",

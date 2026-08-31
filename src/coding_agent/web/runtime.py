@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from coding_agent.application import RepositoryRunSpec, execute_repository_run
+from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.command import CommandPermissionMode
 from coding_agent.demo import DEMO_TASK, run_repository_demo
 from coding_agent.events import BestEffortEventSink, EventSink
@@ -54,7 +55,12 @@ def create_demo_service() -> WebRunService:
 def create_repository_service(config: WebRepositoryConfig) -> WebRunService:
     """Build a one-worker service backed by the shared repository application layer."""
 
-    def run_repository(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+    def run_repository(
+        run_id: str,
+        task: str,
+        event_sink: EventSink,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
         spec = RepositoryRunSpec(
             run_id=run_id,
             task=task,
@@ -70,9 +76,14 @@ def create_repository_service(config: WebRepositoryConfig) -> WebRunService:
         with RunLease(config.paths.root / "leases", run_id):
             # The first presentation milestone is deliberately fail-closed: safe-mode
             # ordinary commands are denied until a Web approval broker is implemented.
-            return execute_repository_run(spec, event_sink=event_sink, approver=None)
+            return execute_repository_run(
+                spec,
+                event_sink=event_sink,
+                approver=None,
+                cancellation_token=cancellation_token,
+            )
 
-    return WebRunService(run_repository)
+    return WebRunService(run_repository, cancellation_source=CancellationSource())
 
 
 def create_workbench_service(

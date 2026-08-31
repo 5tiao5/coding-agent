@@ -14,6 +14,7 @@ from pathlib import PurePosixPath
 from textwrap import dedent
 
 _CASE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_PYTHON_MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _WINDOWS_RESERVED_STEMS = frozenset(
     {"aux", "con", "nul", "prn"}
     | {f"com{index}" for index in range(1, 10)}
@@ -46,6 +47,7 @@ class EvaluationScenario:
     allowed_changed_paths: tuple[str, ...]
     required_changed_paths: tuple[str, ...] = ()
     required_new_paths: tuple[str, ...] = ()
+    runtime_module: str | None = None
 
     def __post_init__(self) -> None:
         if _CASE_ID_PATTERN.fullmatch(self.case_id) is None:
@@ -56,6 +58,11 @@ class EvaluationScenario:
             raise ValueError("scenario must contain at least one fixture file")
         if not self.oracle_files or not self.oracle_source_paths:
             raise ValueError("scenario must contain a host oracle and its source allowlist")
+        if (
+            self.runtime_module is not None
+            and _PYTHON_MODULE_PATTERN.fullmatch(self.runtime_module) is None
+        ):
+            raise ValueError("runtime_module must be a dotted Python module name")
 
         fixture_paths = tuple(file.path for file in self.files)
         oracle_paths = tuple(file.path for file in self.oracle_files)
@@ -577,6 +584,7 @@ _BUILT_IN_SCENARIOS = (
             "telemetry_app/config.py",
             "telemetry_app/render.py",
         ),
+        runtime_module="telemetry_app",
     ),
 )
 

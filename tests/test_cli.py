@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -917,6 +918,25 @@ def _write_passing_project(root: Path) -> None:
     tests.mkdir(parents=True)
     tests.joinpath("test_ok.py").write_text(
         "def test_ok() -> None:\n    assert 2 + 2 == 4\n",
+        encoding="utf-8",
+    )
+    metadata = root / ".coding-agent"
+    metadata.mkdir()
+    metadata.joinpath("project.toml").write_text(
+        "\n".join(
+            (
+                "schema_version = 1",
+                'protected_paths = ["tests/"]',
+                "[python]",
+                "executable = " + json.dumps(str(Path(sys.executable).absolute())),
+                "[[verifiers]]",
+                'label = "pytest"',
+                'type = "pytest"',
+                'scopes = ["tests"]',
+                "required = true",
+                "",
+            )
+        ),
         encoding="utf-8",
     )
 

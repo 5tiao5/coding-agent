@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints, field_validator
@@ -91,6 +92,7 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         runner: CommandRunner | None = None,
         policy: CommandPolicy | None = None,
         approver: CommandApprover | None = None,
+        verification_integrity_guard: Callable[[], bool] | None = None,
         max_output_chars: int = 16_000,
     ) -> None:
         minimum = 512
@@ -100,6 +102,7 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         self._runner = runner or LocalCommandRunner()
         self._policy = policy or CommandPolicy()
         self._approver = approver
+        self._verification_integrity_guard = verification_integrity_guard
         self._max_output_chars = max_output_chars
         self.output_budget_chars = max_output_chars
 
@@ -107,15 +110,28 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         """Recognize only the exact verifier capability used by ``run`` itself."""
 
         cwd = self._workspace.resolve(arguments.cwd, expected="directory")
-        return self._policy.is_verification_call(
-            tuple(arguments.argv),
+        argv = tuple(arguments.argv)
+        if self._policy.is_verification_call(
+            argv,
             cwd=cwd.relative,
             workspace_root=self._workspace.root,
+        ):
+            return True
+        return (
+            self._verification_integrity_guard is not None
+            and self._policy.declared_verifier(argv, cwd=cwd.relative) is not None
         )
 
     def run(self, arguments: RunCommandArguments) -> ToolOutput:
         argv = tuple(arguments.argv)
         cwd = self._workspace.resolve(arguments.cwd, expected="directory")
+        declared = self._policy.declared_verifier(argv, cwd=cwd.relative)
+        if (
+            declared is not None
+            and self._verification_integrity_guard is not None
+            and not self._integrity_intact()
+        ):
+            return self._integrity_failure(declared, cwd=cwd.relative, phase="before")
         try:
             classification = self._policy.classify(
                 argv,
@@ -160,11 +176,69 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
                 ),
             )
         )
-        return self._render_result(
+        rendered = self._render_result(
             result,
             classification=classification,
             cwd=cwd.relative,
             timeout_seconds=arguments.timeout_seconds,
+        )
+        if (
+            classification.command_class is CommandClass.VERIFIER
+            and self._verification_integrity_guard is not None
+            and not self._integrity_intact()
+        ):
+            return self._integrity_failure(
+                classification,
+                cwd=cwd.relative,
+                phase="after",
+                previous=rendered,
+            )
+        return rendered
+
+    def _integrity_intact(self) -> bool:
+        guard = self._verification_integrity_guard
+        if guard is None:
+            return True
+        try:
+            return guard() is True
+        except Exception:  # noqa: BLE001 - policy failures must reject evidence.
+            return False
+
+    def _integrity_failure(
+        self,
+        classification: CommandClassification,
+        *,
+        cwd: str,
+        phase: str,
+        previous: ToolOutput | None = None,
+    ) -> ToolOutput:
+        assert classification.verification_kind is not None
+        assert classification.verification_label is not None
+        safety_message = (
+            "Status: trusted verification rejected\n"
+            "Safety stop: project verification policy integrity changed."
+        )
+        message = safety_message
+        if previous is not None:
+            message += "\nVerifier observation (not trusted):\n" + previous.content
+        content = clip_at_escape_boundary(message, self._max_output_chars)
+        return ToolOutput(
+            content=content,
+            summary="Trusted verification rejected because project policy integrity changed",
+            metadata={
+                "status": "integrity_failed",
+                "cwd": cwd,
+                "command_class": CommandClass.VERIFIER.value,
+                "integrity_intact": False,
+                "integrity_phase": phase,
+            },
+            truncated=len(content) < len(message),
+            control=ToolControlFacts(
+                invalidates_verification=True,
+                verification=VerificationSignal.FAILED,
+                verification_kind=classification.verification_kind,
+                verification_label=classification.verification_label,
+            ),
         )
 
     def _render_result(
