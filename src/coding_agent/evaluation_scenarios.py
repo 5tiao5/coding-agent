@@ -119,7 +119,7 @@ class EvaluationScenario:
 
 
 def built_in_scenarios() -> tuple[EvaluationScenario, ...]:
-    """Return the four project-owned evaluation cases in stable display order."""
+    """Return the five project-owned evaluation cases in stable display order."""
 
     return _BUILT_IN_SCENARIOS
 
@@ -443,6 +443,140 @@ _BUILT_IN_SCENARIOS = (
         ),
         allowed_changed_paths=("reports/config.py",),
         required_changed_paths=("reports/config.py",),
+    ),
+    EvaluationScenario(
+        case_id="runtime_integration",
+        title="Repair a runtime report integration failure",
+        task=(
+            "Repair the telemetry_app package completely. Its protected pytest check fails, "
+            "and users also report that `python -m telemetry_app` crashes at runtime. Diagnose "
+            "the cross-module data-contract defect instead of weakening tests or hard-coding "
+            "the displayed report, then verify both the tests and the real module entry point."
+        ),
+        files=(
+            FixtureFile("telemetry_app/__init__.py", ""),
+            FixtureFile(
+                "telemetry_app/config.py",
+                _source(
+                    """
+                    REPORT_TITLE = "Telemetry"
+                    """
+                ),
+            ),
+            FixtureFile(
+                "telemetry_app/vector.py",
+                _source(
+                    """
+                    from dataclasses import dataclass
+
+
+                    @dataclass(frozen=True, slots=True)
+                    class Vec:
+                        x: float
+                        y: float
+                    """
+                ),
+            ),
+            FixtureFile(
+                "telemetry_app/render.py",
+                _source(
+                    """
+                    from .vector import Vec
+
+
+                    def render_points(points: list[Vec]) -> str:
+                        normalized = [(point.x, point.y) for point in points]
+                        return " | ".join(
+                            f"{point.x:.1f},{point.y:.1f}" for point in normalized
+                        )
+                    """
+                ),
+            ),
+            FixtureFile(
+                "telemetry_app/report.py",
+                _source(
+                    """
+                    from .config import REPORT_TITLE
+                    from .render import render_points
+                    from .vector import Vec
+
+
+                    def build_report() -> str:
+                        points = [Vec(1.0, 2.0), Vec(3.0, 4.0)]
+                        return f"{REPORT_TITLE}\\n{render_points(points)}"
+                    """
+                ),
+            ),
+            FixtureFile(
+                "telemetry_app/__main__.py",
+                _source(
+                    """
+                    from .report import build_report
+
+
+                    print(build_report())
+                    """
+                ),
+            ),
+            FixtureFile("tests/__init__.py", ""),
+            FixtureFile(
+                "tests/test_config.py",
+                _source(
+                    """
+                    from telemetry_app.config import REPORT_TITLE
+
+
+                    def test_report_title_is_descriptive() -> None:
+                        assert REPORT_TITLE == "Telemetry Report"
+                    """
+                ),
+            ),
+        ),
+        protected_paths=("tests/test_config.py",),
+        oracle_files=(
+            FixtureFile(
+                "tests/test_runtime_oracle.py",
+                _source(
+                    """
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+
+
+                    def test_module_entry_point_runs_and_renders_the_report() -> None:
+                        completed = subprocess.run(
+                            [sys.executable, "-m", "telemetry_app"],
+                            cwd=Path(__file__).parents[1],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+
+                        assert completed.returncode == 0, completed.stderr
+                        assert completed.stdout == (
+                            "Telemetry Report\\n1.0,2.0 | 3.0,4.0\\n"
+                        )
+                    """
+                ),
+            ),
+        ),
+        oracle_source_paths=(
+            "telemetry_app/__init__.py",
+            "telemetry_app/config.py",
+            "telemetry_app/vector.py",
+            "telemetry_app/render.py",
+            "telemetry_app/report.py",
+            "telemetry_app/__main__.py",
+        ),
+        allowed_changed_paths=(
+            "telemetry_app/config.py",
+            "telemetry_app/render.py",
+        ),
+        required_changed_paths=(
+            "telemetry_app/config.py",
+            "telemetry_app/render.py",
+        ),
     ),
 )
 

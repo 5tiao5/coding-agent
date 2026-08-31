@@ -19,6 +19,7 @@ from coding_agent.evaluation import (
     EvaluationReport,
     PytestMetrics,
 )
+from coding_agent.evaluation_cli import EvaluationCase, selected_evaluation_scenarios
 from coding_agent.evaluation_scenarios import EvaluationScenario
 from coding_agent.local_config import LOCAL_CONFIG_KEYS, load_local_environment
 from coding_agent.openai_model import ReasoningEffort
@@ -138,6 +139,7 @@ def _report(*, success: bool = True, error: bool = False) -> EvaluationReport:
             successful_cases=int(outcome is EvaluationOutcome.PASSED),
             failed_cases=int(outcome is EvaluationOutcome.FAILED),
             error_cases=int(outcome is EvaluationOutcome.ERROR),
+            verified_but_oracle_failed_cases=int(not error and outcome is EvaluationOutcome.FAILED),
             success_rate=float(outcome is EvaluationOutcome.PASSED),
             total_steps=4,
             average_steps=4.0,
@@ -247,6 +249,12 @@ def test_evaluate_selects_one_safe_case_and_prints_a_table(
     assert _PROVIDER_SECRET not in result.output
 
 
+def test_runtime_integration_case_is_individually_selectable() -> None:
+    scenarios = selected_evaluation_scenarios(EvaluationCase.RUNTIME_INTEGRATION)
+
+    assert [scenario.case_id for scenario in scenarios] == ["runtime_integration"]
+
+
 def test_evaluate_json_uses_a_strict_public_whitelist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -272,6 +280,7 @@ def test_evaluate_json_uses_a_strict_public_whitelist(
     assert payload["mode"] == "live"
     assert payload["model"] == "test-model"
     assert payload["cases"][0]["result"] == "passed"
+    assert payload["cases"][0]["verified_but_oracle_failed"] is False
     assert payload["cases"][0]["integrity"] == {
         "protected_tests_unchanged": True,
         "required_files_present": True,
@@ -282,6 +291,7 @@ def test_evaluate_json_uses_a_strict_public_whitelist(
         "unexpected_changed_paths": [],
     }
     assert payload["summary"]["passed"] == 1
+    assert payload["summary"]["verified_but_oracle_failed"] == 0
     assert _PROVIDER_SECRET not in result.output
     assert _RAW_ORACLE_OUTPUT not in result.output
     assert "TEST_PRIVATE_COMMAND_SENTINEL" not in result.output
@@ -308,7 +318,10 @@ def test_evaluate_returns_three_for_a_completed_report_with_failed_cases(
     )
 
     assert result.exit_code == 3
-    assert json.loads(result.stdout)["summary"]["failed"] == 1
+    payload = json.loads(result.stdout)
+    assert payload["cases"][0]["verified_but_oracle_failed"] is True
+    assert payload["summary"]["failed"] == 1
+    assert payload["summary"]["verified_but_oracle_failed"] == 1
 
 
 def test_evaluate_returns_one_for_a_runner_or_provider_error(

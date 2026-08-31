@@ -24,6 +24,7 @@ class EvaluationCase(StrEnum):
     CROSS_FILE = "cross-file"
     NEW_FEATURE = "new-feature"
     INDIRECT_DEBUG = "indirect-debug"
+    RUNTIME_INTEGRATION = "runtime-integration"
 
 
 class EvaluationFormat(StrEnum):
@@ -49,6 +50,7 @@ def selected_evaluation_scenarios(
         EvaluationCase.CROSS_FILE: "cross_file_change",
         EvaluationCase.NEW_FEATURE: "new_feature",
         EvaluationCase.INDIRECT_DEBUG: "indirect_debugging",
+        EvaluationCase.RUNTIME_INTEGRATION: "runtime_integration",
     }
     case_id = case_ids[selected_case]
     selected = tuple(scenario for scenario in scenarios if scenario.case_id == case_id)
@@ -80,6 +82,7 @@ def evaluation_payload(
                 "steps": case.steps,
                 "duration_seconds": round(case.duration_seconds, 6),
                 "tool_errors": case.tool_errors,
+                "verified_but_oracle_failed": case.verified_but_oracle_failed,
                 "baseline": {
                     "command_status": case.baseline.command_status,
                     "return_code": case.baseline.return_code,
@@ -132,6 +135,7 @@ def evaluation_payload(
             "passed": aggregate.successful_cases,
             "failed": aggregate.failed_cases,
             "errors": aggregate.error_cases,
+            "verified_but_oracle_failed": aggregate.verified_but_oracle_failed_cases,
             "success_rate": round(aggregate.success_rate, 6),
             "steps_total": aggregate.total_steps,
             "steps_average": round(aggregate.average_steps, 6),
@@ -205,6 +209,7 @@ def print_evaluation_report(report: EvaluationReport, *, console: Console) -> No
                 f"Passed {aggregate.successful_cases}/{aggregate.total_cases} "
                 f"({aggregate.success_rate:.0%}) · {aggregate.total_steps} steps · "
                 f"{aggregate.total_tool_errors} tool errors · "
+                f"{aggregate.verified_but_oracle_failed_cases} false-green claims · "
                 f"{aggregate.total_duration_seconds:.2f}s"
             ),
             style=summary_style,

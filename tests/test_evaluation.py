@@ -13,6 +13,7 @@ from coding_agent.application import ModelFactory, RepositoryRunSpec
 from coding_agent.evaluation import (
     EvaluationConfig,
     EvaluationOutcome,
+    _run_host_pytest,
     _workspace_manifest,
     evaluate_case,
     evaluate_suite,
@@ -126,6 +127,18 @@ class RepairingRunner:
                 encoding="utf-8",
             )
             return 5
+        if root.joinpath("telemetry_app").is_dir():
+            root.joinpath("telemetry_app/config.py").write_text(
+                'REPORT_TITLE = "Telemetry Report"\n',
+                encoding="utf-8",
+            )
+            root.joinpath("telemetry_app/render.py").write_text(
+                "from .vector import Vec\n\n\n"
+                "def render_points(points: list[Vec]) -> str:\n"
+                "    return ' | '.join(f'{point.x:.1f},{point.y:.1f}' for point in points)\n",
+                encoding="utf-8",
+            )
+            return 6
         raise AssertionError("unknown evaluation fixture")
 
 
@@ -150,7 +163,7 @@ def _config() -> EvaluationConfig:
     )
 
 
-def test_built_in_suite_runs_four_isolated_red_to_green_cases(tmp_path: Path) -> None:
+def test_built_in_suite_runs_five_isolated_red_to_green_cases(tmp_path: Path) -> None:
     runner = RepairingRunner()
 
     report = evaluate_suite(
@@ -165,6 +178,7 @@ def test_built_in_suite_runs_four_isolated_red_to_green_cases(tmp_path: Path) ->
         "cross_file_change",
         "new_feature",
         "indirect_debugging",
+        "runtime_integration",
     ]
     assert all(case.baseline.return_code == 1 for case in report.cases)
     assert all(case.oracle is not None and case.oracle.passed for case in report.cases)
@@ -179,21 +193,71 @@ def test_built_in_suite_runs_four_isolated_red_to_green_cases(tmp_path: Path) ->
         ("shipping/quote.py", "shipping/rates.py"),
         ("text_tools/slug.py",),
         ("reports/config.py",),
+        ("telemetry_app/config.py", "telemetry_app/render.py"),
     ]
     assert all(not case.unexpected_changed_paths for case in report.cases)
-    assert report.aggregate.total_cases == 4
-    assert report.aggregate.successful_cases == 4
+    assert report.aggregate.total_cases == 5
+    assert report.aggregate.successful_cases == 5
     assert report.aggregate.failed_cases == 0
     assert report.aggregate.error_cases == 0
+    assert report.aggregate.verified_but_oracle_failed_cases == 0
     assert report.aggregate.success_rate == 1.0
-    assert report.aggregate.total_steps == 14
-    assert report.aggregate.average_steps == 3.5
+    assert report.aggregate.total_steps == 20
+    assert report.aggregate.average_steps == 4.0
     assert report.aggregate.total_duration_seconds >= 0
     assert report.aggregate.average_duration_seconds >= 0
     assert report.aggregate.total_tool_errors == 1
-    assert len(set(runner.roots)) == 4
+    assert len(set(runner.roots)) == 5
     assert all(not root.exists() for root in runner.roots)
-    assert runner.model_factories == [_offline_model_factory] * 4
+    assert runner.model_factories == [_offline_model_factory] * 5
+
+
+def test_runtime_oracle_rejects_a_shallow_verified_fix(tmp_path: Path) -> None:
+    scenario = next(case for case in built_in_scenarios() if case.case_id == "runtime_integration")
+
+    def shallow_runner(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink | None,
+        model_factory: ModelFactory | None,
+    ) -> AgentResult:
+        del event_sink, model_factory
+        spec.root.joinpath("telemetry_app/config.py").write_text(
+            'REPORT_TITLE = "Telemetry Report"\n',
+            encoding="utf-8",
+        )
+        assert _run_host_pytest(spec.root, timeout=20).passed
+        return AgentResult(
+            run_id=spec.run_id,
+            state=AgentState.COMPLETED,
+            stop_reason=StopReason.FINAL_RESPONSE,
+            steps=2,
+            final_text="The public pytest check passes.",
+            messages=(
+                ChatMessage(role=MessageRole.USER, content=spec.task),
+                ChatMessage(role=MessageRole.ASSISTANT, content="Verified."),
+            ),
+        )
+
+    report = evaluate_suite(
+        config=_config(),
+        scenarios=(scenario,),
+        run_callable=shallow_runner,
+        temporary_parent=tmp_path,
+    )
+
+    metrics = report.cases[0]
+    assert metrics.agent_state == AgentState.COMPLETED.value
+    assert metrics.oracle is not None and metrics.oracle.passed is False
+    assert metrics.verified_but_oracle_failed is True
+    assert metrics.outcome is EvaluationOutcome.FAILED
+    assert metrics.success is False
+    assert report.aggregate.successful_cases == 0
+    assert report.aggregate.failed_cases == 1
+    assert report.aggregate.verified_but_oracle_failed_cases == 1
+    assert "Agent reported verified completion but the independent oracle failed" in (
+        metrics.failure_reasons
+    )
 
 
 def test_host_oracle_rejects_a_runner_that_modifies_protected_tests(tmp_path: Path) -> None:

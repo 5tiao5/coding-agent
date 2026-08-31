@@ -109,7 +109,7 @@ consent flags; there is no API-key argument:
 # One isolated case (recommended first smoke)
 uv run coding-agent evaluate --live --allow-paid-api --case single-file
 
-# Four categories, stable JSON, and a new report file
+# Five categories, stable JSON, and a new report file
 uv run coding-agent evaluate --live --allow-paid-api --case all `
   --format json --output evaluation.json
 ```
@@ -209,14 +209,17 @@ verification evidence.
   `408/409/429/5xx` use `0.5s → 1s` backoff, while malformed function-argument JSON is discarded
   before tool execution and retried immediately with a fixed, sanitized protocol-correction
   instruction. Both paths share the configured attempt ceiling and are distinguished in events.
-- Four stable categories cover a single-file repair, cross-file change, new feature, and indirect
-  fault. Success requires `AgentState.COMPLETED`, unchanged public-test controls, required source
-  changes, no workspace change outside the scenario allowlist, and a separate sibling regression
-  oracle. JSON reports expose the bounded scope proof as `coding-agent.eval.v2`.
+- Five stable categories cover a single-file repair, cross-file change, new feature, indirect fault,
+  and a runtime integration failure that a shallow public test cannot detect. Success requires
+  `AgentState.COMPLETED`, unchanged public-test controls, required source changes, no workspace
+  change outside the scenario allowlist, and a separate sibling regression oracle. JSON reports
+  expose the bounded scope proof as `coding-agent.eval.v2` and count
+  `verified_but_oracle_failed` false-green claims explicitly.
 - Case results distinguish `passed`, `failed`, and `error`; aggregate metrics include success rate,
   steps, duration, and tool failures.
-- On 2026-08-29, `deepseek-v4-flash` passed all four categories individually and again in one
-  continuous suite: 8/8 case runs, five steps per case, zero tool errors; the full suite took 43.05s.
+- On 2026-08-29, `deepseek-v4-flash` passed the original four categories individually and again in
+  one continuous suite: 8/8 historical case runs, five steps per case, zero tool errors; the full
+  suite took 43.05s. The newer runtime-integration case still requires a fresh live measurement.
 
 ## Important limits
 

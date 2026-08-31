@@ -173,6 +173,16 @@ class CaseMetrics:
     def only_allowed_paths_changed(self) -> bool:
         return not self.unexpected_changed_paths
 
+    @property
+    def verified_but_oracle_failed(self) -> bool:
+        """Whether the Agent claimed verified completion that the host disproved."""
+
+        return (
+            self.agent_state == AgentState.COMPLETED.value
+            and self.oracle is not None
+            and not self.oracle.passed
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AggregateMetrics:
@@ -182,6 +192,7 @@ class AggregateMetrics:
     successful_cases: int
     failed_cases: int
     error_cases: int
+    verified_but_oracle_failed_cases: int
     success_rate: float
     total_steps: int
     average_steps: float
@@ -344,6 +355,15 @@ def evaluate_case(
             )
         if oracle is None or not oracle.passed:
             failure_reasons.append("independent host pytest oracle did not pass")
+        if (
+            result is not None
+            and result.state is AgentState.COMPLETED
+            and oracle is not None
+            and not oracle.passed
+        ):
+            failure_reasons.append(
+                "Agent reported verified completion but the independent oracle failed"
+            )
         if modified_protected:
             failure_reasons.append("protected test files changed: " + ", ".join(modified_protected))
         if missing_required:
@@ -431,6 +451,7 @@ def _aggregate(cases: tuple[CaseMetrics, ...]) -> AggregateMetrics:
     successful = sum(case.success for case in cases)
     errors = sum(case.outcome is EvaluationOutcome.ERROR for case in cases)
     failed = total - successful - errors
+    verified_but_oracle_failed = sum(case.verified_but_oracle_failed for case in cases)
     total_steps = sum(case.steps for case in cases)
     total_duration = sum(case.duration_seconds for case in cases)
     return AggregateMetrics(
@@ -438,6 +459,7 @@ def _aggregate(cases: tuple[CaseMetrics, ...]) -> AggregateMetrics:
         successful_cases=successful,
         failed_cases=failed,
         error_cases=errors,
+        verified_but_oracle_failed_cases=verified_but_oracle_failed,
         success_rate=successful / total if total else 0.0,
         total_steps=total_steps,
         average_steps=total_steps / total if total else 0.0,
