@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Self
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from coding_agent.errors import CodedError
 from coding_agent.models import FrozenModel
@@ -50,6 +51,31 @@ class PlanItem(FrozenModel):
         return value
 
 
+class PlanSnapshot(FrozenModel):
+    """A bounded persisted view of explicit plan state, never model reasoning."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    revision: int = Field(ge=0)
+    items: tuple[PlanItem, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        if self.revision == 0:
+            if self.items:
+                raise ValueError("revision zero is reserved for the empty plan")
+            return self
+        if not self.items:
+            raise ValueError("a revised plan snapshot must contain at least one item")
+
+        ids = tuple(item.id for item in self.items)
+        if len(set(ids)) != len(ids):
+            raise ValueError("plan snapshot item ids must be unique")
+        if sum(item.status is PlanStatus.IN_PROGRESS for item in self.items) > 1:
+            raise ValueError("plan snapshot may contain at most one in_progress item")
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class PlanUpdate:
     """Result of replacing the complete explicit plan snapshot."""
@@ -73,6 +99,23 @@ class PlanState:
     @property
     def revision(self) -> int:
         return self._revision
+
+    def snapshot(self) -> PlanSnapshot:
+        """Return an immutable persisted view of the current explicit plan."""
+
+        return PlanSnapshot(items=self._items, revision=self._revision)
+
+    def restore(self, snapshot: PlanSnapshot) -> PlanSnapshot:
+        """Restore one snapshot into a pristine state without replaying updates."""
+
+        if self._items or self._revision:
+            raise PlanError(
+                "plan_restore_conflict",
+                "plan snapshots can be restored only into an empty plan state",
+            )
+        self._items = snapshot.items
+        self._revision = snapshot.revision
+        return self.snapshot()
 
     def update(self, items: Sequence[PlanItem]) -> PlanUpdate:
         """Replace the whole snapshot after validating its monotonic invariants."""

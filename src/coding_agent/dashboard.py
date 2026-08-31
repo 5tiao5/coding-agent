@@ -40,7 +40,14 @@ _TERMINAL_KINDS = {EventKind.RUN_FINISHED, EventKind.RUN_FAILED}
 _START_KINDS = {EventKind.RUN_STARTED, EventKind.RUN_RESUMED}
 _MUTATION_TOOLS = {"replace_text", "undo_change", "write_file"}
 _NON_TTY_HIDDEN_KINDS = {EventKind.MODEL_REQUESTED, EventKind.MODEL_RESPONDED}
-_VERIFICATION_STATUSES = {"verified", "missing", "failed", "stale", "unverified"}
+_VERIFICATION_STATUSES = {
+    "verified",
+    "checks_only",
+    "missing",
+    "failed",
+    "stale",
+    "unverified",
+}
 _NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
 _MAX_PLAN_LINES = 8
 _MAX_EVIDENCE_LABELS = 8
@@ -1043,6 +1050,9 @@ def _outcome_explanation(snapshot: DashboardSnapshot) -> str:
     if snapshot.run_failed:
         return "The run stopped before trustworthy completion."
     explanations = {
+        "checks_only": (
+            "Configured checks passed, but the task completion contract is incomplete."
+        ),
         "missing": "No current trusted verification evidence was recorded.",
         "failed": "The latest trusted verification evidence failed.",
         "stale": "The workspace changed after the latest passing evidence.",

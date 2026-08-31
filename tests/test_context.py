@@ -13,7 +13,20 @@ from coding_agent.context import (
     context_char_count,
     tool_spec_char_count,
 )
-from coding_agent.models import ChatMessage, MessageRole, ToolCall, ToolExecution, ToolSpec
+from coding_agent.models import (
+    ChatMessage,
+    MessageRole,
+    ToolCall,
+    ToolExecution,
+    ToolSpec,
+    VerificationKind,
+)
+from coding_agent.plan import PlanItem, PlanSnapshot, PlanStatus
+from coding_agent.run_memory import (
+    FileChangeFact,
+    RunMemorySnapshot,
+    VerificationMemoryFact,
+)
 
 
 def _anchors(
@@ -84,6 +97,42 @@ def _failed_block(number: int, *, secret: str) -> tuple[ChatMessage, ...]:
     )
 
 
+def _memory_snapshot() -> RunMemorySnapshot:
+    return RunMemorySnapshot(
+        revision=4,
+        plan=PlanSnapshot(
+            revision=2,
+            items=(
+                PlanItem(id="inspect", step="Inspect files", status=PlanStatus.COMPLETED),
+                PlanItem(id="verify", step="Run tests", status=PlanStatus.IN_PROGRESS),
+            ),
+        ),
+        file_changes=(
+            FileChangeFact(
+                path="src/fixed.py",
+                change_count=2,
+                last_change_id="chg_0002",
+                last_change_kind="update",
+                before_sha256="a" * 64,
+                after_sha256="b" * 64,
+                added_lines=3,
+                removed_lines=1,
+                mutation_revision=2,
+                last_step=4,
+            ),
+        ),
+        verification_facts=(
+            VerificationMemoryFact(
+                label="pytest",
+                kind=VerificationKind.TEST,
+                passed=True,
+                step=3,
+                stale=True,
+            ),
+        ),
+    )
+
+
 def test_uncompacted_context_keeps_distinct_canonical_and_model_views() -> None:
     transcript = (*_anchors(), *_successful_block(1, output="answer = 42"))
     original = context_char_count(transcript)
@@ -97,6 +146,67 @@ def test_uncompacted_context_keeps_distinct_canonical_and_model_views() -> None:
     assert prepared.metadata.original == original
     assert prepared.metadata.prepared == original
     assert prepared.metadata.compacted_blocks == 0
+
+
+def test_host_memory_is_inserted_after_anchors_without_mutating_canonical_history() -> None:
+    transcript = (*_anchors(), *_successful_block(1, output="answer = 42"))
+    memory = _memory_snapshot()
+
+    prepared = ContextManager(max_chars=100_000).prepare(transcript, memory=memory)
+
+    assert prepared.canonical_transcript == transcript
+    assert prepared.model_view[:2] == transcript[:2]
+    memory_message = prepared.model_view[2]
+    assert memory_message.role is MessageRole.ASSISTANT
+    assert memory_message.tool_calls == ()
+    assert "host-owned run memory" in (memory_message.content or "")
+    assert '"path":"src/fixed.py"' in (memory_message.content or "")
+    assert '"stale":true' in (memory_message.content or "")
+    assert prepared.model_view[3:] == transcript[2:]
+    assert prepared.metadata.original == context_char_count(transcript)
+    assert prepared.metadata.prepared == context_char_count(prepared.model_view)
+    assert prepared.metadata.compacted is False
+
+
+def test_host_memory_is_a_mandatory_anchor_during_compaction() -> None:
+    anchors = _anchors()
+    memory = _memory_snapshot()
+    latest = _successful_block(3, output="latest")
+    recent_probe = ContextManager(max_chars=100_000).prepare(
+        (*anchors, *latest),
+        memory=memory,
+    )
+    old = _successful_block(
+        1,
+        output="PRIVATE_OLD_OUTPUT" * 200,
+        assistant_content="PRIVATE_OLD_NARRATION",
+    )
+    transcript = (*anchors, *old, *latest)
+    budget = recent_probe.metadata.prepared + 240
+
+    first = ContextManager(max_chars=budget).prepare(transcript, memory=memory)
+    second = ContextManager(max_chars=budget).prepare(transcript, memory=memory)
+
+    assert first == second
+    assert first.metadata.compacted is True
+    assert first.metadata.compacted_blocks == 1
+    assert "host-owned run memory" in (first.model_view[2].content or "")
+    assert "compacted_tool_facts" in (first.model_view[3].content or "")
+    assert first.model_view[-len(latest) :] == latest
+    rendered = "\n".join(message.content or "" for message in first.model_view)
+    assert "PRIVATE_OLD" not in rendered
+
+
+def test_host_memory_counts_toward_the_anchor_budget() -> None:
+    transcript = _anchors()
+    memory = _memory_snapshot()
+    prepared = ContextManager(max_chars=100_000).prepare(transcript, memory=memory)
+    required = prepared.metadata.prepared
+
+    with pytest.raises(ContextBudgetError) as raised:
+        ContextManager(max_chars=required - 1).prepare(transcript, memory=memory)
+
+    assert raised.value.code == "context_anchor_exceeds_budget"
 
 
 def test_manager_rejects_invalid_budgets_and_exposes_the_configured_limit() -> None:

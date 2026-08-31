@@ -320,6 +320,81 @@ def test_verification_capability_binds_working_directory_and_exact_arguments() -
     assert policy.classify(spec.argv, cwd="src").command_class is CommandClass.GENERAL
 
 
+def test_verification_preflight_fails_closed_for_near_or_unrecognized_commands() -> None:
+    spec = _trusted_spec(["python", "-m", "pytest", "-q"], VerificationKind.TEST, "pytest")
+    safe_policy = CommandPolicy(verification_commands=(spec,))
+
+    assert safe_policy.is_verification_call(spec.argv, cwd=".") is True
+    assert safe_policy.is_verification_call((*spec.argv, "tests/unit"), cwd=".") is False
+    assert safe_policy.is_verification_call(spec.argv, cwd="src") is False
+    assert safe_policy.is_verification_call((str(Path(sys.executable)), "-c", "pass")) is False
+    assert safe_policy.is_verification_call(("cmd.exe", "/c", "pytest")) is False
+
+
+def test_registry_verification_preflight_never_executes_or_requests_approval(
+    repository: Path,
+) -> None:
+    spec = _trusted_spec(["python", "-m", "pytest", "-q"], VerificationKind.TEST, "pytest")
+    runner = RecordingRunner(_result())
+    approver = RecordingApprover(True)
+    registry = ToolRegistry(
+        [
+            RunCommandTool(
+                Workspace(repository),
+                runner=runner,
+                policy=CommandPolicy(verification_commands=(spec,)),
+                approver=approver,
+            )
+        ]
+    )
+
+    exact = ToolCall(
+        id="verify-exact",
+        name="run_command",
+        arguments={"argv": list(spec.argv)},
+    )
+    near = exact.model_copy(
+        update={
+            "id": "verify-near",
+            "arguments": {"argv": [*spec.argv, "tests/unit"], "cwd": "."},
+        }
+    )
+    extra_field = exact.model_copy(
+        update={
+            "id": "verify-extra",
+            "arguments": {"argv": list(spec.argv), "cwd": ".", "unrecognized": True},
+        }
+    )
+
+    assert registry.is_verification_call(exact) is True
+    assert registry.is_verification_call(near) is False
+    assert registry.is_verification_call(extra_field) is False
+    assert (
+        registry.is_verification_call(
+            ToolCall(id="empty-argv", name="run_command", arguments={"argv": []})
+        )
+        is False
+    )
+    assert (
+        registry.is_verification_call(
+            ToolCall(
+                id="missing-cwd",
+                name="run_command",
+                arguments={"argv": list(spec.argv), "cwd": "missing"},
+            )
+        )
+        is False
+    )
+    assert (
+        registry.is_verification_call(
+            ToolCall(id="unknown", name="unknown_tool", arguments={"argv": list(spec.argv)})
+        )
+        is False
+    )
+    assert runner.requests == []
+    assert approver.requests == []
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -351,13 +426,15 @@ def test_workspace_owned_executable_cannot_issue_verification(repository: Path) 
         label="workspace pytest",
     )
 
-    classification = CommandPolicy(
+    policy = CommandPolicy(
         CommandPermissionMode.AUTO,
         verification_commands=(spec,),
-    ).classify(spec.argv, workspace_root=repository)
+    )
+    classification = policy.classify(spec.argv, workspace_root=repository)
 
     assert classification.command_class is CommandClass.GENERAL
     assert classification.verification_kind is None
+    assert policy.is_verification_call(spec.argv, workspace_root=repository) is False
 
 
 def test_hash_bound_workspace_verifier_is_valid_only_while_unchanged(repository: Path) -> None:
@@ -378,10 +455,12 @@ def test_hash_bound_workspace_verifier_is_valid_only_while_unchanged(repository:
     assert (
         policy.classify(spec.argv, workspace_root=repository).command_class is CommandClass.VERIFIER
     )
+    assert policy.is_verification_call(spec.argv, workspace_root=repository) is True
 
     executable.write_bytes(b"rewritten launcher")
     classification = policy.classify(spec.argv, workspace_root=repository)
     assert classification.command_class is CommandClass.GENERAL
+    assert policy.is_verification_call(spec.argv, workspace_root=repository) is False
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable symlink policy")

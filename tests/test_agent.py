@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
+from coding_agent.budget import BudgetPolicy
 from coding_agent.completion import (
     CompletionContract,
     TargetRuntime,
@@ -257,6 +258,8 @@ def test_unknown_tool_failure_is_returned_to_the_model_as_an_observation() -> No
         "output_chars": 0,
         "truncated": False,
         "summary": None,
+        "observation_chars": len(result.messages[3].content or ""),
+        "observation_truncated": False,
     }
 
 
@@ -473,9 +476,7 @@ def test_protocol_correction_does_not_spend_a_step_or_tool_budget() -> None:
         [
             RecoverableModelResponseError("private-code", "private malformed response"),
             ModelResponse(
-                tool_calls=(
-                    ToolCall(id="echo-once", name="echo", arguments={"text": "recovered"}),
-                )
+                tool_calls=(ToolCall(id="echo-once", name="echo", arguments={"text": "recovered"}),)
             ),
             ModelResponse(content="Finished after one real tool call."),
         ]
@@ -487,7 +488,6 @@ def test_protocol_correction_does_not_spend_a_step_or_tool_budget() -> None:
         ToolRegistry([tool]),
         event_sink=events,
         max_steps=2,
-        max_total_tool_calls=1,
         max_model_retries=1,
     ).run("Recover, then use the sole tool budget")
 
@@ -510,9 +510,7 @@ def test_protocol_correction_does_not_spend_a_step_or_tool_budget() -> None:
 
 def test_exhausted_protocol_corrections_fail_without_tools_or_private_response_data() -> None:
     secret = "TEST_PRIVATE_PROTOCOL_FAILURE_SENTINEL"
-    model = OutcomeModel(
-        [RecoverableModelResponseError(secret, secret) for _ in range(3)]
-    )
+    model = OutcomeModel([RecoverableModelResponseError(secret, secret) for _ in range(3)])
     events = MemoryEventSink()
     delays: list[float] = []
 
@@ -709,6 +707,10 @@ class VerificationMarkerTool(BaseTool[ControlArgs]):
     name = "verification_marker"
     description = "Return trusted test verification evidence."
     args_model = ControlArgs
+
+    def _is_verification(self, arguments: ControlArgs) -> bool:
+        del arguments
+        return True
 
     def run(self, arguments: ControlArgs) -> ToolOutput:
         signal = VerificationSignal.PASSED if arguments.passed else VerificationSignal.FAILED
@@ -1226,7 +1228,6 @@ def test_runtime_limits_are_visible_to_the_model_and_run_started_event() -> None
         event_sink=events,
         max_steps=7,
         max_tool_calls_per_step=3,
-        max_total_tool_calls=11,
     ).run("Inspect the runtime limits")
 
     assert result.state is AgentState.COMPLETED_UNVERIFIED
@@ -1235,7 +1236,7 @@ def test_runtime_limits_are_visible_to_the_model_and_run_started_event() -> None
     assert system_message.content is not None
     assert "Maximum model turns: 7." in system_message.content
     assert "Maximum tool calls in one model response: 3." in system_message.content
-    assert "Maximum accepted tool calls across the run: 11." in system_message.content
+    assert "Maximum accepted tool calls across the run: 14." in system_message.content
     assert "split independent calls across turns" in system_message.content
     assert events.events[0].kind is EventKind.RUN_STARTED
     assert events.events[0].data == {
@@ -1243,9 +1244,145 @@ def test_runtime_limits_are_visible_to_the_model_and_run_started_event() -> None
         "limits": {
             "max_model_turns": 7,
             "max_calls_per_turn": 3,
-            "max_total_tool_calls": 11,
+            "max_total_tool_calls": 14,
         },
     }
+
+
+def test_total_tool_budget_scales_with_the_selected_model_turn_limit() -> None:
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        ScriptedModel([ModelResponse(content="No tools needed.")]),
+        ToolRegistry(),
+        event_sink=events,
+        max_steps=50,
+    ).run("Inspect a long-run budget")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert events.events[0].data["limits"] == {
+        "max_model_turns": 50,
+        "max_calls_per_turn": 8,
+        "max_total_tool_calls": 100,
+    }
+
+
+def test_reserved_turns_allow_verification_and_a_final_response() -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id=f"work-{index}",
+                        name="echo",
+                        arguments={"text": str(index)},
+                    ),
+                )
+            )
+            for index in range(3)
+        ]
+        + [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(id="verify-reserved", name="verification_marker", arguments={}),
+                )
+            ),
+            ModelResponse(content="Verified and complete."),
+        ]
+    )
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([EchoTool(), VerificationMarkerTool()]),
+        max_steps=5,
+        max_tool_calls_per_step=1,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Use the work budget, then verify")
+
+    assert result.state is AgentState.COMPLETED
+    assert result.steps == 5
+    verification_prompt = model.requests[3].messages[0].content or ""
+    final_prompt = model.requests[4].messages[0].content or ""
+    assert "[CODING_AGENT_CLOSEOUT]" in verification_prompt
+    assert "verification calls only" in verification_prompt
+    assert "[CODING_AGENT_CLOSEOUT]" in final_prompt
+    assert "Do not call tools" in final_prompt
+
+
+def test_reserved_verification_turn_rejects_more_work_without_executing_it() -> None:
+    echo = EchoTool()
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id=f"work-{index}",
+                        name="echo",
+                        arguments={"text": str(index)},
+                    ),
+                )
+            )
+            for index in range(4)
+        ]
+        + [ModelResponse(content="I could not verify within the reserved closeout.")]
+    )
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([echo, VerificationMarkerTool()]),
+        event_sink=events,
+        max_steps=5,
+        max_tool_calls_per_step=1,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Do not consume the verification reserve with more edits")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert len(echo.calls) == 3
+    rejected = [event for event in events.events if event.kind is EventKind.TOOL_BATCH_REJECTED]
+    assert len(rejected) == 1
+    assert rejected[0].data["reason"] == "verification_turn_requires_verifier"
+
+
+def test_model_facing_tool_observations_share_one_aggregate_turn_budget() -> None:
+    calls = tuple(
+        ToolCall(id=f"large-{index}", name="large_output", arguments={}) for index in range(4)
+    )
+    model = ScriptedModel(
+        [ModelResponse(tool_calls=calls), ModelResponse(content="Observed bounded results.")]
+    )
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([LargeOutputTool()]),
+        event_sink=events,
+        max_repeated_tool_results=5,
+    ).run("Return several large observations")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    finished = [event for event in events.events if event.kind is EventKind.TOOL_FINISHED]
+    assert len(finished) == 4
+    assert sum(int(event.data["observation_chars"]) for event in finished) < 48_000
+    assert all(event.data["observation_truncated"] is True for event in finished)
+    visible_results = [
+        message.content or ""
+        for message in model.requests[1].messages
+        if message.role is MessageRole.TOOL
+    ]
+    assert all("[observation truncated]" in content for content in visible_results)
 
 
 def test_duplicate_tool_call_id_is_rejected_before_a_second_side_effect() -> None:
@@ -1271,7 +1408,7 @@ def test_duplicate_tool_call_id_is_rejected_before_a_second_side_effect() -> Non
     assert result.messages[-1].tool_call_id == "echo-reused"
 
 
-def test_total_tool_call_limit_counts_successful_batches_across_steps() -> None:
+def test_total_tool_call_limit_rejects_a_batch_without_partial_execution() -> None:
     tool = EchoTool()
     model = ScriptedModel(
         [
@@ -1287,6 +1424,7 @@ def test_total_tool_call_limit_counts_successful_batches_across_steps() -> None:
                     ToolCall(id="echo-4", name="echo", arguments={"text": "four"}),
                 )
             ),
+            ModelResponse(content="Stopped after receiving the budget feedback."),
         ]
     )
     events = MemoryEventSink()
@@ -1295,14 +1433,18 @@ def test_total_tool_call_limit_counts_successful_batches_across_steps() -> None:
         model,
         ToolRegistry([tool]),
         event_sink=events,
-        max_tool_calls_per_step=2,
-        max_total_tool_calls=3,
+        budget_policy=BudgetPolicy(
+            max_model_turns=3,
+            max_calls_per_turn=2,
+            average_calls_per_turn=1,
+            verification_turn_reserve=0,
+            verification_call_reserve=0,
+        ),
     ).run("Exceed the cumulative tool budget")
 
-    assert result.state is AgentState.FAILED
-    assert result.stop_reason is StopReason.TOOL_LIMIT
-    assert result.steps == 2
-    assert result.error == "Model exceeded the total tool call limit: 4 > 3"
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.stop_reason is StopReason.FINAL_RESPONSE
+    assert result.steps == 3
     assert [call.text for call in tool.calls] == ["one", "two"]
     assert [message.role for message in result.messages] == [
         MessageRole.SYSTEM,
@@ -1313,7 +1455,10 @@ def test_total_tool_call_limit_counts_successful_batches_across_steps() -> None:
         MessageRole.ASSISTANT,
         MessageRole.TOOL,
         MessageRole.TOOL,
+        MessageRole.ASSISTANT,
     ]
     assert [event.kind for event in events.events].count(EventKind.TOOL_STARTED) == 2
     assert [event.kind for event in events.events].count(EventKind.TOOL_FINISHED) == 2
-    assert events.events[-1].data == {"stop_reason": StopReason.TOOL_LIMIT.value}
+    rejected = [event for event in events.events if event.kind is EventKind.TOOL_BATCH_REJECTED]
+    assert len(rejected) == 1
+    assert rejected[0].data["reason"] == "total_tool_calls_exhausted"

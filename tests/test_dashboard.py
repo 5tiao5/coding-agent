@@ -424,6 +424,23 @@ def test_projection_handles_missing_and_unknown_verification_status() -> None:
     )
     assert unknown.snapshot.verification_status == "unverified"
 
+    checks_only = DashboardProjection()
+    checks_only.apply(_event(EventKind.RUN_STARTED))
+    checks_only.apply(
+        _event(
+            EventKind.RUN_FINISHED,
+            step=1,
+            data={
+                "verified": False,
+                "status": "checks_only",
+                "evidence_labels": ["pytest"],
+            },
+        )
+    )
+    assert checks_only.snapshot.outcome == "UNVERIFIED"
+    assert checks_only.snapshot.verification_status == "checks_only"
+    assert checks_only.snapshot.verification_labels == ("pytest",)
+
 
 def test_verification_reports_replace_labels_and_stale_state_hides_old_evidence() -> None:
     projection = DashboardProjection(max_timeline=20)
@@ -612,6 +629,7 @@ def test_non_tty_sink_prints_stable_timeline_and_verified_card() -> None:
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
+        ("checks_only", "completion contract is incomplete"),
         ("missing", "No current trusted verification evidence"),
         ("failed", "latest trusted verification evidence failed"),
         ("stale", "workspace changed after the latest passing evidence"),

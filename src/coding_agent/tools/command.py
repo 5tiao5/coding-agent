@@ -103,6 +103,16 @@ class RunCommandTool(BaseTool[RunCommandArguments]):
         self._max_output_chars = max_output_chars
         self.output_budget_chars = max_output_chars
 
+    def _is_verification(self, arguments: RunCommandArguments) -> bool:
+        """Recognize only the exact verifier capability used by ``run`` itself."""
+
+        cwd = self._workspace.resolve(arguments.cwd, expected="directory")
+        return self._policy.is_verification_call(
+            tuple(arguments.argv),
+            cwd=cwd.relative,
+            workspace_root=self._workspace.root,
+        )
+
     def run(self, arguments: RunCommandArguments) -> ToolOutput:
         argv = tuple(arguments.argv)
         cwd = self._workspace.resolve(arguments.cwd, expected="directory")

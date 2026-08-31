@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from coding_agent.models import ToolCall, ToolExecution
-from coding_agent.plan import PlanError, PlanItem, PlanState, PlanStatus
+from coding_agent.plan import PlanError, PlanItem, PlanSnapshot, PlanState, PlanStatus
 from coding_agent.tools.base import ToolRegistry
 from coding_agent.tools.plan import UpdatePlanArguments, UpdatePlanTool
 
@@ -237,3 +237,66 @@ def test_tool_schema_rejects_hidden_reasoning_and_describes_a_full_snapshot() ->
                 ]
             }
         )
+
+
+def test_plan_snapshot_restore_preserves_revision_and_completed_item_monotonicity() -> None:
+    original = PlanState()
+    original.update(
+        (
+            _item("inspect", "Inspect files", PlanStatus.IN_PROGRESS),
+            _item("verify", "Run tests"),
+        )
+    )
+    original.update(
+        (
+            _item("inspect", "Inspect files", PlanStatus.COMPLETED),
+            _item("verify", "Run tests", PlanStatus.IN_PROGRESS),
+        )
+    )
+
+    snapshot = original.snapshot()
+    restored = PlanState()
+
+    assert snapshot.revision == 2
+    assert restored.restore(snapshot) == snapshot
+    assert restored.snapshot() == snapshot
+
+    with pytest.raises(PlanError) as regressed:
+        restored.update(
+            (
+                _item("inspect", "Inspect files", PlanStatus.PENDING),
+                _item("verify", "Run tests", PlanStatus.IN_PROGRESS),
+            )
+        )
+    assert regressed.value.code == "plan_completed_item_regressed"
+
+    with pytest.raises(PlanError) as repeated_restore:
+        restored.restore(snapshot)
+    assert repeated_restore.value.code == "plan_restore_conflict"
+
+
+def test_plan_snapshot_is_bounded_strict_and_has_one_valid_empty_state() -> None:
+    empty = PlanState().snapshot()
+
+    assert empty == PlanSnapshot(revision=0, items=())
+    assert PlanState().restore(empty) == empty
+
+    invalid = [
+        {"revision": 0, "items": [_item("inspect", "Inspect")]},
+        {"revision": 1, "items": []},
+        {
+            "revision": 1,
+            "items": [
+                _item("first", "First", PlanStatus.IN_PROGRESS),
+                _item("second", "Second", PlanStatus.IN_PROGRESS),
+            ],
+        },
+        {
+            "revision": 1,
+            "items": [_item("same", "First"), _item("same", "Second")],
+        },
+        {"revision": 0, "items": [], "reasoning": "must not persist"},
+    ]
+    for payload in invalid:
+        with pytest.raises(ValidationError):
+            PlanSnapshot.model_validate(payload)

@@ -50,6 +50,25 @@ class BaseTool(ABC, Generic[ArgsT]):
         )
 
     def invoke(self, arguments: dict[str, object]) -> ToolOutput:
+        return self.run(self._validated_arguments(arguments))
+
+    def _is_verification(self, arguments: ArgsT) -> bool:
+        """Pure preflight hook; implementations must not execute or consume state."""
+
+        del arguments
+        return False
+
+    def classifies_as_verification(self, arguments: dict[str, object]) -> bool:
+        """Validate an inert call and fail closed at the classification boundary."""
+
+        try:
+            parsed = self._validated_arguments(arguments)
+            classified = self._is_verification(parsed)
+        except (CodedError, OSError, RuntimeError, ValueError):
+            return False
+        return classified is True
+
+    def _validated_arguments(self, arguments: dict[str, object]) -> ArgsT:
         unexpected = sorted(set(arguments).difference(self.args_model.model_fields))
         if unexpected:
             joined = ", ".join(unexpected)
@@ -58,7 +77,7 @@ class BaseTool(ABC, Generic[ArgsT]):
             parsed = self.args_model.model_validate(arguments)
         except ValidationError as exc:
             raise ToolError("invalid_arguments", str(exc)) from exc
-        return self.run(parsed)
+        return parsed
 
     @abstractmethod
     def run(self, arguments: ArgsT) -> ToolOutput:
@@ -94,6 +113,14 @@ class ToolRegistry:
 
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(tool.spec for tool in self._tools.values())
+
+    def is_verification_call(self, call: ToolCall) -> bool:
+        """Classify without executing, approving, or consuming a tool call."""
+
+        tool = self._tools.get(call.name)
+        if tool is None:
+            return False
+        return tool.classifies_as_verification(call.arguments)
 
     def execute(self, call: ToolCall) -> ToolExecution:
         started = perf_counter()

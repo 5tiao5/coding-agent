@@ -809,7 +809,7 @@ def test_live_cli_help_discloses_the_stateless_reasoning_limit() -> None:
         ("resume", "model turns, including completed turns"),
     ],
 )
-def test_max_steps_help_separates_model_turns_from_fixed_tool_budgets(
+def test_max_steps_help_explains_the_coupled_tool_budget(
     command: str,
     scope: str,
 ) -> None:
@@ -823,7 +823,8 @@ def test_max_steps_help_separates_model_turns_from_fixed_tool_budgets(
     if command == "resume":
         assert "Maximum cumulative" in plain_output
     assert "8 tool calls per turn" in plain_output
-    assert "40 per" in plain_output
+    assert "2 calls per model turn" in plain_output
+    assert "minimum 8" in plain_output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv launchers are symlinks")

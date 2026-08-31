@@ -132,6 +132,23 @@ def test_tool_schema_and_runtime_both_reject_extra_arguments() -> None:
     assert "unexpected" in execution.error_message
 
 
+def test_ordinary_and_unknown_tools_never_claim_the_verification_reserve() -> None:
+    registry = ToolRegistry([TextTool()])
+
+    assert (
+        registry.is_verification_call(
+            ToolCall(id="ordinary", name="text", arguments={"text": "pytest passed"})
+        )
+        is False
+    )
+    assert (
+        registry.is_verification_call(
+            ToolCall(id="unknown", name="missing", arguments={"text": "pytest passed"})
+        )
+        is False
+    )
+
+
 def test_non_string_tool_output_becomes_an_invalid_output_result() -> None:
     execution = ToolRegistry([NonStringTool()]).execute(
         ToolCall(id="non-string-1", name="non_string", arguments={"text": "hello"})

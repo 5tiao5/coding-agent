@@ -366,6 +366,25 @@ class CommandPolicy:
                 )
         return self._general_or_require_approval(approved=approved)
 
+    def is_verification_call(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = ".",
+        workspace_root: Path | None = None,
+    ) -> bool:
+        """Check an exact registered verifier without granting or requesting approval."""
+
+        try:
+            classification = self.classify(
+                argv,
+                cwd=cwd,
+                workspace_root=workspace_root,
+            )
+        except (CommandError, OSError, RuntimeError, ValueError):
+            return False
+        return classification.command_class is CommandClass.VERIFIER
+
     def _general_or_require_approval(self, *, approved: bool) -> CommandClassification:
         if self._mode is CommandPermissionMode.SAFE and not approved:
             raise CommandError(

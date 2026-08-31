@@ -641,6 +641,9 @@ function verificationCopy(status, outcome) {
   if (status === "stale") {
     return { detail: "上次检查通过后代码又发生了变更", label: "已过期", tone: "stale" };
   }
+  if (status === "checks_only") {
+    return { detail: "已配置检查通过，但任务验收范围仍不完整", label: "部分验证", tone: "stale" };
+  }
   if (status === "missing" || outcome === "UNVERIFIED") {
     return { detail: "没有最新的通过证据", label: "未验证", tone: "missing" };
   }

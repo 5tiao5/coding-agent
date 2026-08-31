@@ -100,7 +100,10 @@ def test_resume_never_replays_tools_and_requires_fresh_verification(tmp_path: Pa
     assert resumed_tool.calls == 0
     assert len(resumed_model.requests) == 1
     resumed_messages = resumed_model.requests[0].messages
-    assert resumed_messages[1:] == loaded.checkpoint.messages[1:]
+    assert resumed_messages[1] == loaded.checkpoint.messages[1]
+    assert resumed_messages[3:] == loaded.checkpoint.messages[2:]
+    assert "[host-owned run memory" in (resumed_messages[2].content or "")
+    assert '"stale":true' in (resumed_messages[2].content or "")
     assert resumed_messages[0].content is not None
     assert "Maximum model turns: 20." in resumed_messages[0].content
     assert "Maximum model turns: 1." not in resumed_messages[0].content
@@ -224,7 +227,6 @@ def test_rejected_batch_checkpoint_resumes_with_feedback_and_current_limits(
         event_sink=events,
         max_steps=4,
         max_tool_calls_per_step=2,
-        max_total_tool_calls=5,
     ).resume(loaded)
 
     assert resumed.state is AgentState.COMPLETED
@@ -233,13 +235,13 @@ def test_rejected_batch_checkpoint_resumes_with_feedback_and_current_limits(
     assert visible_prompt is not None
     assert "Maximum model turns: 4." in visible_prompt
     assert "Maximum tool calls in one model response: 2." in visible_prompt
-    assert "Maximum accepted tool calls across the run: 5." in visible_prompt
+    assert "Maximum accepted tool calls across the run: 8." in visible_prompt
     assert "Maximum model turns: 2." not in visible_prompt
     assert events.events[0].kind is EventKind.RUN_RESUMED
     assert events.events[0].data["limits"] == {
         "max_model_turns": 4,
         "max_calls_per_turn": 2,
-        "max_total_tool_calls": 5,
+        "max_total_tool_calls": 8,
     }
     terminal = store.load(resumed.run_id).checkpoint
     assert terminal.completed_tool_calls == 1

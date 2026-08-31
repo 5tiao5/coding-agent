@@ -14,5 +14,8 @@ class ToolDispatcher(Protocol):
     def specs(self) -> Sequence[ToolSpec]:
         """Describe tools exposed to the model."""
 
+    def is_verification_call(self, call: ToolCall) -> bool:
+        """Return whether a call exactly matches a host-granted verifier."""
+
     def execute(self, call: ToolCall) -> ToolExecution:
         """Execute one validated tool call."""

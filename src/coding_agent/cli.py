@@ -163,8 +163,9 @@ def evaluate_agent(
         min=1,
         max=20,
         help=(
-            "Maximum model turns per evaluation case; does not change the fixed budgets "
-            "of 8 tool calls per turn and 40 per case."
+            "Maximum model turns per evaluation case; tool batches stay capped at 8 "
+            "tool calls per turn, while cumulative capacity scales at 2 calls per "
+            "model turn (minimum 8)."
         ),
     ),
     model_timeout: float = typer.Option(90.0, "--model-timeout", min=1.0, max=600.0),
@@ -331,8 +332,9 @@ def web_console(
         min=1,
         max=100,
         help=(
-            "Maximum model turns per live Web run; does not change the fixed budgets of "
-            "8 tool calls per turn and 40 per run."
+            "Maximum model turns per live Web run; tool batches stay capped at 8 tool "
+            "calls per turn, while cumulative capacity scales at 2 calls per model "
+            "turn (minimum 8)."
         ),
     ),
     model_timeout: float = typer.Option(
@@ -489,8 +491,9 @@ def run_task(
         min=1,
         max=100,
         help=(
-            "Maximum model turns for the complete run; does not change the fixed budgets "
-            "of 8 tool calls per turn and 40 per run."
+            "Maximum model turns for the complete run; tool batches stay capped at 8 "
+            "tool calls per turn, while cumulative capacity scales at 2 calls per "
+            "model turn (minimum 8)."
         ),
     ),
     model_timeout: float = typer.Option(
@@ -590,8 +593,9 @@ def resume_task(
         min=1,
         max=100,
         help=(
-            "Maximum cumulative model turns, including completed turns; does not change "
-            "the fixed budgets of 8 tool calls per turn and 40 per run."
+            "Maximum cumulative model turns, including completed turns; tool batches "
+            "stay capped at 8 tool calls per turn, while cumulative capacity scales at "
+            "2 calls per model turn (minimum 8)."
         ),
     ),
     model_timeout: float = typer.Option(

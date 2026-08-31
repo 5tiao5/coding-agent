@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from coding_agent.models import ChatMessage, MessageRole, StopReason, ToolCall
+from coding_agent.models import (
+    ChatMessage,
+    MessageRole,
+    StopReason,
+    ToolCall,
+    VerificationKind,
+)
+from coding_agent.run_memory import RunMemorySnapshot, VerificationMemoryFact
 from coding_agent.session import (
     SessionBoundary,
     SessionCheckpoint,
@@ -47,6 +54,7 @@ def _checkpoint(
     completed_steps: int = 1,
     completed_tool_calls: int = 1,
     secret_arguments: dict[str, object] | None = None,
+    run_memory: RunMemorySnapshot | None = None,
 ) -> SessionCheckpoint:
     transcript = messages or _tool_transcript(secret_arguments=secret_arguments)
     return SessionCheckpoint(
@@ -56,6 +64,7 @@ def _checkpoint(
         messages=transcript,
         completed_steps=completed_steps,
         completed_tool_calls=completed_tool_calls,
+        run_memory=run_memory or RunMemorySnapshot(revision=0),
         stop_boundary=SessionBoundary.READY_FOR_MODEL,
     )
 
@@ -73,8 +82,13 @@ def test_checkpoint_round_trip_is_passive_and_requires_fresh_verification(tmp_pa
     assert loaded.requires_reverification is True
     assert loaded.auto_replay_tool_calls is False
     payload = json.loads(saved.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
-    assert "verification" not in saved.read_text(encoding="utf-8")
+    assert payload["schema_version"] == 3
+    assert loaded.source_schema_version == 3
+    assert loaded.schema_migrated is False
+    assert loaded.checkpoint.completed_work_tool_calls == 1
+    assert loaded.checkpoint.completed_verification_tool_calls == 0
+    assert "verification_evidence" not in saved.read_text(encoding="utf-8")
+    assert "verification_report" not in saved.read_text(encoding="utf-8")
     assert "environment" not in payload
 
 
@@ -117,7 +131,7 @@ def test_checkpoint_counts_only_tool_calls_that_were_accepted_for_execution(
     store.save(checkpoint)
     loaded = store.load(checkpoint.run_id).checkpoint
 
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert loaded.completed_steps == 1
     assert loaded.completed_tool_calls == 0
     assert loaded.messages == messages
@@ -148,6 +162,86 @@ def test_checkpoint_still_counts_a_real_failed_tool_execution() -> None:
     checkpoint = _checkpoint(messages=messages, completed_tool_calls=1)
 
     assert checkpoint.completed_tool_calls == 1
+    assert checkpoint.completed_work_tool_calls == 1
+    assert checkpoint.completed_verification_tool_calls == 0
+
+
+def test_checkpoint_classified_call_counts_must_sum_to_the_compatible_total() -> None:
+    base = _checkpoint().model_dump(mode="python")
+    classified = SessionCheckpoint.model_validate(
+        {
+            **base,
+            "completed_work_tool_calls": 0,
+            "completed_verification_tool_calls": 1,
+        }
+    )
+
+    assert classified.completed_tool_calls == 1
+    assert classified.completed_work_tool_calls == 0
+    assert classified.completed_verification_tool_calls == 1
+
+    with pytest.raises(ValidationError, match="sum to completed_tool_calls"):
+        SessionCheckpoint.model_validate(
+            {
+                **base,
+                "completed_work_tool_calls": 1,
+                "completed_verification_tool_calls": 1,
+            }
+        )
+
+
+def test_checkpoint_persists_only_historical_verification_facts_and_load_marks_them_stale(
+    tmp_path: Path,
+) -> None:
+    memory = RunMemorySnapshot(
+        revision=1,
+        verification_facts=(
+            VerificationMemoryFact(
+                label="pytest",
+                kind=VerificationKind.TEST,
+                passed=True,
+                step=1,
+                stale=False,
+            ),
+        ),
+    )
+    checkpoint = _checkpoint(run_id="memory-v3", run_memory=memory)
+    store = SessionStore(tmp_path / "state")
+
+    saved = store.save(checkpoint)
+    persisted = json.loads(saved.read_text(encoding="utf-8"))
+    loaded = store.load(checkpoint.run_id)
+
+    assert persisted["run_memory"]["verification_facts"][0]["stale"] is False
+    assert loaded.checkpoint.run_memory.verification_facts[0].stale is True
+    assert loaded.checkpoint.run_memory.revision == memory.revision + 1
+    assert loaded.verification_evidence_restored is False
+    assert loaded.requires_reverification is True
+
+
+def test_store_migrates_v2_to_v3_in_memory_without_rewriting_or_inventing_evidence(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    legacy = _checkpoint(run_id="legacy-v2").model_dump(mode="json", exclude_none=True)
+    legacy["schema_version"] = 2
+    legacy.pop("run_memory")
+    legacy.pop("completed_work_tool_calls")
+    legacy.pop("completed_verification_tool_calls")
+    target = state / "legacy-v2.json"
+    original = json.dumps(legacy, sort_keys=True)
+    target.write_text(original, encoding="utf-8")
+
+    loaded = SessionStore(state).load("legacy-v2")
+
+    assert loaded.source_schema_version == 2
+    assert loaded.schema_migrated is True
+    assert loaded.checkpoint.schema_version == 3
+    assert loaded.checkpoint.run_memory == RunMemorySnapshot(revision=0)
+    assert loaded.checkpoint.completed_work_tool_calls == loaded.checkpoint.completed_tool_calls
+    assert loaded.checkpoint.completed_verification_tool_calls == 0
+    assert target.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.parametrize(

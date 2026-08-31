@@ -26,6 +26,7 @@ from coding_agent.completion import (
 from coding_agent.models import VerificationKind
 from coding_agent.mutation import MutationSession
 from coding_agent.plan import PlanState
+from coding_agent.run_memory import RunMemory
 from coding_agent.tools import (
     ListFilesTool,
     ReadFileTool,
@@ -44,6 +45,7 @@ from coding_agent.workspace import Workspace
 class RuntimeComponents:
     workspace: Workspace
     mutation_session: MutationSession
+    run_memory: RunMemory
     plan_state: PlanState
     tools: ToolRegistry
     verification_commands: tuple[VerificationCommandSpec, ...]
@@ -92,7 +94,8 @@ def build_runtime(
 ) -> RuntimeComponents:
     workspace = Workspace(root)
     mutation_session = MutationSession(workspace)
-    plan_state = PlanState()
+    run_memory = RunMemory()
+    plan_state = run_memory.plan_state
     verifiers = (
         (default_pytest_verifier(root),)
         if verification_commands is None
@@ -142,6 +145,7 @@ def build_runtime(
     return RuntimeComponents(
         workspace=workspace,
         mutation_session=mutation_session,
+        run_memory=run_memory,
         plan_state=plan_state,
         tools=tools,
         verification_commands=verifiers,

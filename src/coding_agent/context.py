@@ -10,6 +10,11 @@ from hashlib import sha256
 from typing import cast
 
 from coding_agent.models import ChatMessage, MessageRole, ToolSpec
+from coding_agent.run_memory import RunMemorySnapshot
+
+_RUN_MEMORY_HEADER = (
+    "[host-owned run memory: explicit facts only; verification facts marked stale must be rerun]"
+)
 
 
 class ContextError(ValueError):
@@ -83,29 +88,38 @@ class ContextManager:
         self,
         transcript: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] = (),
+        *,
+        memory: RunMemorySnapshot | None = None,
     ) -> PreparedContext:
         """Return a bounded model view without modifying ``transcript``."""
 
         canonical = tuple(message for message in transcript)
         anchors, blocks = _split_transcript(canonical)
+        memory_messages = _memory_messages(memory)
+        prepared_anchors = (*anchors, *memory_messages)
         tool_chars = tool_spec_char_count(tools)
         original_chars = context_char_count(canonical) + tool_chars
-        anchor_chars = context_char_count(anchors) + tool_chars
+        anchor_chars = context_char_count(prepared_anchors) + tool_chars
         if anchor_chars > self._max_chars:
             raise ContextBudgetError(
                 "context_anchor_exceeds_budget",
                 f"context anchors require {anchor_chars} characters; budget is {self._max_chars}",
             )
 
-        if original_chars <= self._max_chars:
-            model_view = tuple(message for message in canonical)
+        uncompacted_view = (
+            *prepared_anchors,
+            *(message for block in blocks for message in block.messages),
+        )
+        uncompacted_chars = context_char_count(uncompacted_view) + tool_chars
+        if uncompacted_chars <= self._max_chars:
+            model_view = tuple(uncompacted_view)
             return PreparedContext(
                 canonical_transcript=canonical,
                 model_view=model_view,
                 metadata=ContextMetadata(
                     compacted=False,
                     original=original_chars,
-                    prepared=original_chars,
+                    prepared=uncompacted_chars,
                     compacted_blocks=0,
                 ),
             )
@@ -120,7 +134,7 @@ class ContextManager:
                 message for block in recent_blocks for message in block.messages
             )
             for summary in _summary_variants(old_blocks):
-                candidate = (*anchors, summary, *recent_messages)
+                candidate = (*prepared_anchors, summary, *recent_messages)
                 prepared_chars = context_char_count(candidate) + tool_chars
                 if prepared_chars <= self._max_chars:
                     return PreparedContext(
@@ -138,6 +152,17 @@ class ContextManager:
             "context_compaction_exceeds_budget",
             "context anchors fit, but the budget cannot represent compacted tool facts",
         )
+
+
+def _memory_messages(memory: RunMemorySnapshot | None) -> tuple[ChatMessage, ...]:
+    if memory is None or memory.revision == 0:
+        return ()
+    return (
+        ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=f"{_RUN_MEMORY_HEADER}\n{memory.canonical_json()}",
+        ),
+    )
 
 
 def context_char_count(messages: Sequence[ChatMessage]) -> int:

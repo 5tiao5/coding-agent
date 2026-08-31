@@ -108,7 +108,10 @@ def run_repository_demo(
         model or repository_demo_model(),
         runtime.tools,
         event_sink=event_sink,
-        max_steps=12,
+        max_steps=13,
+        run_memory=runtime.run_memory,
+        verification_profile=runtime.verification_profile,
+        completion_contract=runtime.completion_contract,
     )
     result = runner.run(DEMO_TASK, run_id=run_id)
     source_matches_expected = root.joinpath(DEMO_SOURCE_PATH).read_bytes() == DEMO_SOURCE_AFTER

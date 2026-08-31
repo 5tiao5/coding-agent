@@ -1,8 +1,8 @@
 """Versioned, bounded checkpoints for explicit session resume.
 
-The store is deliberately passive: loading a checkpoint returns data only.  It never
-executes or replays a tool call, and verification evidence is intentionally outside the
-persisted schema so a resumed run must establish fresh evidence.
+The store is deliberately passive: loading a checkpoint returns data only. It never
+executes or replays a tool call. Historical verifier facts may be retained for orientation,
+but trusted verification evidence remains outside the schema and every loaded fact is stale.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import suppress
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Self
+from typing import Any, Literal, Self, cast
 from uuid import uuid4
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -24,8 +24,10 @@ from pydantic import ConfigDict, Field, ValidationError, field_validator, model_
 from coding_agent.errors import CodedError
 from coding_agent.models import ChatMessage, FrozenModel, MessageRole, StopReason, ToolCall
 from coding_agent.run_id import require_run_id
+from coding_agent.run_memory import RunMemorySnapshot
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
+_OLDEST_SUPPORTED_SESSION_SCHEMA_VERSION = 2
 DEFAULT_MAX_CHECKPOINT_BYTES = 2_000_000
 _TOOL_BATCH_REJECTED_ERROR_CODE = "tool_batch_rejected"
 
@@ -77,7 +79,7 @@ class SessionCheckpoint(FrozenModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     run_id: str = Field(min_length=1, max_length=64)
     workspace_fingerprint: str | None = Field(
         default=None,
@@ -88,8 +90,25 @@ class SessionCheckpoint(FrozenModel):
     messages: tuple[ChatMessage, ...] = Field(min_length=2)
     completed_steps: int = Field(ge=0)
     completed_tool_calls: int = Field(ge=0)
+    completed_work_tool_calls: int = Field(default=0, ge=0)
+    completed_verification_tool_calls: int = Field(default=0, ge=0)
+    run_memory: RunMemorySnapshot = Field(default_factory=lambda: RunMemorySnapshot(revision=0))
     stop_boundary: SessionBoundary
     stop_reason: StopReason | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_compatible_call_classification(cls, value: Any) -> Any:
+        """Treat an old caller's unclassified total conservatively as work."""
+
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        if "completed_work_tool_calls" not in payload:
+            payload["completed_work_tool_calls"] = payload.get("completed_tool_calls", 0)
+        if "completed_verification_tool_calls" not in payload:
+            payload["completed_verification_tool_calls"] = 0
+        return payload
 
     @field_validator("run_id")
     @classmethod
@@ -117,6 +136,13 @@ class SessionCheckpoint(FrozenModel):
             raise ValueError("completed_steps does not match the canonical transcript")
         if self.completed_tool_calls != completed_tool_calls:
             raise ValueError("completed_tool_calls does not match the canonical transcript")
+        if (
+            self.completed_work_tool_calls + self.completed_verification_tool_calls
+            != self.completed_tool_calls
+        ):
+            raise ValueError(
+                "completed work and verification tool calls must sum to completed_tool_calls"
+            )
 
         last = self.messages[-1]
         if self.stop_boundary is SessionBoundary.READY_FOR_MODEL:
@@ -139,6 +165,8 @@ class LoadedSession(FrozenModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     checkpoint: SessionCheckpoint
+    source_schema_version: Literal[2, 3] = 3
+    schema_migrated: bool = False
     verification_evidence_restored: Literal[False] = False
     requires_reverification: Literal[True] = True
     auto_replay_tool_calls: Literal[False] = False
@@ -245,16 +273,23 @@ class SessionStore:
             raise SessionError("checkpoint_corrupt", "checkpoint root must be a JSON object")
 
         version = decoded.get("schema_version")
-        if type(version) is not int or version != SESSION_SCHEMA_VERSION:
+        if type(version) is not int or not (
+            _OLDEST_SUPPORTED_SESSION_SCHEMA_VERSION <= version <= SESSION_SCHEMA_VERSION
+        ):
             raise SessionError(
                 "checkpoint_version",
                 "checkpoint schema version is not supported",
-                metadata={"supported_version": SESSION_SCHEMA_VERSION},
+                metadata={
+                    "supported_version": SESSION_SCHEMA_VERSION,
+                    "oldest_supported_version": _OLDEST_SUPPORTED_SESSION_SCHEMA_VERSION,
+                },
             )
         _reject_unsafe_payload(decoded)
         _reject_unknown_nested_fields(decoded)
+        source_version = cast(Literal[2, 3], version)
+        migrated = _migrate_checkpoint_payload(decoded, source_version=source_version)
         try:
-            checkpoint = SessionCheckpoint.model_validate(decoded)
+            checkpoint = SessionCheckpoint.model_validate(migrated)
         except ValidationError as exc:
             raise SessionError(
                 "checkpoint_corrupt",
@@ -266,7 +301,14 @@ class SessionStore:
                 "checkpoint run ID does not match its filename",
             )
         self._require_matching_workspace(checkpoint)
-        return LoadedSession(checkpoint=checkpoint)
+        resumed_memory = checkpoint.run_memory.with_stale_verification()
+        if resumed_memory is not checkpoint.run_memory:
+            checkpoint = checkpoint.model_copy(update={"run_memory": resumed_memory})
+        return LoadedSession(
+            checkpoint=checkpoint,
+            source_schema_version=source_version,
+            schema_migrated=source_version != SESSION_SCHEMA_VERSION,
+        )
 
     def _require_matching_workspace(self, checkpoint: SessionCheckpoint) -> None:
         expected = self._workspace_fingerprint
@@ -417,6 +459,37 @@ def workspace_fingerprint(root: Path) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return sha256(payload).hexdigest()
+
+
+def _migrate_checkpoint_payload(
+    payload: dict[str, object],
+    *,
+    source_version: int,
+) -> dict[str, object]:
+    """Return a validated-version candidate without rewriting the checkpoint file."""
+
+    if source_version == SESSION_SCHEMA_VERSION:
+        return payload
+    if source_version != 2:  # pragma: no cover - load checks the supported interval first.
+        raise SessionError("checkpoint_version", "checkpoint schema version is not supported")
+
+    v3_only_fields = {
+        "completed_work_tool_calls",
+        "completed_verification_tool_calls",
+        "run_memory",
+    }
+    if v3_only_fields.intersection(payload):
+        raise SessionError(
+            "checkpoint_corrupt",
+            "version 2 checkpoint contains fields from a newer schema",
+        )
+    migrated = dict(payload)
+    migrated["schema_version"] = SESSION_SCHEMA_VERSION
+    completed = migrated.get("completed_tool_calls")
+    migrated["completed_work_tool_calls"] = completed if type(completed) is int else 0
+    migrated["completed_verification_tool_calls"] = 0
+    migrated["run_memory"] = RunMemorySnapshot(revision=0).model_dump(mode="json")
+    return migrated
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

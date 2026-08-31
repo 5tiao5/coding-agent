@@ -72,21 +72,31 @@ This prevents a pretty UI, stale trace, or loaded JSON file from becoming an acc
 
 The core runs one tool call at a time. Filesystem mutations are order-dependent; concurrency is not added until a tool is proven read-only and the gain justifies the extra failure states.
 
-## Run budgets and oversized batches
+## Coupled run budgets and oversized batches
 
-The loop has three independent bounds: 20 model-decision turns by default, at most eight declared
-tool calls in one model response, and at most 40 tool calls across the run. `--max-steps` changes only
-the first bound. The live `run` and `web` hosts accept 1–100 turns, `resume` interprets the value as a
-cumulative turn ceiling, and live evaluation accepts 1–20 turns per case. Neither CLI nor browser
-configuration raises the per-turn or total tool budgets.
+`BudgetPolicy` couples the cumulative call ceiling to the model-turn budget:
+`max(8, 2 × max-model-turns)` by default. The per-response burst ceiling remains eight calls. Live
+`run` and `web` accept 1–100 turns, `resume` treats the value as a cumulative ceiling, and live
+evaluation accepts 1–20 turns per case. With a completion contract, separate work and verification
+lanes preserve registered-verifier capacity plus a final-response turn. A verifier occupies that
+lane only when its exact host-registered argv, cwd, and executable identity match before execution.
 
 A response may declare several independent tool calls, but the registry still executes them in
 order. An oversized batch is rejected atomically before any prefix executes. The loop appends a
 bounded error result for every declared call and gives the model a bounded opportunity to resubmit
 smaller batches on later turns. This preserves provider transcript invariants, avoids partially
 applying an arbitrary prefix of mutations, and lets a multi-file task progress without requiring the
-user to split it into separate prompts. The resubmitted calls remain subject to the 40-call total and
-the remaining model-turn budget.
+user to split it into separate prompts. Cumulative exhaustion is a recoverable rejected observation,
+so the model can use its remaining turn to verify or report incomplete work honestly. Every accepted
+assistant/tool block also shares one 48,000-character observation envelope before entering model
+context; trusted control facts and trace metrics continue to use the unabridged host result.
+
+`RunMemory` preserves only bounded explicit facts across compaction and resume: the observable plan,
+coalesced file-change metadata, recent failed-command identities, and historical verifier outcomes.
+It never stores raw command output, file contents, diffs, or model reasoning. Session schema v3
+persists this snapshot and classified budget usage; v2 checkpoints migrate conservatively, and every
+restored verifier fact is marked stale. The fresh `VerificationLedger` remains the sole completion
+authority.
 
 ## CLI and loopback Web hosts
 

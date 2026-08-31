@@ -80,23 +80,25 @@ catalogued.
 
 ### Run budgets
 
-`--max-steps` limits model-decision turns, not files or tool calls. Increasing it gives the model
-more opportunities to observe results and decide what to do next; it does **not** enlarge the fixed
-tool budgets.
+`--max-steps` limits model-decision turns, not files. Increasing it also scales the cumulative tool
+capacity to `max(8, 2 × max-steps)`, while the atomic per-turn ceiling remains eight calls. When a
+completion contract is active, the host protects closing capacity for registered verification and
+one honest final response.
 
 | Host | Model-turn budget | Tool-call budget |
 |---|---|---|
-| `run` / live `web` | 20 by default; `--max-steps` accepts 1–100 | 8 per turn, 40 per run (fixed) |
-| `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | 8 per turn, 40 cumulative calls (fixed) |
-| live `evaluate` | 12 per case by default; `--max-steps` accepts 1–20 | 8 per turn, 40 per case (fixed) |
-| deterministic CLI/Web demo | 12 fixed turns | 8 per turn, 40 per run (fixed) |
+| `run` / live `web` | 20 by default; `--max-steps` accepts 1–100 | 8 per turn; `max(8, 2 × turns)` cumulative |
+| `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | same formula, including restored calls |
+| live `evaluate` | 12 per case by default; `--max-steps` accepts 1–20 | 8 per turn; 24 cumulative by default |
+| deterministic CLI/Web demo | 13 turns | 8 per turn; 26 cumulative |
 
 One model turn may declare several independent tools, which the Agent executes sequentially. If a
 model proposes more than eight at once, the Agent rejects the whole oversized batch before any of
 its calls execute, returns bounded feedback, and lets the model automatically resubmit the work in
-smaller batches. A multi-file task therefore does not need to be split into separate user prompts;
-it still has to fit within the model-turn and 40-call run budgets. For Web, `--max-steps` is selected
-when the local server starts and applies to its live runs; the browser cannot override it per task.
+smaller batches. Cumulative exhaustion is also recoverable: the model receives bounded feedback and
+can close honestly instead of losing the whole run after an already useful batch. For Web,
+`--max-steps` is selected when the local server starts and applies to its live runs; the browser
+cannot override it per task.
 
 ### Opt-in live evaluation
 
