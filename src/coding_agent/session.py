@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from coding_agent.agent_protocol import is_early_final_correction
 from coding_agent.errors import CodedError
 from coding_agent.models import ChatMessage, FrozenModel, MessageRole, StopReason, ToolCall
 from coding_agent.run_id import require_run_id
@@ -386,8 +387,11 @@ def _validate_closed_turns(messages: Sequence[ChatMessage]) -> tuple[int, int]:
         cursor += 1
 
         if not assistant.tool_calls:
-            if cursor != len(messages):
+            if cursor == len(messages):
+                continue
+            if not is_early_final_correction(messages[cursor]):
                 raise ValueError("a final assistant message must end the canonical transcript")
+            cursor += 1
             continue
 
         for call in assistant.tool_calls:

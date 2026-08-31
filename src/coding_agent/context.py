@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import cast
 
+from coding_agent.agent_protocol import is_early_final_correction
 from coding_agent.models import ChatMessage, MessageRole, ToolSpec
 from coding_agent.run_memory import RunMemorySnapshot
 
@@ -224,10 +225,17 @@ def _split_transcript(
                 f"expected an assistant tool-call block at index {cursor}",
             )
         if not assistant.tool_calls:
-            raise ContextTranscriptError(
-                "context_standalone_assistant",
-                f"assistant message at index {cursor} has no tool calls",
-            )
+            correction_index = cursor + 1
+            if correction_index >= len(transcript) or not is_early_final_correction(
+                transcript[correction_index]
+            ):
+                raise ContextTranscriptError(
+                    "context_standalone_assistant",
+                    f"assistant message at index {cursor} has no tool calls",
+                )
+            blocks.append(_ToolBlock(messages=(assistant, transcript[correction_index])))
+            cursor = correction_index + 1
+            continue
 
         call_ids = tuple(call.id for call in assistant.tool_calls)
         if len(set(call_ids)) != len(call_ids):
@@ -262,7 +270,12 @@ def _split_transcript(
 
 
 def _summary_variants(blocks: Sequence[_ToolBlock]) -> tuple[ChatMessage, ...]:
-    facts = tuple(_extract_tool_fact(message) for block in blocks for message in block.messages[1:])
+    facts = tuple(
+        _extract_tool_fact(message)
+        for block in blocks
+        if block.messages[0].tool_calls
+        for message in block.messages[1:]
+    )
     successful = sum(fact.ok is True for fact in facts)
     failed = sum(fact.ok is False for fact in facts)
     unknown = len(facts) - successful - failed

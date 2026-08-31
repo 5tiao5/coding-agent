@@ -105,6 +105,13 @@ class PlanState:
 
         return PlanSnapshot(items=self._items, revision=self._revision)
 
+    def reset(self) -> PlanSnapshot:
+        """Clear one run's plan while preserving the shared state object identity."""
+
+        self._items = ()
+        self._revision = 0
+        return self.snapshot()
+
     def restore(self, snapshot: PlanSnapshot) -> PlanSnapshot:
         """Restore one snapshot into a pristine state without replaying updates."""
 

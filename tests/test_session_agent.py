@@ -50,6 +50,49 @@ class CountingVerifyTool(BaseTool[VerifyArguments]):
         )
 
 
+class CountingMemoryWriteTool(BaseTool[VerifyArguments]):
+    name = "write_file"
+    description = "Record one deterministic file mutation for checkpoint tests."
+    args_model = VerifyArguments
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, arguments: VerifyArguments) -> ToolOutput:
+        del arguments
+        self.calls += 1
+        return ToolOutput(
+            content="created src/persisted.py",
+            summary="Created persisted fixture",
+            metadata={
+                "path": "src/persisted.py",
+                "change_id": "chg_0001_persisted",
+                "changed": True,
+                "change_kind": "create",
+                "before_sha256": None,
+                "after_sha256": "b" * 64,
+                "added_lines": 1,
+                "removed_lines": 0,
+                "mutation_revision": 1,
+            },
+            control=ToolControlFacts(invalidates_verification=True, made_progress=True),
+        )
+
+
+class InterruptingCheckpointTool(BaseTool[VerifyArguments]):
+    name = "interrupt_fixture"
+    description = "Interrupt after an earlier call in an accepted batch."
+    args_model = VerifyArguments
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, arguments: VerifyArguments) -> ToolOutput:
+        del arguments
+        self.calls += 1
+        raise KeyboardInterrupt
+
+
 def test_initial_checkpoint_makes_a_first_model_failure_resumable(tmp_path: Path) -> None:
     store = SessionStore((tmp_path / "state").resolve())
 
@@ -64,6 +107,60 @@ def test_initial_checkpoint_makes_a_first_model_failure_resumable(tmp_path: Path
     assert loaded.checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
     assert loaded.checkpoint.completed_steps == 0
     assert loaded.checkpoint.completed_tool_calls == 0
+
+
+def test_partial_batch_interrupt_checkpoint_resumes_without_replaying_prefix(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore((tmp_path / "state").resolve())
+    write = CountingMemoryWriteTool()
+    interrupt = InterruptingCheckpointTool()
+    initial = AgentRunner(
+        ScriptedModel(
+            [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(id="write-prefix", name="write_file"),
+                        ToolCall(id="interrupt-next", name="interrupt_fixture"),
+                        ToolCall(id="cancel-tail", name="verify_fixture"),
+                    )
+                )
+            ]
+        ),
+        ToolRegistry([write, interrupt, CountingVerifyTool()]),
+        session_store=store,
+        max_steps=3,
+    ).run("Write once, then survive an interrupt")
+
+    assert initial.stop_reason is StopReason.USER_INTERRUPTED
+    assert write.calls == 1
+    assert interrupt.calls == 1
+    loaded = store.load(initial.run_id)
+    checkpoint = loaded.checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.completed_steps == 1
+    assert checkpoint.completed_tool_calls == 3
+    assert checkpoint.completed_work_tool_calls == 3
+    assert [message.role for message in checkpoint.messages[-4:]] == [
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.TOOL,
+        MessageRole.TOOL,
+    ]
+    assert checkpoint.run_memory.file_changes[0].path == "src/persisted.py"
+
+    resumed_model = ScriptedModel([ModelResponse(content="Recovered without replaying writes.")])
+    resumed = AgentRunner(
+        resumed_model,
+        ToolRegistry([write, interrupt, CountingVerifyTool()]),
+        session_store=store,
+        max_steps=3,
+    ).resume(loaded)
+
+    assert resumed.state is AgentState.COMPLETED_UNVERIFIED
+    assert write.calls == 1
+    assert interrupt.calls == 1
+    assert '"path":"src/persisted.py"' in str(resumed_model.requests[0].messages)
 
 
 def test_resume_never_replays_tools_and_requires_fresh_verification(tmp_path: Path) -> None:

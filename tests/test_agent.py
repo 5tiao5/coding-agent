@@ -5,11 +5,13 @@ from __future__ import annotations
 import subprocess
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
+from coding_agent.agent_protocol import EARLY_FINAL_CORRECTION_MARKER
 from coding_agent.budget import BudgetPolicy
 from coding_agent.completion import (
     CompletionContract,
@@ -36,6 +38,8 @@ from coding_agent.models import (
     VerificationKind,
     VerificationSignal,
 )
+from coding_agent.run_memory import RunMemory
+from coding_agent.session import SessionBoundary, SessionStore
 from coding_agent.tools import BaseTool, ToolOutput, ToolRegistry
 
 _TOOL_PAYLOAD_ADAPTER = TypeAdapter(dict[str, object])
@@ -703,6 +707,35 @@ class MutationMarkerTool(BaseTool[ControlArgs]):
         )
 
 
+class MemoryWriteTool(BaseTool[ControlArgs]):
+    name = "write_file"
+    description = "Record a deterministic mutation fact without touching the test workspace."
+    args_model = ControlArgs
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, arguments: ControlArgs) -> ToolOutput:
+        del arguments
+        self.calls += 1
+        return ToolOutput(
+            content="created src/first.py",
+            summary="Created first task file",
+            metadata={
+                "path": "src/first.py",
+                "change_id": "chg_0001_first",
+                "changed": True,
+                "change_kind": "create",
+                "before_sha256": None,
+                "after_sha256": "a" * 64,
+                "added_lines": 1,
+                "removed_lines": 0,
+                "mutation_revision": 1,
+            },
+            control=ToolControlFacts(invalidates_verification=True, made_progress=True),
+        )
+
+
 class VerificationMarkerTool(BaseTool[ControlArgs]):
     name = "verification_marker"
     description = "Return trusted test verification evidence."
@@ -946,7 +979,7 @@ def test_failed_rerun_replaces_passed_evidence_for_the_same_verifier() -> None:
     assert [event.data["passed"] for event in recorded] == [True, False]
 
 
-def test_terminal_control_fact_stops_the_run_after_recording_the_observation() -> None:
+def test_terminal_control_fact_stops_with_a_terminal_checkpoint(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             ModelResponse(
@@ -955,14 +988,21 @@ def test_terminal_control_fact_stops_the_run_after_recording_the_observation() -
         ]
     )
 
-    result = AgentRunner(model, ToolRegistry([TerminalMarkerTool()])).run(
-        "Trigger a terminal command-control failure"
-    )
+    store = SessionStore((tmp_path / "state").resolve())
+    result = AgentRunner(
+        model,
+        ToolRegistry([TerminalMarkerTool()]),
+        session_store=store,
+    ).run("Trigger a terminal command-control failure")
 
     assert result.state is AgentState.FAILED
     assert result.stop_reason is StopReason.COMMAND_CONTROL_FAILED
     assert result.error == "Command process cleanup could not be guaranteed"
     assert result.messages[-1].role is MessageRole.TOOL
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.TERMINAL
+    assert checkpoint.stop_reason is StopReason.COMMAND_CONTROL_FAILED
+    assert checkpoint.completed_tool_calls == 1
 
 
 def test_verification_ledger_is_fresh_for_each_runner_invocation() -> None:
@@ -982,6 +1022,115 @@ def test_verification_ledger_is_fresh_for_each_runner_invocation() -> None:
 
     assert first.state is AgentState.COMPLETED
     assert second.state is AgentState.COMPLETED_UNVERIFIED
+
+
+def test_run_memory_is_fresh_for_each_runner_invocation() -> None:
+    memory = RunMemory()
+    shared_plan = memory.plan_state
+    write = MemoryWriteTool()
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=(ToolCall(id="write-first", name="write_file"),)),
+            ModelResponse(content="First task finished."),
+            ModelResponse(content="Second task needs no tools."),
+        ]
+    )
+    runner = AgentRunner(model, ToolRegistry([write]), run_memory=memory)
+
+    first = runner.run("First task")
+    assert first.state is AgentState.COMPLETED_UNVERIFIED
+    assert memory.snapshot().file_changes[0].path == "src/first.py"
+
+    second = runner.run("Second task")
+
+    assert second.state is AgentState.COMPLETED_UNVERIFIED
+    assert write.calls == 1
+    assert memory.plan_state is shared_plan
+    assert memory.snapshot().revision == 0
+    assert [message.role for message in model.requests[2].messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+    ]
+
+
+def test_early_final_correction_consumes_a_turn_and_survives_resume(tmp_path: Path) -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    contract = CompletionContract(required_scopes=("tests",))
+    store = SessionStore((tmp_path / "state").resolve())
+    initial = AgentRunner(
+        ScriptedModel(
+            [
+                ModelResponse(tool_calls=(ToolCall(id="write-before-final", name="write_file"),)),
+                ModelResponse(content="Done before verification."),
+            ]
+        ),
+        ToolRegistry([MemoryWriteTool(), VerificationMarkerTool()]),
+        session_store=store,
+        max_steps=4,
+        verification_profile=profile,
+        completion_contract=contract,
+    ).run("Change, then verify before finishing")
+
+    assert initial.state is AgentState.FAILED
+    checkpoint = store.load(initial.run_id)
+    assert checkpoint.checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.checkpoint.completed_steps == 2
+    assert checkpoint.checkpoint.messages[-1].role is MessageRole.USER
+    assert EARLY_FINAL_CORRECTION_MARKER in (checkpoint.checkpoint.messages[-1].content or "")
+
+    resumed_model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-after-resume", name="verification_marker"),)
+            ),
+            ModelResponse(content="Now verified and complete."),
+        ]
+    )
+    resumed = AgentRunner(
+        resumed_model,
+        ToolRegistry([MemoryWriteTool(), VerificationMarkerTool()]),
+        session_store=store,
+        max_steps=4,
+        verification_profile=profile,
+        completion_contract=contract,
+    ).resume(checkpoint)
+
+    assert resumed.state is AgentState.COMPLETED
+    assert resumed.steps == 4
+    assert "verification calls only" in (resumed_model.requests[0].messages[0].content or "")
+    assert (
+        sum(
+            EARLY_FINAL_CORRECTION_MARKER in (message.content or "") for message in resumed.messages
+        )
+        == 1
+    )
+
+
+def test_early_final_correction_requires_a_workspace_mutation() -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    model = ScriptedModel([ModelResponse(content="No workspace changes were needed.")])
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([VerificationMarkerTool()]),
+        max_steps=4,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Answer without changing files")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert len(model.requests) == 1
+    assert all(
+        EARLY_FINAL_CORRECTION_MARKER not in (message.content or "") for message in result.messages
+    )
 
 
 def test_runner_compacts_only_the_model_view_and_keeps_canonical_history() -> None:
@@ -1047,16 +1196,20 @@ def test_third_identical_tool_observation_stops_a_no_progress_loop() -> None:
     assert result.error == "The same tool call produced the same observation 3 consecutive times"
 
 
-def test_repeated_call_stop_closes_the_remaining_tool_batch_without_executing_it() -> None:
+def test_repeated_call_stop_closes_and_terminally_checkpoints_the_batch(
+    tmp_path: Path,
+) -> None:
     calls = tuple(
         ToolCall(id=f"echo-{index}", name="echo", arguments={"text": "same"})
         for index in range(1, 5)
     )
     tool = EchoTool()
+    store = SessionStore((tmp_path / "state").resolve())
 
     result = AgentRunner(
         ScriptedModel([ModelResponse(tool_calls=calls)]),
         ToolRegistry([tool]),
+        session_store=store,
     ).run("Repeat four times in one batch")
 
     assert result.state is AgentState.FAILED
@@ -1068,6 +1221,10 @@ def test_repeated_call_stop_closes_the_remaining_tool_batch_without_executing_it
     assert cancelled["ok"] is False
     assert cancelled["error_code"] == "tool_call_cancelled"
     ContextManager(max_chars=100_000).prepare(result.messages)
+    checkpoint = store.load(result.run_id).checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.TERMINAL
+    assert checkpoint.stop_reason is StopReason.REPEATED_TOOL_CALL
+    assert checkpoint.completed_tool_calls == 4
 
 
 def test_keyboard_interrupt_during_tool_execution_is_a_structured_failure() -> None:

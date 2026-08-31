@@ -300,3 +300,16 @@ def test_plan_snapshot_is_bounded_strict_and_has_one_valid_empty_state() -> None
     for payload in invalid:
         with pytest.raises(ValidationError):
             PlanSnapshot.model_validate(payload)
+
+
+def test_reset_clears_plan_in_place_for_a_new_task() -> None:
+    state = PlanState()
+    state.update((_item("first", "Finish first task", PlanStatus.COMPLETED),))
+    identity = id(state)
+
+    reset = state.reset()
+
+    assert id(state) == identity
+    assert reset == PlanSnapshot(revision=0)
+    update = state.update((_item("second", "Start second task", PlanStatus.IN_PROGRESS),))
+    assert update.revision == 1

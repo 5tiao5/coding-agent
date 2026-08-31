@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Sequence
-from math import isfinite
 from time import sleep
 from uuid import uuid4
 
+from coding_agent import agent_protocol as protocol
+from coding_agent.agent_protocol import DEFAULT_SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
 from coding_agent.budget import BudgetPolicy, BudgetPurpose, BudgetUsage
 from coding_agent.completion import (
     CompletionContract,
     VerificationProfile,
-    evaluate_completion,
 )
 from coding_agent.context import ContextError, ContextManager
 from coding_agent.events import EventKind, EventSink, NullEventSink, RunEvent
@@ -27,7 +26,6 @@ from coding_agent.models import (
     ChatMessage,
     MessageRole,
     StopReason,
-    ToolCall,
     ToolExecution,
 )
 from coding_agent.run_id import require_run_id
@@ -42,43 +40,6 @@ from coding_agent.session import (
 from coding_agent.stopping import RepeatedToolCallGuard
 from coding_agent.tooling import ToolDispatcher
 from coding_agent.verification import VerificationLedger
-
-DEFAULT_SYSTEM_PROMPT = """You are a coding agent. Use the available local tools when needed.
-Keep plans and action summaries explicit, but never provide hidden reasoning or chain of thought.
-After changing files, run a recognized test, build, or check before giving a concise final answer.
-Runtime evidence, not your textual claim, determines whether the result is verified."""
-
-_RUNTIME_LIMITS_MARKER = "[CODING_AGENT_RUNTIME_LIMITS]"
-_RUNTIME_LIMITS_END_MARKER = "[/CODING_AGENT_RUNTIME_LIMITS]"
-_MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS = 3
-_TOOL_BATCH_REJECTED_ERROR_CODE = "tool_batch_rejected"
-_PROTOCOL_CORRECTION_MARKER = "[CODING_AGENT_PROTOCOL_CORRECTION]"
-_PROTOCOL_CORRECTION_INSTRUCTION = (
-    f"\n\n{_PROTOCOL_CORRECTION_MARKER}\n"
-    "The previous response was discarded. Return a fresh response and ensure the "
-    "arguments field of every function call is a valid JSON object, not an array or scalar."
-)
-_CLOSEOUT_MARKER = "[CODING_AGENT_CLOSEOUT]"
-
-_PRESENTATION_PREVIEW_TOOLS = frozenset(
-    {"replace_text", "undo_change", "update_plan", "write_file"}
-)
-
-_ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
-    AgentState.CREATED: {AgentState.PLANNING},
-    AgentState.PLANNING: {AgentState.ACTING},
-    AgentState.ACTING: {
-        AgentState.OBSERVING,
-        AgentState.VERIFYING,
-        AgentState.FAILED,
-    },
-    AgentState.OBSERVING: {AgentState.ACTING, AgentState.FAILED},
-    AgentState.VERIFYING: {
-        AgentState.COMPLETED,
-        AgentState.COMPLETED_UNVERIFIED,
-        AgentState.FAILED,
-    },
-}
 
 
 class AgentRunner:
@@ -106,72 +67,26 @@ class AgentRunner:
             raise ValueError(
                 "verification_profile and completion_contract must be provided together"
             )
-        if budget_policy is not None and (
-            max_steps != 20 or max_tool_calls_per_step != 8 or max_total_tool_calls is not None
-        ):
-            raise ValueError("budget_policy cannot be combined with legacy budget arguments")
-        required_verifier_calls = (
-            len(verification_profile.required_labels) if verification_profile is not None else 1
+        selected_budget = protocol.resolve_budget_policy(
+            budget_policy=budget_policy,
+            max_steps=max_steps,
+            max_tool_calls_per_step=max_tool_calls_per_step,
+            max_total_tool_calls=max_total_tool_calls,
+            verification_profile=verification_profile,
         )
-        verifier_batch_width = (
-            budget_policy.max_calls_per_turn
-            if budget_policy is not None
-            else max_tool_calls_per_step
-        )
-        required_verifier_turns = (
-            required_verifier_calls + verifier_batch_width - 1
-        ) // verifier_batch_width
-        selected_budget = budget_policy or BudgetPolicy(
-            max_model_turns=max_steps,
-            max_calls_per_turn=max_tool_calls_per_step,
-            average_calls_per_turn=min(2, max_tool_calls_per_step),
-            verification_turn_reserve=max(2, required_verifier_turns + 1),
-            verification_call_reserve=max(1, required_verifier_calls),
-        )
-        if (
-            max_total_tool_calls is not None
-            and max_total_tool_calls != selected_budget.max_total_tool_calls
-        ):
-            raise ValueError(
-                "max_total_tool_calls is derived from max_steps; use BudgetPolicy "
-                "to configure coupled budgets"
-            )
         if max_repeated_tool_results < 2:
             raise ValueError("max_repeated_tool_results must be at least 2")
-        if (
-            isinstance(max_model_retries, bool)
-            or not isinstance(max_model_retries, int)
-            or not 0 <= max_model_retries <= 10
-        ):
-            raise ValueError("max_model_retries must be an integer between 0 and 10")
-        if (
-            isinstance(model_retry_base_delay_seconds, bool)
-            or not isinstance(model_retry_base_delay_seconds, int | float)
-            or not isfinite(model_retry_base_delay_seconds)
-            or not 0 <= model_retry_base_delay_seconds <= 60
-        ):
-            raise ValueError("model_retry_base_delay_seconds must be between 0 and 60")
-        if (
-            verification_profile is not None
-            and selected_budget.verification_call_reserve < required_verifier_calls
-        ):
-            raise ValueError(
-                "budget_policy must reserve at least one call for every required verifier"
-            )
-        if (
-            verification_profile is not None
-            and selected_budget.verification_turn_reserve < required_verifier_turns + 1
-        ):
-            raise ValueError(
-                "budget_policy must reserve verifier batches and one final-response turn"
-            )
+        retry_delay = protocol.validate_model_retry_settings(
+            max_model_retries,
+            model_retry_base_delay_seconds,
+        )
         self._model = model
         self._tools = tools
         self._events = event_sink or NullEventSink()
         self._budget = selected_budget
         self._max_repeated_tool_results = max_repeated_tool_results
         self._max_model_retries = max_model_retries
-        self._model_retry_base_delay_seconds = float(model_retry_base_delay_seconds)
+        self._model_retry_base_delay_seconds = retry_delay
         self._model_retry_sleeper = model_retry_sleeper
         self._context = context_manager or ContextManager(max_chars=selected_budget.context_chars)
         self._session_store = session_store
@@ -221,20 +136,17 @@ class AgentRunner:
             raise ValueError("task cannot be empty")
 
         policy = self._budget
-        system_prompt = _with_runtime_limits(
+        system_prompt = protocol.with_runtime_limits(
             system_prompt,
             max_model_turns=policy.max_model_turns,
             max_calls_per_turn=policy.max_calls_per_turn,
             max_total_tool_calls=policy.max_total_tool_calls,
         )
-        limits = {
-            "max_model_turns": policy.max_model_turns,
-            "max_calls_per_turn": policy.max_calls_per_turn,
-            "max_total_tool_calls": policy.max_total_tool_calls,
-        }
+        limits = protocol.runtime_limits_event_data(policy)
         verification_required = self._verification_profile is not None
 
         if resumed is None:
+            self._memory.reset()
             state = AgentState.CREATED
             messages: list[ChatMessage] = [
                 ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
@@ -343,14 +255,15 @@ class AgentRunner:
             if message.role is MessageRole.ASSISTANT
             for call in message.tool_calls
         }
-        consecutive_batch_rejections = _trailing_tool_batch_rejections(messages)
-        closeout_mode = False
+        consecutive_batch_rejections = protocol.trailing_tool_batch_rejections(messages)
+        early_final_corrected = protocol.has_early_final_correction(messages)
+        closeout_mode = early_final_corrected
 
         for step in range(first_step, policy.max_model_turns + 1):
             turn_purpose: BudgetPurpose = (
-                _closeout_turn_purpose(
+                protocol.closeout_turn_purpose(
                     budget_state.remaining_model_turns,
-                    verification_required=_requires_current_verification(
+                    verification_required=protocol.requires_current_verification(
                         verification,
                         self._verification_profile,
                         self._completion_contract,
@@ -362,9 +275,9 @@ class AgentRunner:
             turn_admission = budget_state.admit_turn(turn_purpose)
             if not turn_admission.accepted:
                 closeout_mode = True
-                turn_purpose = _closeout_turn_purpose(
+                turn_purpose = protocol.closeout_turn_purpose(
                     budget_state.remaining_model_turns,
-                    verification_required=_requires_current_verification(
+                    verification_required=protocol.requires_current_verification(
                         verification,
                         self._verification_profile,
                         self._completion_contract,
@@ -413,7 +326,7 @@ class AgentRunner:
             response = None
             request_view = prepared.model_view
             if closeout_mode:
-                request_view = _with_closeout_instruction(
+                request_view = protocol.with_closeout_instruction(
                     request_view,
                     purpose=turn_purpose,
                     remaining_turns=budget_state.remaining_model_turns,
@@ -490,7 +403,7 @@ class AgentRunner:
                         )
                     try:
                         corrected = self._context.prepare(
-                            _with_protocol_correction(messages),
+                            protocol.with_protocol_correction(messages),
                             tool_specs,
                             memory=self._memory.snapshot(),
                         )
@@ -505,7 +418,7 @@ class AgentRunner:
                         )
                     request_view = corrected.model_view
                     if closeout_mode:
-                        request_view = _with_closeout_instruction(
+                        request_view = protocol.with_closeout_instruction(
                             request_view,
                             purpose=turn_purpose,
                             remaining_turns=budget_state.remaining_model_turns,
@@ -515,16 +428,11 @@ class AgentRunner:
                         EventKind.MODEL_RETRYING,
                         "Requesting a corrected model protocol response",
                         step,
-                        {
-                            "attempt": attempt,
-                            "next_attempt": attempt + 1,
-                            "max_attempts": max_attempts,
-                            "delay_seconds": 0.0,
-                            "error_code": "model_response_invalid",
-                            "retry_kind": "protocol_correction",
-                            "instruction_chars": len(_PROTOCOL_CORRECTION_INSTRUCTION),
-                            "prepared_context_chars": corrected.metadata.prepared,
-                        },
+                        protocol.protocol_correction_retry_event_data(
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            prepared_context_chars=corrected.metadata.prepared,
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 - adapter errors terminate the run.
                     return self._failure(
@@ -546,6 +454,39 @@ class AgentRunner:
                 step,
                 {"tool_count": len(response.tool_calls), "has_content": bool(response.content)},
             )
+            if protocol.should_append_early_final_correction(
+                response,
+                memory=self._memory.snapshot(),
+                ledger=verification,
+                profile=self._verification_profile,
+                contract=self._completion_contract,
+                already_corrected=early_final_corrected,
+                remaining_model_turns=budget_state.remaining_model_turns,
+            ):
+                protocol.append_early_final_correction(messages, response)
+                early_final_corrected = True
+                closeout_mode = True
+                consecutive_batch_rejections = 0
+                self._emit(
+                    run_id,
+                    EventKind.MODEL_RETRYING,
+                    "Scheduling one host-required verification closeout turn",
+                    step,
+                    protocol.early_final_correction_event_data(
+                        remaining_model_turns=budget_state.remaining_model_turns
+                    ),
+                )
+                state = self._transition(run_id, state, AgentState.OBSERVING, step)
+                self._save_checkpoint(
+                    run_id,
+                    task,
+                    system_prompt,
+                    messages,
+                    SessionBoundary.READY_FOR_MODEL,
+                    step,
+                    budget_usage=budget_state.usage,
+                )
+                continue
             messages.append(
                 ChatMessage(
                     role=MessageRole.ASSISTANT,
@@ -560,7 +501,7 @@ class AgentRunner:
                     call_id in seen_tool_call_ids for call_id in response_call_ids
                 )
                 if duplicate_call_id:
-                    _append_cancelled_tool_results(
+                    protocol.append_cancelled_tool_results(
                         messages,
                         response.tool_calls,
                         error_code="tool_batch_rejected",
@@ -578,15 +519,13 @@ class AgentRunner:
                 requested_calls = len(response.tool_calls)
                 if requested_calls > policy.max_calls_per_turn:
                     consecutive_batch_rejections += 1
-                    _append_cancelled_tool_results(
+                    protocol.append_cancelled_tool_results(
                         messages,
                         response.tool_calls,
-                        error_code=_TOOL_BATCH_REJECTED_ERROR_CODE,
-                        error_message=(
-                            "tool batch exceeded the per-step call limit "
-                            f"({requested_calls} requested, "
-                            f"{policy.max_calls_per_turn} allowed); "
-                            "retry with a smaller batch"
+                        error_code=protocol.TOOL_BATCH_REJECTED_ERROR_CODE,
+                        error_message=protocol.over_limit_tool_batch_error_message(
+                            requested_calls=requested_calls,
+                            max_calls_per_turn=policy.max_calls_per_turn,
                         ),
                     )
                     self._emit(
@@ -598,10 +537,13 @@ class AgentRunner:
                             "requested_calls": requested_calls,
                             "max_calls_per_turn": policy.max_calls_per_turn,
                             "rejection_count": consecutive_batch_rejections,
-                            "max_rejections": _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS,
+                            "max_rejections": (protocol.MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS),
                         },
                     )
-                    if consecutive_batch_rejections >= _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS:
+                    if (
+                        consecutive_batch_rejections
+                        >= protocol.MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS
+                    ):
                         return self._failure(
                             run_id,
                             state,
@@ -624,7 +566,7 @@ class AgentRunner:
                     )
                     continue
                 verification_calls = sum(
-                    _is_verification_call(self._tools, call) for call in response.tool_calls
+                    protocol.is_verification_call(self._tools, call) for call in response.tool_calls
                 )
                 work_calls = requested_calls - verification_calls
                 batch_admission = budget_state.admit_batch(
@@ -650,13 +592,12 @@ class AgentRunner:
                         rejection_code = "observation_budget_exceeded"
                 if rejection_code is not None:
                     consecutive_batch_rejections += 1
-                    _append_cancelled_tool_results(
+                    protocol.append_cancelled_tool_results(
                         messages,
                         response.tool_calls,
-                        error_code=_TOOL_BATCH_REJECTED_ERROR_CODE,
-                        error_message=(
-                            f"tool batch was not admitted ({rejection_code}); "
-                            "return a final response or request an allowed smaller batch"
+                        error_code=protocol.TOOL_BATCH_REJECTED_ERROR_CODE,
+                        error_message=protocol.inadmissible_tool_batch_error_message(
+                            rejection_code
                         ),
                     )
                     self._emit(
@@ -668,13 +609,16 @@ class AgentRunner:
                             "requested_calls": requested_calls,
                             "max_calls_per_turn": policy.max_calls_per_turn,
                             "rejection_count": consecutive_batch_rejections,
-                            "max_rejections": _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS,
+                            "max_rejections": (protocol.MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS),
                             "reason": rejection_code,
                             "remaining_total_tool_calls": (budget_state.remaining_total_tool_calls),
                             "remaining_work_tool_calls": (budget_state.remaining_work_tool_calls),
                         },
                     )
-                    if consecutive_batch_rejections >= _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS:
+                    if (
+                        consecutive_batch_rejections
+                        >= protocol.MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS
+                    ):
                         return self._failure(
                             run_id,
                             state,
@@ -715,11 +659,20 @@ class AgentRunner:
                     try:
                         raw_execution = self._tools.execute(call)
                     except KeyboardInterrupt:
-                        _append_cancelled_tool_results(
+                        protocol.append_cancelled_tool_results(
                             messages,
                             response.tool_calls[call_index:],
                             error_code="tool_call_cancelled",
                             error_message="run was interrupted during tool execution",
+                        )
+                        self._save_stopped_batch_checkpoint(
+                            run_id,
+                            task,
+                            system_prompt,
+                            messages,
+                            step,
+                            budget_usage=budget_state.usage,
+                            reason=StopReason.USER_INTERRUPTED,
                         )
                         return self._failure(
                             run_id,
@@ -741,30 +694,11 @@ class AgentRunner:
                             tool_name=call.name,
                         )
                     )
-                    event_data: dict[str, object] = {
-                        "call_id": call.id,
-                        "tool_name": call.name,
-                        "ok": raw_execution.ok,
-                        "error_code": raw_execution.error_code,
-                        "duration_ms": raw_execution.duration_ms,
-                        "output_chars": len(raw_execution.output or ""),
-                        "truncated": raw_execution.truncated,
-                        "summary": raw_execution.summary,
-                        "observation_chars": len(execution.as_message_content()),
-                        "observation_truncated": (
-                            execution.as_message_content() != raw_execution.as_message_content()
-                        ),
-                    }
-                    if raw_execution.metadata:
-                        event_data["metadata"] = dict(raw_execution.metadata)
-                    if (
-                        raw_execution.ok
-                        and raw_execution.output is not None
-                        and call.name in _PRESENTATION_PREVIEW_TOOLS
-                    ):
-                        # Only explicit plans and bounded mutation diffs are presentation-safe.
-                        # Read/search/command output stays in the private canonical transcript.
-                        event_data["preview"] = raw_execution.output
+                    event_data = protocol.tool_finished_event_data(
+                        call,
+                        raw_execution,
+                        execution,
+                    )
                     self._emit(
                         run_id,
                         EventKind.TOOL_FINISHED,
@@ -776,11 +710,20 @@ class AgentRunner:
                     self._memory.observe(call, raw_execution, step=step)
                     if raw_execution.control.terminal_stop:
                         assert raw_execution.control.terminal_reason is not None
-                        _append_cancelled_tool_results(
+                        protocol.append_cancelled_tool_results(
                             messages,
                             response.tool_calls[call_index + 1 :],
                             error_code="tool_call_cancelled",
                             error_message="an earlier tool forced a terminal safety stop",
+                        )
+                        self._save_stopped_batch_checkpoint(
+                            run_id,
+                            task,
+                            system_prompt,
+                            messages,
+                            step,
+                            budget_usage=budget_state.usage,
+                            reason=StopReason.COMMAND_CONTROL_FAILED,
                         )
                         return self._failure(
                             run_id,
@@ -792,11 +735,20 @@ class AgentRunner:
                         )
                     repeated = repetition.observe(call, raw_execution)
                     if repeated.should_stop:
-                        _append_cancelled_tool_results(
+                        protocol.append_cancelled_tool_results(
                             messages,
                             response.tool_calls[call_index + 1 :],
                             error_code="tool_call_cancelled",
                             error_message="the repeated-call stop policy cancelled this call",
+                        )
+                        self._save_stopped_batch_checkpoint(
+                            run_id,
+                            task,
+                            system_prompt,
+                            messages,
+                            step,
+                            budget_usage=budget_state.usage,
+                            reason=StopReason.REPEATED_TOOL_CALL,
                         )
                         return self._failure(
                             run_id,
@@ -819,37 +771,23 @@ class AgentRunner:
                 continue
 
             state = self._transition(run_id, state, AgentState.VERIFYING, step)
-            verification_report = verification.report()
-            if self._verification_profile is not None:
-                assert self._completion_contract is not None
-                completion_report = evaluate_completion(
-                    self._verification_profile,
-                    self._completion_contract,
-                    verification_report,
-                )
-                verified = completion_report.task_validated
-                verification_data = completion_report.event_data(verification_report)
-                evaluation_message = (
-                    "Task completion contract validated"
-                    if verified
-                    else f"Completion contract is {completion_report.completion_status.value}"
-                )
-            else:
-                verified = verification_report.verified
-                verification_data = verification_report.event_data()
-                evaluation_message = (
-                    "Current verification evidence passed"
-                    if verified
-                    else f"Verification evidence is {verification_report.status.value}"
-                )
+            final_verification = protocol.final_verification_view(
+                verification,
+                self._verification_profile,
+                self._completion_contract,
+            )
             self._emit(
                 run_id,
                 EventKind.VERIFICATION_EVALUATED,
-                evaluation_message,
+                final_verification.evaluation_message,
                 step,
-                verification_data,
+                final_verification.event_data,
             )
-            terminal_state = AgentState.COMPLETED if verified else AgentState.COMPLETED_UNVERIFIED
+            terminal_state = (
+                AgentState.COMPLETED
+                if final_verification.verified
+                else AgentState.COMPLETED_UNVERIFIED
+            )
             state = self._transition(run_id, state, terminal_state, step)
             self._save_checkpoint(
                 run_id,
@@ -867,17 +805,9 @@ class AgentRunner:
             self._emit(
                 run_id,
                 EventKind.RUN_FINISHED,
-                (
-                    "Run ended with a validated completion contract"
-                    if verified and self._verification_profile is not None
-                    else (
-                        "Run ended with current verification evidence"
-                        if verified
-                        else "Run ended with an unverified final response"
-                    )
-                ),
+                final_verification.finished_message,
                 step,
-                verification_data,
+                final_verification.event_data,
             )
             return AgentResult(
                 run_id=run_id,
@@ -895,6 +825,29 @@ class AgentRunner:
             policy.max_model_turns,
             messages,
             f"Maximum step count reached: {policy.max_model_turns}",
+        )
+
+    def _save_stopped_batch_checkpoint(
+        self,
+        run_id: str,
+        task: str,
+        system_prompt: str,
+        messages: Sequence[ChatMessage],
+        step: int,
+        *,
+        budget_usage: BudgetUsage,
+        reason: StopReason,
+    ) -> None:
+        resumable = reason is StopReason.USER_INTERRUPTED
+        self._save_checkpoint(
+            run_id,
+            task,
+            system_prompt,
+            messages,
+            SessionBoundary.READY_FOR_MODEL if resumable else SessionBoundary.TERMINAL,
+            step,
+            budget_usage=budget_usage,
+            stop_reason=None if resumable else reason,
         )
 
     def _save_checkpoint(
@@ -986,8 +939,7 @@ class AgentRunner:
         current: AgentState,
         step: int = 0,
     ) -> AgentState:
-        allowed = _ALLOWED_TRANSITIONS.get(previous, set())
-        if current not in allowed:
+        if not protocol.is_allowed_transition(previous, current):
             raise RuntimeError(
                 f"invalid agent state transition: {previous.value} -> {current.value}"
             )
@@ -1043,164 +995,3 @@ class AgentRunner:
                 data=data or {},
             )
         )
-
-
-def _append_cancelled_tool_results(
-    messages: list[ChatMessage],
-    calls: Sequence[ToolCall],
-    *,
-    error_code: str,
-    error_message: str,
-) -> None:
-    for call in calls:
-        execution = ToolExecution(
-            call_id=call.id,
-            tool_name=call.name,
-            ok=False,
-            error_code=error_code,
-            error_message=error_message,
-        )
-        messages.append(
-            ChatMessage(
-                role=MessageRole.TOOL,
-                content=execution.as_message_content(),
-                tool_call_id=call.id,
-                tool_name=call.name,
-            )
-        )
-
-
-def _with_runtime_limits(
-    system_prompt: str,
-    *,
-    max_model_turns: int,
-    max_calls_per_turn: int,
-    max_total_tool_calls: int,
-) -> str:
-    """Replace the host-owned runtime budget block with current runner limits."""
-
-    base = system_prompt
-    marker_index = base.find(_RUNTIME_LIMITS_MARKER)
-    if marker_index >= 0:
-        end_index = base.find(_RUNTIME_LIMITS_END_MARKER, marker_index)
-        if end_index >= 0:
-            base = base[:marker_index] + base[end_index + len(_RUNTIME_LIMITS_END_MARKER) :]
-    base = base.rstrip()
-    return (
-        f"{base}\n\n{_RUNTIME_LIMITS_MARKER}\n"
-        "Runtime budgets enforced for this run:\n"
-        f"- Maximum model turns: {max_model_turns}.\n"
-        f"- Maximum tool calls in one model response: {max_calls_per_turn}. "
-        "Never exceed this per-turn limit; split independent calls across turns.\n"
-        f"- Maximum accepted tool calls across the run: {max_total_tool_calls}.\n"
-        "The host reserves enough closing capacity for registered verification and one "
-        "honest final response when a completion contract is active.\n"
-        "An over-limit per-turn batch is rejected atomically: none of its calls execute. "
-        "Use the returned tool errors to retry with a smaller batch.\n"
-        f"{_RUNTIME_LIMITS_END_MARKER}"
-    )
-
-
-def _with_protocol_correction(messages: Sequence[ChatMessage]) -> tuple[ChatMessage, ...]:
-    """Add one bounded, sanitized retry instruction to a transient request view only."""
-
-    system = messages[0]
-    assert system.role is MessageRole.SYSTEM
-    assert system.content is not None
-    content = f"{system.content.rstrip()}{_PROTOCOL_CORRECTION_INSTRUCTION}"
-    return (system.model_copy(update={"content": content}), *messages[1:])
-
-
-def _with_closeout_instruction(
-    messages: Sequence[ChatMessage],
-    *,
-    purpose: BudgetPurpose,
-    remaining_turns: int,
-) -> tuple[ChatMessage, ...]:
-    """Inject a host-owned closeout instruction into the request view only."""
-
-    system = messages[0]
-    assert system.role is MessageRole.SYSTEM
-    assert system.content is not None
-    if purpose == "verification":
-        instruction = (
-            "The work-turn budget is exhausted. This turn is reserved for recognized "
-            "verification calls only; do not inspect or modify files. Request the smallest "
-            "registered verification batch needed to validate the current workspace."
-        )
-    else:
-        instruction = (
-            "This is the reserved final-response turn. Do not call tools. Give a concise, "
-            "honest summary and explicitly state any missing or failed verification."
-        )
-    content = (
-        f"{system.content.rstrip()}\n\n{_CLOSEOUT_MARKER}\n"
-        f"{instruction}\nRemaining model turns after this response: {remaining_turns}."
-    )
-    return (system.model_copy(update={"content": content}), *messages[1:])
-
-
-def _requires_current_verification(
-    ledger: VerificationLedger,
-    profile: VerificationProfile | None,
-    contract: CompletionContract | None,
-) -> bool:
-    if profile is None:
-        return False
-    assert contract is not None
-    return not evaluate_completion(profile, contract, ledger.report()).task_validated
-
-
-def _closeout_turn_purpose(
-    remaining_turns: int,
-    *,
-    verification_required: bool,
-) -> BudgetPurpose:
-    if verification_required and remaining_turns > 1:
-        return "verification"
-    return "final"
-
-
-def _is_verification_call(tools: ToolDispatcher, call: ToolCall) -> bool:
-    classifier = getattr(tools, "is_verification_call", None)
-    if classifier is None or not callable(classifier):
-        return False
-    try:
-        return classifier(call) is True
-    except (TypeError, ValueError):
-        return False
-
-
-def _trailing_tool_batch_rejections(messages: Sequence[ChatMessage]) -> int:
-    """Recover the consecutive rejection streak from a stable transcript."""
-
-    consecutive = 0
-    cursor = 2
-    while cursor < len(messages):
-        assistant = messages[cursor]
-        cursor += 1
-        if assistant.role is not MessageRole.ASSISTANT or not assistant.tool_calls:
-            consecutive = 0
-            continue
-        results = messages[cursor : cursor + len(assistant.tool_calls)]
-        cursor += len(assistant.tool_calls)
-        if len(results) == len(assistant.tool_calls) and all(
-            _tool_result_error_code(result) == _TOOL_BATCH_REJECTED_ERROR_CODE for result in results
-        ):
-            consecutive += 1
-        else:
-            consecutive = 0
-    return consecutive
-
-
-def _tool_result_error_code(message: ChatMessage) -> str | None:
-    if message.role is not MessageRole.TOOL or message.content is None:
-        return None
-    try:
-        payload = json.loads(message.content)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or payload.get("ok") is not False:
-        return None
-    error_code = payload.get("error_code")
-    return error_code if isinstance(error_code, str) else None

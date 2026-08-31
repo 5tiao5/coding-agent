@@ -165,6 +165,35 @@ def test_memory_snapshots_the_shared_explicit_plan_without_reasoning() -> None:
     assert "reasoning" not in snapshot.canonical_json()
 
 
+def test_reset_clears_task_facts_without_replacing_shared_plan_state() -> None:
+    memory = RunMemory()
+    shared_plan = memory.plan_state
+    plan_call = ToolCall(
+        id="plan-reset",
+        name="update_plan",
+        arguments={"items": [{"id": "old", "step": "Old task", "status": "in_progress"}]},
+    )
+    plan_execution = ToolRegistry([UpdatePlanTool(shared_plan)]).execute(plan_call)
+    memory.observe(plan_call, plan_execution, step=1)
+    mutation_call, mutation_execution = _mutation(1, "src/old.py")
+    memory.observe(mutation_call, mutation_execution, step=2)
+
+    reset = memory.reset()
+
+    assert memory.plan_state is shared_plan
+    assert reset == RunMemorySnapshot(revision=0)
+    assert shared_plan.snapshot().revision == 0
+    next_execution = ToolRegistry([UpdatePlanTool(shared_plan)]).execute(
+        ToolCall(
+            id="plan-next",
+            name="update_plan",
+            arguments={"items": [{"id": "new", "step": "New task", "status": "in_progress"}]},
+        )
+    )
+    assert next_execution.ok is True
+    assert shared_plan.revision == 1
+
+
 def test_file_changes_are_allowlisted_coalesced_by_path_and_lru_bounded() -> None:
     memory = RunMemory(max_file_changes=2)
     first = _mutation(1, "src/a.py")

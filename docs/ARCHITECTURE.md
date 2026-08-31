@@ -157,7 +157,7 @@ tool calls enters the Verification Gate. The terminal checkpoint event is emitte
 
 | Area | Main modules |
 |---|---|
-| orchestration | `agent.py`, `models.py`, `context.py`, `stopping.py`, `verification.py` |
+| orchestration | `agent.py`, `agent_protocol.py`, `budget.py`, `completion.py`, `run_memory.py`, `models.py`, `context.py`, `stopping.py`, `verification.py` |
 | provider boundary | `model.py`, `openai_model.py` |
 | tools and policy | `tools/`, `workspace.py`, `mutation.py`, `command.py`, `approval.py` |
 | application wiring | `application.py`, `runtime.py`, `cli.py`, `local_config.py`, `demo.py`, `web/runtime.py`, `web/workbench.py` |
@@ -173,6 +173,11 @@ metrics; scenario fixtures and regression-oracle tests remain declarative in
 `evaluation_scenarios.py`. Those definitions are project code, not a secret benchmark boundary.
 `evaluation_cli.py` owns only the stable JSON/table projection and report-file policy, keeping the
 Typer host focused on argument handling and control flow.
+
+The evaluation suite includes a deliberately shallow public test paired with a real module-entry
+oracle. This makes a false-green outcome observable: if the Agent reports completion after fixing
+only the public assertion while the application still crashes, the report records
+`verified_but_oracle_failed` and the case remains failed.
 
 ## Dependency boundary
 

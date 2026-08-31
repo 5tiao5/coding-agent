@@ -262,6 +262,17 @@ class RunMemory:
             raise RuntimeError("run memory exceeded its configured character budget")
         return snapshot
 
+    def reset(self) -> RunMemorySnapshot:
+        """Clear task-local facts without replacing the plan object shared by tools."""
+
+        empty_plan = self._plan_state.reset()
+        self._observed_plan = empty_plan
+        self._file_changes.clear()
+        self._failed_commands.clear()
+        self._verification_facts.clear()
+        self._revision = 0
+        return self.snapshot()
+
     def restore(
         self,
         snapshot: RunMemorySnapshot,
