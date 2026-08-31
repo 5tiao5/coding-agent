@@ -22,6 +22,7 @@ const TIMELINE_HEADLINES = {
   "Checkpoint saved": "检查点已保存",
   "Context budget compacted": "上下文已压缩",
   "Failing evidence recorded": "已记录失败证据",
+  "Final response deferred; verification scheduled": "暂缓结束，正在安排验证",
   "Passing evidence recorded": "已记录通过证据",
   "Previous evidence invalidated": "旧验证证据已失效",
   "Invalid model response; protocol correction scheduled": "模型工具参数格式异常，正在自动纠正",

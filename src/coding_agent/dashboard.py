@@ -223,6 +223,16 @@ class DashboardProjection:
             self._phase = "DECIDING"
             return self._entry(event, "MODEL", "Selecting the next action", None)
         if kind is EventKind.MODEL_RETRYING:
+            retry_kind = _data_string(data, "retry_kind")
+            if retry_kind == "verification_closeout":
+                self._phase = "VERIFYING"
+                return self._entry(
+                    event,
+                    "VERIFY",
+                    "Final response deferred; verification scheduled",
+                    "Fresh verification is required",
+                    level="warning",
+                )
             self._phase = "RETRYING"
             next_attempt = _data_int(data, "next_attempt")
             max_attempts = _data_int(data, "max_attempts")
@@ -233,7 +243,6 @@ class DashboardProjection:
             if delay_seconds is not None:
                 detail_parts.append(f"after {delay_seconds:g}s")
             error_code = _data_string(data, "error_code")
-            retry_kind = _data_string(data, "retry_kind")
             protocol_correction = retry_kind == "protocol_correction" or error_code in {
                 "model_response_invalid",
                 "openai_invalid_function_arguments",

@@ -89,3 +89,15 @@ test("protocol correction copy is distinct from transport backoff", async () => 
     "第 2 / 3 次请求 · 0.5 秒后重试 · 瞬态请求错误",
   );
 });
+
+test("verification closeout copy does not imply a model request failure", async () => {
+  const { translatePhase, translateTimelineDetail, translateTimelineHeadline } =
+    await importBrowserModule("src/coding_agent/web/static/locale-zh.js");
+
+  assert.equal(translatePhase("VERIFYING", []), "正在验证");
+  assert.equal(
+    translateTimelineHeadline("Final response deferred; verification scheduled"),
+    "暂缓结束，正在安排验证",
+  );
+  assert.equal(translateTimelineDetail("Fresh verification is required"), "需要重新验证");
+});

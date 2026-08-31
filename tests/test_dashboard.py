@@ -309,6 +309,35 @@ def test_projection_distinguishes_protocol_correction_without_exposing_response(
     assert "TEST_PRIVATE" not in str(entry)
 
 
+def test_projection_treats_verification_closeout_as_verification_not_model_failure() -> None:
+    projection = DashboardProjection(max_timeline=4)
+    projection.apply(_event(EventKind.RUN_STARTED))
+
+    entry = projection.apply(
+        _event(
+            EventKind.MODEL_RETRYING,
+            step=2,
+            seconds=1,
+            message="host instruction must stay private",
+            data={
+                "retry_kind": "verification_closeout",
+                "remaining_model_turns": 2,
+                "instruction_chars": 417,
+                "provider_private": "TEST_PRIVATE_CLOSEOUT_SENTINEL",
+            },
+        )
+    )
+
+    assert entry is not None
+    assert projection.snapshot.phase == "VERIFYING"
+    assert entry.category == "VERIFY"
+    assert entry.level == "warning"
+    assert entry.headline == "Final response deferred; verification scheduled"
+    assert entry.detail == "Fresh verification is required"
+    assert "failure" not in str(entry).casefold()
+    assert "TEST_PRIVATE" not in str(entry)
+
+
 def test_projection_whitelists_run_limits_and_treats_batch_rejection_as_retry() -> None:
     projection = DashboardProjection(max_timeline=5)
     projection.apply(
