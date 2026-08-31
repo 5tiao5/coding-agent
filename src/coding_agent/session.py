@@ -22,11 +22,12 @@ from uuid import uuid4
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from coding_agent.errors import CodedError
-from coding_agent.models import ChatMessage, FrozenModel, MessageRole, StopReason
+from coding_agent.models import ChatMessage, FrozenModel, MessageRole, StopReason, ToolCall
 from coding_agent.run_id import require_run_id
 
 SESSION_SCHEMA_VERSION = 2
 DEFAULT_MAX_CHECKPOINT_BYTES = 2_000_000
+_TOOL_BATCH_REJECTED_ERROR_CODE = "tool_batch_rejected"
 
 _FORBIDDEN_FIELD_NAMES = {
     "accesstoken",
@@ -358,9 +359,32 @@ def _validate_closed_turns(messages: Sequence[ChatMessage]) -> tuple[int, int]:
                 raise ValueError("checkpoint cannot split an assistant/tool block")
             if result.tool_call_id != call.id or result.tool_name != call.name:
                 raise ValueError("tool result does not match its canonical tool call")
-            completed_tool_calls += 1
+            if not _is_rejected_tool_result(result, call):
+                completed_tool_calls += 1
             cursor += 1
     return completed_steps, completed_tool_calls
+
+
+def _is_rejected_tool_result(result: ChatMessage, call: ToolCall) -> bool:
+    """Return whether one closed TOOL message records a non-executed batch rejection."""
+
+    try:
+        payload = json.loads(result.content or "", object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("tool result content must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("tool result content must be a JSON object")
+    if payload.get("call_id") != call.id or payload.get("tool_name") != call.name:
+        raise ValueError("tool result content does not match its canonical tool call")
+    ok = payload.get("ok")
+    if type(ok) is not bool:
+        raise ValueError("tool result content must contain a boolean ok field")
+    error_code = payload.get("error_code")
+    if error_code == _TOOL_BATCH_REJECTED_ERROR_CODE:
+        if ok is not False or not isinstance(payload.get("error_message"), str):
+            raise ValueError("rejected tool results must contain a stable failure payload")
+        return True
+    return False
 
 
 def _require_safe_run_id(run_id: str) -> None:

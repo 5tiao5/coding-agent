@@ -9,6 +9,7 @@ const PHASE_LABELS = {
   FAILED: "已失败",
   OBSERVING: "正在观察结果",
   PLANNING: "正在规划",
+  REPLANNING: "正在拆分工具批次",
   RESUMED: "已恢复会话",
   RETRYING: "正在重试模型请求",
   VERIFYING: "正在验证",
@@ -23,9 +24,11 @@ const TIMELINE_HEADLINES = {
   "Failing evidence recorded": "已记录失败证据",
   "Passing evidence recorded": "已记录通过证据",
   "Previous evidence invalidated": "旧验证证据已失效",
+  "Invalid model response; protocol correction scheduled": "模型工具参数格式异常，正在自动纠正",
   "Selecting the next action": "正在选择下一步",
   "Session resumed": "会话已恢复",
   "Task accepted": "任务已接收",
+  "Tool batch too large; split retry requested": "工具批次过大，正在拆分重试",
   "Transient model failure; retry scheduled": "模型暂时不可用，已安排重试",
   "Verification gate evaluated": "验证门已评估",
 };
@@ -57,6 +60,8 @@ const METADATA_LABELS = {
 
 const RETRY_REASON_LABELS = {
   "MODEL REQUEST TRANSIENT": "瞬态请求错误",
+  "MODEL REQUEST FAILURE": "模型请求异常",
+  "MODEL RESPONSE INVALID": "模型工具参数格式无效",
 };
 
 function asText(value, fallback = "") {
@@ -144,6 +149,13 @@ export function translateTimelineDetail(value) {
   if (match) {
     return `已准备 ${match[1]} 个工具调用`;
   }
+  match = text.match(
+    /^Requested (\d+) tool calls; per-turn limit (\d+); split retry requested(?:; rejection (\d+) of (\d+))?$/,
+  );
+  if (match) {
+    const retry = match[3] && match[4] ? `（第 ${match[3]} / ${match[4]} 次调整）` : "";
+    return `本轮请求 ${match[1]} 个工具调用，上限 ${match[2]}；已要求模型拆分重试${retry}`;
+  }
   match = text.match(/^Summarized (\d+) older tool block\(s\)$/);
   if (match) {
     return `已摘要 ${match[1]} 个较早的工具结果块`;
@@ -153,7 +165,8 @@ export function translateTimelineDetail(value) {
   );
   if (match) {
     const reason = mappedText(RETRY_REASON_LABELS, match[4]);
-    return `第 ${match[1]} / ${match[2]} 次请求 · ${match[3]} 秒后重试 · ${reason}`;
+    const schedule = Number(match[3]) === 0 ? "立即重试" : `${match[3]} 秒后重试`;
+    return `第 ${match[1]} / ${match[2]} 次请求 · ${schedule} · ${reason}`;
   }
   match = text.match(/^Resumed after (\d+) completed step\(s\); fresh verification is required$/);
   if (match) {

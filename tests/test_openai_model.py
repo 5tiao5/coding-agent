@@ -8,7 +8,8 @@ import httpx
 import pytest
 from openai import APIStatusError, APITimeoutError
 
-from coding_agent.model import RetryableModelError
+from coding_agent.errors import CodedError
+from coding_agent.model import RecoverableModelResponseError, RetryableModelError
 from coding_agent.models import (
     ChatMessage,
     MessageRole,
@@ -232,7 +233,7 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
 
 
 @pytest.mark.parametrize(
-    ("items", "message"),
+    ("items", "message", "error_type", "error_code"),
     [
         (
             (
@@ -244,6 +245,8 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
                 ),
             ),
             "arguments are not valid JSON",
+            RecoverableModelResponseError,
+            "openai_invalid_function_arguments",
         ),
         (
             (
@@ -255,6 +258,8 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
                 ),
             ),
             "arguments are not a JSON object",
+            RecoverableModelResponseError,
+            "openai_invalid_function_arguments",
         ),
         (
             (
@@ -272,6 +277,8 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
                 ),
             ),
             "IDs are not unique",
+            OpenAIModelError,
+            "openai_invalid_response",
         ),
         (
             (
@@ -283,6 +290,8 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
                 ),
             ),
             "arguments are not valid JSON",
+            RecoverableModelResponseError,
+            "openai_invalid_function_arguments",
         ),
     ],
     ids=["invalid-json", "non-object-json", "duplicate-call-id", "non-standard-json"],
@@ -290,16 +299,48 @@ def test_rejects_reasoning_state_that_cannot_be_replayed_with_tool_calls() -> No
 def test_rejects_untrusted_function_call_shapes(
     items: tuple[object, ...],
     message: str,
+    error_type: type[CodedError],
+    error_code: str,
 ) -> None:
     adapter, _ = _adapter(FakeResponse(output_text=None, output=items))
 
-    with pytest.raises(OpenAIModelError, match=message) as error:
+    with pytest.raises(error_type, match=message) as error:
         adapter.complete(
             (ChatMessage(role=MessageRole.USER, content="Use a tool."),),
             (),
         )
 
-    assert error.value.code == "openai_invalid_response"
+    assert error.value.code == error_code
+
+
+def test_malformed_function_arguments_never_escape_in_recoverable_error() -> None:
+    secret = "TEST_PRIVATE_MALFORMED_ARGUMENT_SENTINEL"
+    adapter, _ = _adapter(
+        FakeResponse(
+            output_text=None,
+            output=(
+                FakeOutputItem(
+                    type="function_call",
+                    call_id="call-1",
+                    name="read_file",
+                    arguments=f'{{"path":"{secret}"',
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(RecoverableModelResponseError) as error:
+        adapter.complete(
+            (ChatMessage(role=MessageRole.USER, content="Use a tool."),),
+            (),
+        )
+
+    assert error.value.code == "openai_invalid_function_arguments"
+    assert str(error.value) == (
+        "OpenAI returned invalid function-call arguments: arguments are not valid JSON"
+    )
+    assert secret not in str(error.value)
+    assert error.value.__cause__ is None
 
 
 @pytest.mark.parametrize(

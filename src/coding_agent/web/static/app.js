@@ -5,6 +5,8 @@ import {
   translateTimelineDetail,
   translateTimelineHeadline,
 } from "./locale-zh.js";
+import { createWorkbench } from "./_workbench.js";
+import { runtimeMetricView } from "./_metrics.js";
 
 "use strict";
 
@@ -24,19 +26,44 @@ const elements = {
   footerPulse: document.querySelector("#footer-pulse"),
   form: document.querySelector("#run-form"),
   formMessage: document.querySelector("#form-message"),
+  historyBadge: document.querySelector("#history-badge"),
+  historyReturn: document.querySelector("#history-return"),
+  historyTitle: document.querySelector("#history-title"),
   messageList: document.querySelector("#message-list"),
   metricFailed: document.querySelector("#metric-failed"),
+  metricBudget: document.querySelector("#metric-budget"),
   metricStep: document.querySelector("#metric-step"),
   metricTools: document.querySelector("#metric-tools"),
+  newProjectButton: document.querySelector("#new-project-button"),
+  openProjectButton: document.querySelector("#open-project-button"),
   phaseLabel: document.querySelector("#phase-label"),
   planCount: document.querySelector("#plan-count"),
   planList: document.querySelector("#plan-list"),
+  projectDialog: document.querySelector("#project-dialog"),
+  projectDialogCancel: document.querySelector("#project-dialog-cancel"),
+  projectDialogClose: document.querySelector("#project-dialog-close"),
+  projectDialogCopy: document.querySelector("#project-dialog-copy"),
+  projectDialogForm: document.querySelector("#project-dialog-form"),
+  projectDialogMessage: document.querySelector("#project-dialog-message"),
+  projectDialogSubmit: document.querySelector("#project-dialog-submit"),
+  projectDialogTitle: document.querySelector("#project-dialog-title"),
+  projectDisplayNameField: document.querySelector("#project-display-name-field"),
+  projectDisplayNameInput: document.querySelector("#project-display-name-input"),
+  projectBrowser: document.querySelector("#project-browser"),
+  projectList: document.querySelector("#project-list"),
+  projectNameField: document.querySelector("#project-name-field"),
+  projectNameInput: document.querySelector("#project-name-input"),
+  projectRootBrowse: document.querySelector("#project-root-browse"),
+  projectRootInput: document.querySelector("#project-root-input"),
+  projectRootLabel: document.querySelector("#project-root-label"),
   runButton: document.querySelector("#run-button"),
   runButtonLabel: document.querySelector("#run-button-label"),
   runId: document.querySelector("#run-id"),
+  runHistoryList: document.querySelector("#run-history-list"),
   runStatus: document.querySelector("#run-status"),
   runStatusLabel: document.querySelector("#run-status-label"),
   runtimeLabel: document.querySelector("#runtime-label"),
+  sessionHeading: document.querySelector("#session-heading"),
   taskInput: document.querySelector("#task-input"),
   toast: document.querySelector("#toast"),
   toastText: document.querySelector("#toast-text"),
@@ -47,10 +74,14 @@ const elements = {
 };
 
 let appMetadata = {
+  controlToken: "",
   defaultTask: "",
+  nativeFolderPickerAvailable: false,
   taskLocked: false,
 };
 let currentState = null;
+let liveState = null;
+let workbench = null;
 let lastRenderSignature = "";
 let lastServerTask = "";
 let pollInFlight = false;
@@ -67,6 +98,7 @@ const RUN_STATUS = {
   },
   failed: { label: "失败", phase: "运行因错误停止", tone: "failed" },
   idle: { label: "就绪", phase: "等待任务", tone: "idle" },
+  interrupted: { label: "已中断", phase: "运行轨迹未正常终止", tone: "unverified" },
   running: { label: "运行中", phase: "智能体正在工作", tone: "running" },
 };
 
@@ -83,7 +115,12 @@ const CATEGORY_META = {
 
 const LEVELS = new Set(["info", "success", "warning", "error"]);
 const PLAN_STATES = new Set(["pending", "in_progress", "completed"]);
-const TERMINAL_STATUSES = new Set(["completed", "completed_unverified", "failed"]);
+const TERMINAL_STATUSES = new Set([
+  "completed",
+  "completed_unverified",
+  "failed",
+  "interrupted",
+]);
 
 function asObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -152,6 +189,17 @@ function shortRunId(runId) {
   return text.length > 12 ? text.slice(0, 8) : text;
 }
 
+function mutationHeaders() {
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  if (appMetadata.controlToken) {
+    headers["X-Coding-Agent-Token"] = appMetadata.controlToken;
+  }
+  return headers;
+}
+
 function setConnection(connected) {
   elements.connectionDot.classList.toggle("is-offline", !connected);
   elements.connectionLabel.textContent = connected ? "本地服务已连接" : "服务不可用";
@@ -159,20 +207,36 @@ function setConnection(connected) {
 
 function setFormState(status) {
   const running = status === "running";
-  elements.taskInput.disabled = running || appMetadata.taskLocked;
-  elements.runButton.disabled = running;
+  const hasProject = appMetadata.controlToken
+    ? workbench?.hasSelectedProject() === true
+    : true;
+  elements.taskInput.disabled = running || appMetadata.taskLocked || !hasProject;
+  elements.runButton.disabled = running || !hasProject;
   elements.runButton.classList.toggle("is-running", running);
-  elements.runButtonLabel.textContent = running ? "智能体运行中" : "启动智能体";
+  elements.runButtonLabel.textContent = running
+    ? "智能体运行中"
+    : hasProject
+      ? "启动智能体"
+      : "请先选择项目";
+  workbench?.updateControls(status);
 }
 
 function renderMetadata(rawMetadata) {
   const metadata = asObject(rawMetadata);
   appMetadata = {
+    controlToken: asText(metadata.control_token).trim(),
     defaultTask: asText(metadata.default_task).trim(),
+    nativeFolderPickerAvailable: metadata.native_folder_picker_available === true,
     taskLocked: metadata.task_locked === true,
   };
-  elements.workspaceName.textContent = translateMetadataLabel(metadata.workspace, "本地仓库");
-  elements.runtimeLabel.textContent = translateMetadataLabel(metadata.runtime, "本地智能体");
+  elements.projectBrowser.hidden = !appMetadata.controlToken;
+  const project = workbench?.projectSummary();
+  elements.workspaceName.textContent = project
+    ? project.name
+    : translateMetadataLabel(metadata.workspace, "尚未选择项目");
+  elements.runtimeLabel.textContent = project
+    ? project.root
+    : translateMetadataLabel(metadata.runtime, "请选择本地项目");
   if (appMetadata.defaultTask && (!taskInputDirty || appMetadata.taskLocked)) {
     elements.taskInput.value = appMetadata.defaultTask;
   }
@@ -180,6 +244,9 @@ function renderMetadata(rawMetadata) {
 }
 
 function preserveServerTask(state) {
+  if (workbench?.isReplaying()) {
+    return;
+  }
   const serverTask = asText(state.task).trim();
   if (!serverTask) {
     return;
@@ -431,7 +498,8 @@ function renderLatestChange(rawChange) {
   return card;
 }
 
-function renderFinalMessage(finalText, failed, error) {
+function renderFinalMessage(finalText, status, error) {
+  const failed = status === "failed" || status === "interrupted";
   const message = makeMessageShell("agent", "Relay");
   message.heading.append(
     createElement(
@@ -442,7 +510,16 @@ function renderFinalMessage(finalText, failed, error) {
   );
   const answer = createElement("div", `final-answer ${failed ? "final-error" : ""}`);
   const content = asText(finalText).trim() || asText(error).trim();
+  const historyFallback = workbench?.isReplaying()
+    ? status === "interrupted"
+      ? "此次运行的轨迹未正常终止；这里只回放中断前经过白名单过滤的事件。"
+      : "此历史仅回放经过白名单过滤的可验证事件；最终回复未持久化。"
+    : "";
   appendRichText(answer, content || (failed ? "运行失败，但没有错误信息。" : "运行已完成。"));
+  if (!content && historyFallback) {
+    answer.replaceChildren();
+    appendRichText(answer, historyFallback);
+  }
   message.body.append(answer);
   return message.row;
 }
@@ -487,7 +564,7 @@ function renderConversation(state, snapshot, status) {
   }
 
   if (TERMINAL_STATUSES.has(status)) {
-    fragment.append(renderFinalMessage(state.final_text, status === "failed", state.error));
+    fragment.append(renderFinalMessage(state.final_text, status, state.error));
   }
 
   elements.messageList.replaceChildren(fragment);
@@ -637,11 +714,15 @@ function renderVerification(snapshot, runStatus) {
 }
 
 function renderMetrics(snapshot) {
-  const started = Math.max(0, asNumber(snapshot.tools_started));
-  const finished = Math.max(0, asNumber(snapshot.tools_finished));
+  const metrics = runtimeMetricView(snapshot);
   const failed = Math.max(0, asNumber(snapshot.tools_failed));
-  elements.metricStep.textContent = String(Math.max(0, asNumber(snapshot.current_step)));
-  elements.metricTools.textContent = `${finished} / ${started}`;
+  elements.metricStep.textContent = metrics.modelTurnsText;
+  elements.metricStep.setAttribute("aria-label", metrics.modelTurnsAriaLabel);
+  elements.metricStep.title = metrics.modelTurnsAriaLabel;
+  elements.metricTools.textContent = metrics.toolCallsText;
+  elements.metricTools.setAttribute("aria-label", metrics.toolCallsAriaLabel);
+  elements.metricTools.title = metrics.toolCallsAriaLabel;
+  elements.metricBudget.textContent = metrics.toolBudgetText;
   elements.metricFailed.textContent = String(failed);
   elements.metricFailed.classList.toggle("has-failures", failed > 0);
 
@@ -691,6 +772,39 @@ function showToast(message, tone = "error") {
   }, 4200);
 }
 
+workbench = createWorkbench({
+  elements,
+  formatServerDetail: translateServerDetail,
+  getControlToken: () => appMetadata.controlToken,
+  getNativeFolderPickerAvailable: () => appMetadata.nativeFolderPickerAvailable,
+  onBusyStateChanged() {
+    setFormState(normalizeRunStatus(asText(currentState?.status)));
+  },
+  onBeforeProjectChanged() {
+    currentState = null;
+    liveState = null;
+    lastRenderSignature = "";
+    lastServerTask = "";
+    taskInputDirty = false;
+    if (!appMetadata.taskLocked) {
+      elements.taskInput.value = "";
+    }
+  },
+  onHistoryState(state) {
+    lastRenderSignature = "";
+    renderState(state);
+  },
+  async onProjectChanged() {
+    await fetchMetadata();
+    await fetchState();
+  },
+  onReturnLive(state) {
+    lastRenderSignature = "";
+    renderState(state);
+  },
+  showToast,
+});
+
 async function fetchState() {
   if (pollInFlight) {
     return;
@@ -704,9 +818,17 @@ async function fetchState() {
     if (!response.ok) {
       throw new Error(`状态请求失败（HTTP ${response.status}）`);
     }
-    const state = await response.json();
+    const state = asObject(await response.json());
+    const nextStatus = normalizeRunStatus(asText(state.status));
+    liveState = state;
+    workbench.syncLiveState(state);
     consecutivePollFailures = 0;
-    renderState(state);
+    if (workbench.isReplaying()) {
+      setConnection(true);
+      setFormState(nextStatus);
+    } else {
+      renderState(state);
+    }
   } catch (error) {
     consecutivePollFailures += 1;
     if (consecutivePollFailures >= 2) {
@@ -738,6 +860,10 @@ async function fetchMetadata() {
 
 async function submitRun(event) {
   event.preventDefault();
+  if (appMetadata.controlToken && !workbench.hasSelectedProject()) {
+    elements.formMessage.textContent = "请先打开或新建一个项目。";
+    return;
+  }
   const task = elements.taskInput.value.trim();
   if (!task) {
     elements.formMessage.textContent = "请先描述任务，再启动智能体。";
@@ -749,22 +875,17 @@ async function submitRun(event) {
   elements.runButton.disabled = true;
   elements.runButton.classList.add("is-running");
   elements.runButtonLabel.textContent = "正在启动…";
+  if (workbench.isReplaying()) {
+    workbench.returnToCurrent();
+  }
 
   try {
     const response = await fetch("/api/runs", {
       body: JSON.stringify({ task }),
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
+      headers: mutationHeaders(),
       method: "POST",
     });
 
-    if (response.status === 409) {
-      showToast("已有任务正在运行。", "warning");
-      await fetchState();
-      return;
-    }
     if (response.status !== 202) {
       let detail = `任务请求失败（HTTP ${response.status}）`;
       try {
@@ -773,10 +894,17 @@ async function submitRun(event) {
       } catch {
         // Keep the status-based message when the server did not return JSON.
       }
+      if (response.status === 409) {
+        showToast(detail, "warning");
+        await fetchState();
+        return;
+      }
       throw new Error(detail);
     }
 
     const acceptedState = await response.json();
+    liveState = acceptedState;
+    workbench.beginRun(acceptedState);
     lastRenderSignature = "";
     renderState(acceptedState);
     showToast("任务已接收，Relay 正在规划第一步。", "success");
@@ -801,5 +929,13 @@ elements.taskInput.addEventListener("keydown", (event) => {
   }
 });
 
-Promise.all([fetchMetadata(), fetchState()]);
+async function initializeApp() {
+  await fetchMetadata();
+  if (appMetadata.controlToken) {
+    await workbench.initialize();
+  }
+  await fetchState();
+}
+
+void initializeApp();
 window.setInterval(fetchState, POLL_INTERVAL_MS);

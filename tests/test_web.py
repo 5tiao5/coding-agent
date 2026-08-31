@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from coding_agent.errors import CodedError
 from coding_agent.events import EventKind, EventSink, RunEvent
 from coding_agent.models import (
     AgentResult,
@@ -54,7 +55,15 @@ def _emit_completed_story(run_id: str, sink: EventSink) -> None:
             run_id=run_id,
             kind=EventKind.RUN_STARTED,
             message="raw event message must not reach the browser",
-            data={"private": "raw event data must not reach the browser"},
+            data={
+                "private": "raw event data must not reach the browser",
+                "limits": {
+                    "max_model_turns": 20,
+                    "max_calls_per_turn": 8,
+                    "max_total_tool_calls": 40,
+                    "private": "must-not-leak",
+                },
+            },
         )
     )
     sink.emit(
@@ -173,6 +182,7 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
         "task_label",
         "phase",
         "current_step",
+        "limits",
         "tools_started",
         "tools_finished",
         "tools_failed",
@@ -191,6 +201,11 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
     assert snapshot["task_label"] == "Repair the example"
     assert snapshot["phase"] == "COMPLETED"
     assert snapshot["current_step"] == 2
+    assert snapshot["limits"] == {
+        "max_model_turns": 20,
+        "max_calls_per_turn": 8,
+        "max_total_tool_calls": 40,
+    }
     assert snapshot["tools_started"] == 1
     assert snapshot["tools_finished"] == 1
     assert snapshot["verification_status"] == "verified"
@@ -287,6 +302,88 @@ def test_api_projects_a_sanitized_model_retry_while_the_run_is_active() -> None:
     _wait_for(service)
 
 
+def test_api_projects_tool_batch_rejection_as_a_bounded_retry() -> None:
+    rejection_visible = Event()
+    release = Event()
+
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.RUN_STARTED,
+                message="started",
+                data={
+                    "limits": {
+                        "max_model_turns": 20,
+                        "max_calls_per_turn": 8,
+                        "max_total_tool_calls": 40,
+                    }
+                },
+            )
+        )
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.TOOL_BATCH_REJECTED,
+                message="TEST_PRIVATE_TOOL_ARGUMENTS",
+                step=2,
+                data={
+                    "requested_calls": 9,
+                    "max_calls_per_turn": 8,
+                    "rejection_count": 1,
+                    "max_rejections": 3,
+                    "raw_arguments": "TEST_PRIVATE_TOOL_ARGUMENTS",
+                },
+            )
+        )
+        rejection_visible.set()
+        assert release.wait(timeout=2)
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.RUN_FAILED,
+                message="failed",
+                step=2,
+                data={"stop_reason": StopReason.MODEL_ERROR.value},
+            )
+        )
+        return AgentResult(
+            run_id=run_id,
+            state=AgentState.FAILED,
+            stop_reason=StopReason.MODEL_ERROR,
+            steps=2,
+            messages=_messages(task),
+        )
+
+    service = WebRunService(runner)
+    client = _test_client(create_app(service))
+
+    assert client.post("/api/runs", json={"task": "split the batch"}).status_code == 202
+    assert rejection_visible.wait(timeout=2)
+    response = client.get("/api/state")
+    snapshot = response.json()["snapshot"]
+    entry = snapshot["timeline"][-1]
+
+    assert response.json()["status"] == "running"
+    assert snapshot["phase"] == "REPLANNING"
+    assert snapshot["limits"] == {
+        "max_model_turns": 20,
+        "max_calls_per_turn": 8,
+        "max_total_tool_calls": 40,
+    }
+    assert snapshot["tools_started"] == snapshot["tools_finished"] == 0
+    assert snapshot["tools_failed"] == 0
+    assert entry["category"] == "MODEL"
+    assert entry["level"] == "warning"
+    assert entry["headline"] == "Tool batch too large; split retry requested"
+    assert entry["detail"] == (
+        "Requested 9 tool calls; per-turn limit 8; split retry requested; rejection 1 of 3"
+    )
+    assert "TEST_PRIVATE_TOOL_ARGUMENTS" not in response.text
+    release.set()
+    _wait_for(service)
+
+
 def test_second_concurrent_run_is_rejected_with_conflict() -> None:
     started = Event()
     release = Event()
@@ -342,6 +439,27 @@ def test_runner_exception_becomes_failed_state() -> None:
     assert state["snapshot"]["task_label"] == "trigger failure"
 
 
+def test_model_setup_error_becomes_actionable_without_exposing_exception_text() -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        del run_id, task, event_sink
+        raise CodedError(
+            "openai_client_configuration",
+            "configuration included TEST_PRIVATE_API_KEY",
+        )
+
+    service = WebRunService(runner)
+    client = _test_client(create_app(service))
+
+    assert client.post("/api/runs", json={"task": "configure model"}).status_code == 202
+    _wait_for(service)
+    response = client.get("/api/state")
+
+    assert response.json()["error"] == (
+        "模型客户端配置失败。请检查 API Key、接口地址和相关环境变量。"
+    )
+    assert "TEST_PRIVATE" not in response.text
+
+
 def test_failed_agent_result_maps_stop_reason_without_exposing_raw_error() -> None:
     secret = "TEST_RESULT_SECRET_SENTINEL"
 
@@ -364,8 +482,100 @@ def test_failed_agent_result_maps_stop_reason_without_exposing_raw_error() -> No
     response = client.get("/api/state")
 
     assert response.json()["status"] == "failed"
-    assert response.json()["error"] == "模型请求失败。"
+    assert response.json()["error"] == "模型请求失败。请检查模型配置或稍后重试。"
     assert secret not in response.text
+
+
+@pytest.mark.parametrize(
+    ("private_error", "expected"),
+    [
+        (
+            "Model returned invalid tool-call arguments after protocol recovery attempts",
+            "模型返回的工具参数格式无效，自动纠正重试后仍未恢复。",
+        ),
+        (
+            "Model request failed after transient retries",
+            "模型服务暂时不可用，自动重试后仍未恢复。请稍后重试。",
+        ),
+        (
+            "Model request failed: OpenAI model request failed",
+            "模型请求被服务端拒绝。请检查 API Key、模型名称、接口地址和账户权限。",
+        ),
+        (
+            "Model request failed: OpenAI returned an invalid response: "
+            "TEST_PRIVATE_PROVIDER_RESPONSE",
+            "模型返回了无法识别的响应格式，请重试或更换兼容模型。",
+        ),
+    ],
+)
+def test_model_failures_map_to_specific_safe_public_reasons(
+    private_error: str,
+    expected: str,
+) -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        del event_sink
+        return AgentResult(
+            run_id=run_id,
+            state=AgentState.FAILED,
+            stop_reason=StopReason.MODEL_ERROR,
+            steps=2,
+            error=private_error,
+            messages=_messages(task),
+        )
+
+    service = WebRunService(runner)
+    client = _test_client(create_app(service))
+
+    assert client.post("/api/runs", json={"task": "explain model failure"}).status_code == 202
+    _wait_for(service)
+    response = client.get("/api/state")
+
+    assert response.json()["error"] == expected
+    assert "TEST_PRIVATE" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("private_error", "expected"),
+    [
+        (
+            "Model exceeded the per-step tool call limit 3 consecutive times: 9 > 8",
+            "模型连续提交过大的工具批次（本轮 9，上限 8）。",
+        ),
+        (
+            "Model exceeded the total tool call limit: 41 > 40",
+            "模型达到工具调用总上限（累计请求 41，上限 40）。",
+        ),
+        (
+            "Model exceeded the total tool call limit: SECRET > 40",
+            "任务已达到设定的工具调用上限。",
+        ),
+    ],
+)
+def test_tool_limit_error_exposes_only_exact_agent_owned_counts(
+    private_error: str,
+    expected: str,
+) -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        del event_sink
+        return AgentResult(
+            run_id=run_id,
+            state=AgentState.FAILED,
+            stop_reason=StopReason.TOOL_LIMIT,
+            steps=3,
+            error=private_error,
+            messages=_messages(task),
+        )
+
+    service = WebRunService(runner)
+    client = _test_client(create_app(service))
+
+    assert client.post("/api/runs", json={"task": "respect tool limits"}).status_code == 202
+    _wait_for(service)
+    response = client.get("/api/state")
+
+    assert response.json()["error"] == expected
+    if "SECRET" in private_error:
+        assert "SECRET" not in response.text
 
 
 def test_app_factory_defaults_to_the_packaged_static_directory() -> None:
@@ -384,6 +594,8 @@ def test_app_factory_defaults_to_the_packaged_static_directory() -> None:
     ):
         assert client.get(f"/static/{stylesheet}").status_code == 200
     assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/_metrics.js").status_code == 200
+    assert client.get("/static/_workbench.js").status_code == 200
     assert client.get("/static/locale-zh.js").status_code == 200
     assert client.get("/static/favicon.svg").status_code == 200
 
@@ -446,7 +658,9 @@ def test_metadata_exposes_only_server_owned_display_settings() -> None:
         "runtime": "Offline deterministic demo",
         "task_locked": True,
         "default_task": "Repair the pricing helper",
+        "native_folder_picker_available": False,
     }
+    assert client.post("/api/folders/pick", json={}).status_code == 404
     assert client.post("/api/runs", json={"task": "Run an unrelated task"}).status_code == 422
 
 

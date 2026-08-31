@@ -15,6 +15,8 @@ def test_explicit_state_directory_override_is_partitioned(tmp_path: Path) -> Non
     assert state.root == tmp_path.resolve()
     assert state.sessions == tmp_path.resolve() / "sessions"
     assert state.traces == tmp_path.resolve() / "traces"
+    assert state.projects_file == tmp_path.resolve() / "projects.json"
+    assert state.runs == tmp_path.resolve() / "runs"
 
 
 def test_relative_state_directory_override_is_rejected() -> None:

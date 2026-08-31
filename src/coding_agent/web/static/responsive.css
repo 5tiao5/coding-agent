@@ -1,10 +1,10 @@
-@media (max-width: 1080px) {
+@media (max-width: 1140px) {
   body {
     overflow: auto;
   }
 
   .app-shell {
-    grid-template-columns: 215px minmax(0, 1fr);
+    grid-template-columns: 250px minmax(0, 1fr);
     height: auto;
     min-height: 100vh;
   }
@@ -36,6 +36,17 @@
   }
 }
 
+@media (max-height: 760px) and (min-width: 761px) {
+  .workspace-card,
+  .local-note {
+    display: none;
+  }
+
+  .project-browser {
+    min-height: 210px;
+  }
+}
+
 @media (max-width: 760px) {
   .app-shell {
     display: flex;
@@ -56,6 +67,19 @@
 
   .brand {
     padding-bottom: 13px;
+  }
+
+  .project-browser {
+    max-height: 330px;
+    min-height: 250px;
+  }
+
+  .project-list {
+    max-height: 105px;
+  }
+
+  .run-history-list {
+    max-height: 125px;
   }
 
   .workspace-card,
@@ -109,6 +133,10 @@
   .activity-category {
     display: block;
     margin-bottom: 3px;
+  }
+
+  .project-dialog-form {
+    padding: 17px;
   }
 }
 

@@ -10,10 +10,10 @@ from uuid import uuid4
 from coding_agent.dashboard import DashboardProjection, DashboardSnapshot, TimelineEntry
 from coding_agent.errors import CodedError
 from coding_agent.events import EventSink, RunEvent
-from coding_agent.models import AgentResult, AgentState, StopReason
+from coding_agent.models import AgentResult, AgentState
+from coding_agent.public_errors import public_coded_error, public_result_error
 
 WebRunStatus = Literal["idle", "running", "completed", "completed_unverified", "failed"]
-
 
 class TimelinePayload(TypedDict):
     """Whitelisted presentation fields for one projected timeline entry."""
@@ -48,12 +48,21 @@ class VerificationEvidencePayload(TypedDict):
     epoch: int
 
 
+class RunLimitsPayload(TypedDict):
+    """Whitelisted immutable budgets selected by the host for one run."""
+
+    max_model_turns: int
+    max_calls_per_turn: int
+    max_total_tool_calls: int
+
+
 class SnapshotPayload(TypedDict):
     """Browser-safe subset of :class:`DashboardSnapshot`."""
 
     task_label: str
     phase: str
     current_step: int
+    limits: RunLimitsPayload | None
     tools_started: int
     tools_finished: int
     tools_failed: int
@@ -214,7 +223,7 @@ class WebRunService:
             self._status = _result_status(result)
             self._final_text = result.final_text
             self._error = (
-                _public_result_error(result) if result.state is AgentState.FAILED else None
+                public_result_error(result) if result.state is AgentState.FAILED else None
             )
 
     def _apply_event(self, expected_run_id: str, event: RunEvent) -> None:
@@ -252,6 +261,15 @@ def _snapshot_payload(snapshot: DashboardSnapshot) -> SnapshotPayload:
         "task_label": snapshot.task_label,
         "phase": snapshot.phase,
         "current_step": snapshot.current_step,
+        "limits": (
+            {
+                "max_model_turns": snapshot.limits.max_model_turns,
+                "max_calls_per_turn": snapshot.limits.max_calls_per_turn,
+                "max_total_tool_calls": snapshot.limits.max_total_tool_calls,
+            }
+            if snapshot.limits is not None
+            else None
+        ),
         "tools_started": snapshot.tools_started,
         "tools_finished": snapshot.tools_finished,
         "tools_failed": snapshot.tools_failed,
@@ -313,22 +331,7 @@ def _timeline_payload(entry: TimelineEntry) -> TimelinePayload:
 
 def _public_worker_error(exc: BaseException) -> str:
     if isinstance(exc, CodedError):
-        message = " ".join(exc.message.split())
-        bounded = message if len(message) <= 400 else f"{message[:397]}..."
-        return f"运行失败：{bounded} [{exc.code}]"
+        return public_coded_error(exc)
     if isinstance(exc, OSError):
         return "Agent 运行时发生了本地文件系统错误。"
     return f"本地 Agent 运行失败（{type(exc).__name__}）。"
-
-
-def _public_result_error(result: AgentResult) -> str:
-    messages = {
-        StopReason.MAX_STEPS: "任务已达到设定的最大步骤数。",
-        StopReason.TOOL_LIMIT: "任务已达到设定的工具调用上限。",
-        StopReason.MODEL_ERROR: "模型请求失败。",
-        StopReason.USER_INTERRUPTED: "任务已由用户中断。",
-        StopReason.COMMAND_CONTROL_FAILED: "命令进程控制失败。",
-        StopReason.CONTEXT_LIMIT: "模型上下文超出了设定预算。",
-        StopReason.REPEATED_TOOL_CALL: "Agent 因重复执行相同工具调用而停止。",
-    }
-    return messages.get(result.stop_reason, "本地 Agent 运行失败。")

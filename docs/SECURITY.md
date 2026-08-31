@@ -71,12 +71,35 @@ instead of misreporting an already-applied change as a normal failure.
 
 ## Local Web boundary
 
-- The optional Web host binds only to `127.0.0.1`; there is no configurable remote bind. The
-  server, not the browser, owns the repository, model, base URL, permission mode, state root,
-  verifier registrations, and run limits.
+- The optional Web host binds only to `127.0.0.1`; there is no configurable remote bind. A
+  token-protected request may ask the local host to open the native Windows folder chooser, and the
+  browser may also propose an absolute directory during explicit project registration. A picker
+  result is convenience, not authority: the server still resolves, validates, fingerprints, and then
+  owns the active project together with the model, base URL, permission mode, state root, verifier
+  registrations, and run limits. A normal run request contains no path, and the captured project
+  context cannot change during that run.
 - `TrustedHostMiddleware` accepts only `127.0.0.1` and `localhost`. Responses add a self-only
   Content Security Policy plus `no-referrer`, `nosniff`, frame-deny, and `no-store` headers. These
   are browser hardening measures, not user authentication.
+- Workbench mutations require a random per-process control token learned through same-origin
+  metadata; requests with an `Origin` header must also match the loopback origin. Project selection
+  uses an empty JSON body and task/project creation use JSON, preventing simple cross-origin forms.
+  Read-only endpoints remain local and are still not a hostile-same-machine authentication boundary.
+- The native picker bridge uses the same mutation token and Origin checks, allows only one dialog at
+  a time, and returns stable cancelled/busy/unavailable outcomes without exception detail. It never
+  runs in the deterministic demo. While the dialog is open, one server-side navigation reservation
+  rejects run admission, project registration/selection, and a second picker request; the reservation
+  is released on selection, cancellation, and failure.
+- Project/run navigation records are bounded, versioned JSON in the private state directory. Stores
+  reject link-like paths and non-regular/hard-linked records, use atomic replacement, and cannot sit
+  inside a registered workspace or contain it. New-project creation makes only one absent empty leaf,
+  never overwrites an existing directory, and rolls back that leaf if registration fails. Each run
+  record freezes the selected directory fingerprint; a replaced directory cannot inherit or replay
+  runs from the old physical identity.
+- Project history is an untrusted navigation aid, not execution authority. The API rebuilds a
+  bounded `DashboardProjection` from validated trace events and omits raw event messages, checkpoint
+  conversations, provider state, and canonical final replies. Runs created before M5.5 metadata are
+  not automatically listed.
 - API credentials remain in the backend environment. A process entry point may populate that
   environment from the exact launch-directory `.env.local`; it never searches parents, loads only
   the four allowlisted model settings, disables interpolation, and preserves existing environment
@@ -203,10 +226,13 @@ or a fragment; plain HTTP is limited to loopback.
 Tool schemas currently advertise `strict=false` because several local Pydantic schemas intentionally
 contain optional fields with defaults; project-owned validation remains authoritative. SDK retries
 default to zero so retry behavior is not hidden below runtime events and deadlines. The project-owned
-runner retries only connection/timeouts, HTTP 408/409/429, and HTTP 5xx, with at most two retries in
-normal runs and one in evaluation. Every attempt and scheduled delay is observable. Retry events and
-terminal results use a fixed public error code/message rather than adapter-supplied detail. Provider
-errors are mapped without preserving headers, URLs, bodies, credentials, or exception chains.
+runner handles two recoverable classes within one bounded attempt budget: connection/timeouts plus
+HTTP 408/409/429/5xx use exponential backoff; malformed function-call argument JSON is rejected
+before canonical history, tool dispatch, checkpoints, or tool-budget accounting and receives an
+immediate protocol-correction request. Normal runs allow at most two retries and evaluation one.
+Every attempt and retry category is observable. Correction prompts and terminal results are fixed,
+sanitized text; provider arguments, headers, URLs, bodies, credentials, and exception chains are
+never retained or surfaced.
 
 Stateless reasoning continuation is an explicit limitation. If a response combines a reasoning item
 with function calls, safe continuation would require retaining and replaying encrypted provider

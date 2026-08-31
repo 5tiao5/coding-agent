@@ -15,6 +15,10 @@ class RetryableModelError(CodedError):
     """A sanitized transient model failure that the project-owned loop may retry."""
 
 
+class RecoverableModelResponseError(CodedError):
+    """A sanitized malformed model response that is safe to discard and replace."""
+
+
 class ModelAdapter(Protocol):
     def complete(
         self,

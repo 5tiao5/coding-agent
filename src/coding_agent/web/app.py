@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal, Protocol
+from unicodedata import category
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
@@ -14,15 +18,41 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from coding_agent.web.native_picker import (
+    NativeFolderPicker,
+    NativeFolderPickerBusyError,
+    NativeFolderPickerUnavailableError,
+)
 from coding_agent.web.service import (
     RunAlreadyActiveError,
-    WebRunService,
     WebRunStartError,
     WebRunStatePayload,
     WebServiceClosedError,
 )
+from coding_agent.web.workbench import (
+    HistoryPayload,
+    NoActiveProjectError,
+    ProjectListPayload,
+    ProjectPayload,
+    ProjectRunsPayload,
+    WebWorkbench,
+    WorkbenchBusyError,
+    WorkbenchError,
+    WorkbenchInputError,
+    WorkbenchNotFoundError,
+)
 
 DEFAULT_SHUTDOWN_DRAIN_SECONDS = 5.0
+
+
+class _RunService(Protocol):
+    """Narrow service surface shared by fixed and project-aware hosts."""
+
+    def start(self, task: str) -> WebRunStatePayload: ...
+
+    def state(self) -> WebRunStatePayload: ...
+
+    def shutdown(self, timeout: float | None = None) -> bool: ...
 
 
 class RunRequest(BaseModel):
@@ -38,6 +68,11 @@ class RunRequest(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("task cannot be blank")
+        if any(
+            category(character).startswith("C") and character not in {"\t", "\n", "\r"}
+            for character in normalized
+        ):
+            raise ValueError("task cannot contain control or formatting characters")
         return normalized
 
 
@@ -74,12 +109,21 @@ class VerificationEvidenceResponse(BaseModel):
     epoch: int
 
 
+class RunLimitsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_model_turns: int = Field(ge=1, le=1_000_000)
+    max_calls_per_turn: int = Field(ge=1, le=1_000_000)
+    max_total_tool_calls: int = Field(ge=1, le=1_000_000)
+
+
 class SnapshotResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_label: str
     phase: str
     current_step: int
+    limits: RunLimitsResponse | None
     tools_started: int
     tools_finished: int
     tools_failed: int
@@ -114,16 +158,103 @@ class WebMetadataResponse(BaseModel):
     runtime: str
     task_locked: bool
     default_task: str | None
+    control_token: str | None = None
+    native_folder_picker_available: bool
+
+
+class ProjectRegistrationRequest(BaseModel):
+    """One explicit local project registration or empty-directory creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    root: str = Field(min_length=1, max_length=4096)
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    create: bool = False
+
+    @field_validator("root", "display_name")
+    @classmethod
+    def normalize_bounded_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value cannot be blank")
+        return normalized
+
+
+class SelectProjectRequest(BaseModel):
+    """Strict empty JSON body used to keep selection non-simple and auditable."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PickFolderRequest(BaseModel):
+    """Strict empty body for the native local-control operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PickFolderResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["selected", "cancelled"]
+    path: str | None
+
+
+class ProjectResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    display_name: str
+    root: str
+    created_at: str
+    last_opened_at: str
+
+
+class ProjectListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    active_project_id: str | None
+    projects: list[ProjectResponse]
+
+
+class RunCatalogResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    project_id: str
+    task: str
+    status: str
+    created_at: str
+    completed_at: str | None
+    final_text: str | None = None
+    error: str | None = None
+
+
+class ProjectRunsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    runs: list[RunCatalogResponse]
+
+
+class HistoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run: RunCatalogResponse
+    snapshot: SnapshotResponse
 
 
 def create_app(
-    service: WebRunService,
+    service: _RunService,
     *,
     static_dir: str | Path | None = None,
     workspace_label: str = "本地仓库",
     runtime_label: str = "本地 Agent",
     default_task: str | None = None,
     task_locked: bool = False,
+    workbench: WebWorkbench | None = None,
+    native_folder_picker: NativeFolderPicker | None = None,
 ) -> FastAPI:
     """Create an API app bound to one injected run service and asset directory."""
     if task_locked and default_task is None:
@@ -156,12 +287,7 @@ def create_app(
     )
     app.state.run_service = service
     app.state.static_dir = assets
-    metadata = WebMetadataResponse(
-        workspace=workspace_label,
-        runtime=runtime_label,
-        task_locked=task_locked,
-        default_task=default_task,
-    )
+    control_token = secrets.token_urlsafe(32) if workbench is not None else None
 
     @app.middleware("http")
     async def secure_local_responses(
@@ -187,17 +313,29 @@ def create_app(
     def get_state() -> WebRunStatePayload:
         return service.state()
 
-    @app.get("/api/meta", response_model=WebMetadataResponse)
+    @app.get(
+        "/api/meta",
+        response_model=WebMetadataResponse,
+        response_model_exclude_none=True,
+    )
     def get_metadata() -> WebMetadataResponse:
-        return metadata
+        return WebMetadataResponse(
+            workspace=(workbench.workspace_label if workbench is not None else workspace_label),
+            runtime=runtime_label,
+            task_locked=task_locked,
+            default_task=default_task,
+            control_token=control_token,
+            native_folder_picker_available=_picker_available(native_folder_picker),
+        )
 
     @app.post(
         "/api/runs",
         response_model=WebRunResponse,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def start_run(request: RunRequest) -> WebRunStatePayload:
-        if metadata.task_locked and request.task != metadata.default_task:
+    def start_run(request: RunRequest, raw_request: Request) -> WebRunStatePayload:
+        _authorize_mutation(raw_request, control_token)
+        if task_locked and request.task != default_task:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="此本地界面已锁定为预设演示任务",
@@ -209,11 +347,119 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(exc),
             ) from None
+        except (NoActiveProjectError, WorkbenchBusyError, WorkbenchInputError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from None
         except (WebRunStartError, WebServiceClosedError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(exc),
             ) from None
+        except WorkbenchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from None
+
+    if workbench is not None:
+
+        @app.post("/api/folders/pick", response_model=PickFolderResponse)
+        def pick_folder(
+            request: PickFolderRequest,
+            raw_request: Request,
+        ) -> PickFolderResponse:
+            del request
+            _authorize_mutation(raw_request, control_token)
+            picker = native_folder_picker
+            if picker is None or not _picker_available(picker):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="本机文件夹选择器暂时不可用",
+                )
+            try:
+                with workbench.reserve_navigation():
+                    selected = picker.pick_directory()
+            except WorkbenchBusyError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(exc),
+                ) from None
+            except NativeFolderPickerBusyError:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="已有文件夹选择窗口正在等待操作",
+                ) from None
+            except NativeFolderPickerUnavailableError:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="本机文件夹选择器暂时不可用",
+                ) from None
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="本机文件夹选择器暂时不可用",
+                ) from None
+            if selected is None:
+                return PickFolderResponse(status="cancelled", path=None)
+            return PickFolderResponse(status="selected", path=str(selected))
+
+        @app.get("/api/projects", response_model=ProjectListResponse)
+        def list_projects() -> ProjectListPayload:
+            return workbench.projects()
+
+        @app.post(
+            "/api/projects",
+            response_model=ProjectResponse,
+            status_code=status.HTTP_201_CREATED,
+        )
+        def register_project(
+            request: ProjectRegistrationRequest,
+            raw_request: Request,
+        ) -> ProjectPayload:
+            _authorize_mutation(raw_request, control_token)
+            try:
+                return workbench.register_project(
+                    root=request.root,
+                    display_name=request.display_name,
+                    create=request.create,
+                )
+            except Exception as exc:  # Normalize persistence and local path failures.
+                raise _workbench_http_error(exc) from None
+
+        @app.post(
+            "/api/projects/{project_id}/select",
+            response_model=ProjectResponse,
+        )
+        def select_project(
+            project_id: str,
+            request: SelectProjectRequest,
+            raw_request: Request,
+        ) -> ProjectPayload:
+            del request
+            _authorize_mutation(raw_request, control_token)
+            try:
+                return workbench.select_project(project_id)
+            except Exception as exc:
+                raise _workbench_http_error(exc) from None
+
+        @app.get(
+            "/api/projects/{project_id}/runs",
+            response_model=ProjectRunsResponse,
+        )
+        def list_project_runs(project_id: str) -> ProjectRunsPayload:
+            try:
+                return workbench.project_runs(project_id)
+            except Exception as exc:
+                raise _workbench_http_error(exc) from None
+
+        @app.get("/api/history/{run_id}", response_model=HistoryResponse)
+        def get_history(run_id: str) -> HistoryPayload:
+            try:
+                return workbench.history(run_id)
+            except Exception as exc:
+                raise _workbench_http_error(exc) from None
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -231,3 +477,52 @@ def create_app(
         name="static",
     )
     return app
+
+
+def _authorize_mutation(request: Request, control_token: str | None) -> None:
+    """Require same-origin possession of a per-process token for workbench writes."""
+
+    if control_token is None:
+        return
+    supplied = request.headers.get("x-coding-agent-token", "")
+    if not supplied or not hmac.compare_digest(supplied, control_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="缺少有效的本地控制令牌",
+        )
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    expected_origin = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    if not hmac.compare_digest(origin.rstrip("/"), expected_origin.rstrip("/")):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="拒绝跨来源的本地控制请求",
+        )
+
+
+def _picker_available(picker: NativeFolderPicker | None) -> bool:
+    if picker is None:
+        return False
+    try:
+        return picker.available
+    except Exception:
+        return False
+
+
+def _workbench_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, WorkbenchBusyError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, NoActiveProjectError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, WorkbenchNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, (WorkbenchInputError, ValueError)):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="本地项目状态暂时不可用",
+    )

@@ -1,8 +1,8 @@
 # Coding Agent 项目计划
 
-> 版本：v0.5 · 2026-08-30 · 截止：2026-09-02 24:00（北京时间）
+> 版本：v0.5.5 · 2026-08-31 · 截止：2026-09-02 24:00（北京时间）
 
-> 当前进度：M4 已完成；M5 核心已落地本地 loopback 会话视图、可观察模型重试、全仓变更范围证明和四类外置 oracle 评测。DeepSeek 实测两轮共 8/8 场景通过，主线剩余干净环境复验、最终演示任务三连测与视频彩排。
+> 当前进度：M5 已完成并推送；M5.5 本地项目工作台已完成多轮 Web/live 手测。DeepSeek 两轮共 8/8 微型场景通过；手测暴露的复杂任务验证、预算和长程记忆问题进入 M5.6 可靠性加固，之后再做干净环境复验、演示三连测和视频彩排。
 
 ## 1. 目标
 
@@ -39,7 +39,7 @@
 - 被动 transcript checkpoint/load/resume、工作区绑定、完成轨迹拒绝和并发恢复 lease；工具局部状态不跨进程恢复。
 - 写文件前生成 Diff，并支持本次会话内撤销。
 - JSONL 事件轨迹与 `inspect <run-id>`：记录工具调用、结果、耗时、错误和停止原因；不记录模型隐式思维过程。
-- M5-UX 本地会话视图：绑定 loopback、单后台任务、复用同一 application service，只向浏览器提供白名单状态投影。
+- M5.5 本地项目工作台：绑定 loopback、Windows 原生文件夹选择与手动路径兜底、全局单后台任务、项目登记/安全空目录创建、左侧项目与新运行历史、可信轨迹回放；复用同一 application service，只向浏览器提供白名单状态投影。
 - 自动评测：单文件修复、跨文件修改、新增功能、间接故障调试四类任务；每类使用临时公开红测、受保护测试清单、全仓前后 manifest、显式变更路径白名单、白名单源码复制和工作区外独立回归 oracle，统计成功率、步数、耗时和工具错误，并区分任务失败与运行错误。oracle 定义随项目发布，这是评分路径隔离而非秘密 benchmark 边界。
 
 ### P2：时间允许再做
@@ -50,12 +50,13 @@
 
 ### 非目标
 
-完整的远程/多用户 Web 产品、浏览器终端或编辑器、Web 审批 broker、多 Agent、向量数据库、MCP、插件市场、远程沙箱和 IDE 集成不进入本次范围。M5-UX 仅是 `127.0.0.1` 上的单任务会话视图，不扩张这些边界。
+完整的远程/多用户 Web 产品、打包桌面壳、Git clone/初始化与模板、浏览器终端或编辑器、Web 审批 broker、多 Agent、向量数据库、MCP、插件市场、远程沙箱和 IDE 集成不进入本次范围。M5.5 仍是 `127.0.0.1` 上的本地单-worker 工作台。
 
 ## 4. 架构
 
 ```text
 CLI / loopback Web
+ ├─ WebWorkbench（项目注册表 + 运行目录 + 单 worker）
  └─ Repository application service
      └─ AgentRunner（状态机与循环）
          ├─ ModelAdapter（供应商协议隔离）
@@ -69,7 +70,7 @@ CLI / loopback Web
          └─ EventSink
              ├─ JsonlEventSink（持久轨迹与 inspect）
              ├─ DashboardEventSink（Rich 时间线与验证卡）
-             └─ WebRunService（浏览器白名单投影）
+             └─ WebRunService（实时白名单投影）
 
 evaluate CLI
  └─ 临时公开 fixture → 同一 Repository application service
@@ -120,7 +121,9 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
 | 8/29 | M2 工具与安全 | 完成 | Agent 在 fixture 中定位 Bug、原子修改并支持撤销 |
 | 8/30 | M3 上下文与验证 | 完成 | 命令、计划、压缩、停止、被动恢复和 Verification Gate 测试通过 |
 | 8/31 | M4 Demo UX 与轨迹 | 完成 | 真实模型 CLI、审批、时间线、Diff、恢复、`inspect` 和验证卡片可完整演示 |
-| 9/1 | M5 评测与冻结 | 进行中 | M5-UX、可观察重试和四类外置 oracle 评测已实现；DeepSeek 两轮 8/8 通过，待干净环境复验、最终演示任务三连测与视频彩排 |
+| 8/31 | M5 评测与冻结 | 完成 | M5-UX、可观察重试和四类外置 oracle 评测已实现并推送；DeepSeek 两轮 8/8 通过 |
+| 9/1 | M5.5 项目工作台 | 完成 | 项目选择/安全新建、左侧历史、可信回放和运行期根目录冻结已实现并完成多轮手测 |
+| 9/1–9/2 | M5.6 可靠性加固 | 进行中 | 修正复杂任务验证合同、预算/上下文、长程记忆与代表性评测 |
 | 9/2 | 最终交付 | 待开始 | 安全检查、录制视频、整理材料并在截止前完成最终推送 |
 
 按可解释的功能单元小步提交并保留历史，不 squash、不改写已推送提交；截止后不再 push，包括文档修正和 tag。

@@ -229,7 +229,64 @@ def test_web_demo_uses_loopback_and_the_same_verified_scenario(
         "runtime": "离线确定性演示",
         "task_locked": True,
         "default_task": DEMO_TASK,
+        "native_folder_picker_available": False,
     }
+
+
+def test_live_web_injects_the_native_folder_picker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = (tmp_path / "selected").resolve()
+    selected.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeNativePicker:
+        available = True
+
+        def pick_directory(self) -> Path:
+            return selected
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    monkeypatch.setattr(
+        "coding_agent.web.native_picker.WindowsNativeFolderPicker",
+        FakeNativePicker,
+    )
+
+    def fake_run(web_app: FastAPI, **kwargs: object) -> None:
+        captured.update(kwargs)
+        client = TestClient(web_app, base_url="http://localhost")
+        metadata = client.get("/api/meta").json()
+        token = metadata["control_token"]
+        picked = client.post(
+            "/api/folders/pick",
+            json={},
+            headers={"X-Coding-Agent-Token": token},
+        )
+        captured["metadata"] = metadata
+        captured["picked"] = picked.json()
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "web",
+            "--model",
+            "gpt-test",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--no-open-browser",
+            "--port",
+            "8124",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["host"] == "127.0.0.1"
+    metadata = captured["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["native_folder_picker_available"] is True
+    assert captured["picked"] == {"status": "selected", "path": str(selected)}
 
 
 def test_real_run_persists_terminal_session_and_inspectable_trace(
@@ -741,6 +798,32 @@ def test_live_cli_help_discloses_the_stateless_reasoning_limit() -> None:
         assert all(word in plain_output for word in ("stateless", "provider", "reasoning", "state"))
         assert "--reasoning-effort" in plain_output
         assert "use" in plain_output and "none" in plain_output
+
+
+@pytest.mark.parametrize(
+    ("command", "scope"),
+    [
+        ("evaluate", "per evaluation case"),
+        ("web", "per live Web run"),
+        ("run", "for the complete run"),
+        ("resume", "model turns, including completed turns"),
+    ],
+)
+def test_max_steps_help_separates_model_turns_from_fixed_tool_budgets(
+    command: str,
+    scope: str,
+) -> None:
+    result = runner.invoke(app, [command, "--help"], terminal_width=220)
+
+    assert result.exit_code == 0
+    decoded = re.sub(r"[\u2500-\u257f]", " ", Text.from_ansi(result.stdout).plain)
+    plain_output = " ".join(decoded.split())
+    assert "--max-steps" in plain_output
+    assert scope in plain_output
+    if command == "resume":
+        assert "Maximum cumulative" in plain_output
+    assert "8 tool calls per turn" in plain_output
+    assert "40 per" in plain_output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv launchers are symlinks")

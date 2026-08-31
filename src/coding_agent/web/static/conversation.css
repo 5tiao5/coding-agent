@@ -44,6 +44,17 @@
   font-size: 9px;
 }
 
+.history-badge {
+  padding: 3px 7px;
+  border: 1px solid rgba(147, 97, 0, 0.24);
+  border-radius: 999px;
+  background: var(--yellow-soft);
+  color: var(--yellow);
+  font-size: 8px;
+  font-weight: 720;
+  letter-spacing: 0.05em;
+}
+
 .status-pill {
   display: flex;
   align-items: center;

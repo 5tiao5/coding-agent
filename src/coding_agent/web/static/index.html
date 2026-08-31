@@ -22,7 +22,7 @@
     <div class="ambient ambient-two" aria-hidden="true"></div>
 
     <div class="app-shell">
-      <aside class="left-rail" aria-label="运行控制">
+      <aside class="left-rail" aria-label="项目与运行控制">
         <header class="brand">
           <div class="brand-mark" aria-hidden="true">
             <span></span>
@@ -34,13 +34,41 @@
           </div>
         </header>
 
+        <section class="project-browser" id="project-browser" aria-labelledby="projects-heading">
+          <header class="project-browser-heading">
+            <div>
+              <div class="section-kicker">工作区</div>
+              <h2 id="projects-heading">项目</h2>
+            </div>
+            <div class="project-actions">
+              <button class="project-action" id="open-project-button" type="button">打开项目</button>
+              <button class="project-action project-action-primary" id="new-project-button" type="button">新建项目</button>
+            </div>
+          </header>
+
+          <div class="project-list" id="project-list" aria-label="项目列表">
+            <p class="navigation-placeholder">正在加载项目…</p>
+          </div>
+
+          <div class="history-heading">
+            <div>
+              <div class="section-kicker">会话</div>
+              <h3 id="history-title">运行历史</h3>
+            </div>
+            <button class="history-return" id="history-return" type="button" hidden>返回当前</button>
+          </div>
+          <div class="run-history-list" id="run-history-list" aria-label="选中项目的运行历史">
+            <p class="navigation-placeholder">选择项目后查看历史。</p>
+          </div>
+        </section>
+
         <section class="workspace-card" aria-labelledby="workspace-heading">
-          <div class="section-kicker" id="workspace-heading">工作区</div>
+          <div class="section-kicker" id="workspace-heading">当前项目</div>
           <div class="workspace-row">
             <div class="repo-glyph" aria-hidden="true"></div>
             <div class="workspace-copy">
-              <strong id="workspace-name">当前仓库</strong>
-              <span id="runtime-label">本地运行 · 绑定工作区</span>
+              <strong id="workspace-name">尚未选择项目</strong>
+              <span id="runtime-label">请选择或新建一个本地项目</span>
             </div>
           </div>
           <div class="connection-row">
@@ -59,7 +87,7 @@
             name="task"
             rows="6"
             maxlength="20000"
-            placeholder="描述一个明确、聚焦的编程任务…"
+            placeholder="先选择项目，再描述一个明确的编程任务…"
             required
           ></textarea>
           <button class="run-button" id="run-button" type="submit">
@@ -82,8 +110,9 @@
         <header class="session-header">
           <div>
             <div class="session-title-row">
-              <h1>智能体会话</h1>
+              <h1 id="session-heading">智能体会话</h1>
               <span class="run-id" id="run-id" hidden></span>
+              <span class="history-badge" id="history-badge" hidden>只读回放</span>
             </div>
             <p id="phase-label">等待任务</p>
           </div>
@@ -182,18 +211,21 @@
           </header>
           <div class="metric-grid">
             <div class="metric">
-              <span>步骤</span>
+              <span>模型轮次</span>
               <strong id="metric-step">0</strong>
             </div>
             <div class="metric">
-              <span>工具</span>
-              <strong id="metric-tools">0 / 0</strong>
+              <span>累计调用</span>
+              <strong id="metric-tools">0</strong>
             </div>
             <div class="metric">
               <span>失败</span>
               <strong id="metric-failed">0</strong>
             </div>
           </div>
+          <p class="metric-budget" id="metric-budget">
+            执行中 0 · 旧记录未保存运行上限
+          </p>
           <div class="active-tools" id="active-tools" hidden>
             <span class="active-tools-label">正在运行</span>
             <div class="active-tool-list" id="active-tool-list"></div>
@@ -206,5 +238,79 @@
       <span class="toast-mark" aria-hidden="true"></span>
       <span id="toast-text"></span>
     </div>
+
+    <dialog
+      class="project-dialog"
+      id="project-dialog"
+      aria-labelledby="project-dialog-title"
+      aria-describedby="project-dialog-copy project-dialog-message"
+      aria-busy="false"
+    >
+      <form class="project-dialog-form" id="project-dialog-form">
+        <header class="project-dialog-heading">
+          <div>
+            <p class="section-kicker">本地工作区</p>
+            <h2 id="project-dialog-title">打开项目</h2>
+          </div>
+          <button class="dialog-close" id="project-dialog-close" type="button" aria-label="关闭">×</button>
+        </header>
+
+        <p class="project-dialog-copy" id="project-dialog-copy">
+          输入已有项目的绝对路径。Relay 只会在选中的项目中工作。
+        </p>
+
+        <div class="dialog-field">
+          <label class="dialog-field-label" id="project-root-label" for="project-root-input">
+            项目绝对路径
+          </label>
+          <div class="dialog-path-control">
+            <input
+              id="project-root-input"
+              name="root"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="D:\\code\\my-project"
+              required
+            >
+            <button class="dialog-browse-button" id="project-root-browse" type="button" hidden>
+              浏览…
+            </button>
+          </div>
+        </div>
+
+        <label class="dialog-field" id="project-name-field" for="project-name-input" hidden>
+          <span>项目名</span>
+          <input
+            id="project-name-input"
+            name="project_name"
+            type="text"
+            autocomplete="off"
+            maxlength="120"
+            placeholder="my-project"
+          >
+        </label>
+
+        <label class="dialog-field" id="project-display-name-field" for="project-display-name-input">
+          <span>显示名称 <em>可选</em></span>
+          <input
+            id="project-display-name-input"
+            name="display_name"
+            type="text"
+            autocomplete="off"
+            maxlength="120"
+            placeholder="用于左侧边栏"
+          >
+        </label>
+
+        <p class="dialog-message" id="project-dialog-message" aria-live="polite"></p>
+        <footer class="project-dialog-actions">
+          <button class="dialog-button" id="project-dialog-cancel" type="button">取消</button>
+          <button class="dialog-button dialog-button-primary" id="project-dialog-submit" type="submit">
+            打开项目
+          </button>
+        </footer>
+      </form>
+    </dialog>
   </body>
 </html>

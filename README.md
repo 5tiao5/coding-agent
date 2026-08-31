@@ -4,7 +4,7 @@
 
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
-The M4 core is complete. M5 now adds project-owned transient-model retries, a four-category regression-oracle evaluation harness, and a bounded **M5-UX** slice that exposes the same runtime through an optional local Web view. Both demos tell one complete repair story:
+The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's trusted trace history from a Codex-style sidebar. Both demos tell one complete repair story:
 
 `plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
 
@@ -61,11 +61,42 @@ $env:CODING_AGENT_REASONING_EFFORT = "none"
 uv run coding-agent run "Inspect this repository and report one verified improvement" --root . --mode safe
 ```
 
-The optional live Web view uses the same environment and repository-owned application service:
+The optional live Web workbench uses the same environment and repository-owned application service:
 
 ```powershell
+# Start at the project chooser. The model may also come from .env.local.
+uv run coding-agent web --model <model> --mode safe
+
+# Optional shortcut: register and select this directory immediately.
 uv run coding-agent web --root . --model <model> --mode safe
 ```
+
+On Windows, “打开项目” first opens the native folder chooser; manual absolute-path input remains as
+a fallback. “新建项目” can browse for its parent and then creates exactly one previously absent empty
+leaf directory; it does not initialize Git, add a template, or overwrite a directory. Project and
+new-run history metadata live in the private state directory, not inside the repository. The sidebar
+replays only bounded trace projections; older runs that predate M5.5 metadata are not retroactively
+catalogued.
+
+### Run budgets
+
+`--max-steps` limits model-decision turns, not files or tool calls. Increasing it gives the model
+more opportunities to observe results and decide what to do next; it does **not** enlarge the fixed
+tool budgets.
+
+| Host | Model-turn budget | Tool-call budget |
+|---|---|---|
+| `run` / live `web` | 20 by default; `--max-steps` accepts 1–100 | 8 per turn, 40 per run (fixed) |
+| `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | 8 per turn, 40 cumulative calls (fixed) |
+| live `evaluate` | 12 per case by default; `--max-steps` accepts 1–20 | 8 per turn, 40 per case (fixed) |
+| deterministic CLI/Web demo | 12 fixed turns | 8 per turn, 40 per run (fixed) |
+
+One model turn may declare several independent tools, which the Agent executes sequentially. If a
+model proposes more than eight at once, the Agent rejects the whole oversized batch before any of
+its calls execute, returns bounded feedback, and lets the model automatically resubmit the work in
+smaller batches. A multi-file task therefore does not need to be split into separate user prompts;
+it still has to fit within the model-turn and 40-call run budgets. For Web, `--max-steps` is selected
+when the local server starts and applies to its live runs; the browser cannot override it per task.
 
 ### Opt-in live evaluation
 
@@ -98,7 +129,7 @@ for a runner/provider/harness error, and `2` for invalid configuration. A suite 
 `error` to limit paid requests. Unit tests exercise the same harness with injected deterministic
 models; they are not presented as evidence of real-model intelligence.
 
-The browser can submit one local task and observe its bounded plan, timeline, latest Diff, structured
+The browser can select a locally registered project, submit one task, and observe its bounded plan, timeline, latest Diff, structured
 file-change-to-verifier evidence chain, and final response. In this first slice, Web `safe` mode has no browser approval broker:
 registered verification commands may run, while ordinary commands fail closed. Select `--mode auto`
 only when that broader local command authority is intentional; it remains subject to the command
@@ -147,25 +178,35 @@ workspace. Other
 commands may run under the selected permission mode, but their output cannot manufacture
 verification evidence.
 
-## M5-UX local Web slice
+## M5.5 local project workbench
 
 - CLI and Web both call the same repository application service and therefore share the Agent loop,
   tools, permission policy, trace-first event ordering, checkpoints, and Verification Gate.
-- The server owns the repository, model, base URL, permission mode, state directory, and run limits;
-  the browser supplies only a bounded task.
-- At most one background run is active. Graceful server shutdown stops accepting tasks and attempts
+- The token-protected local host may open a native Windows folder chooser and return its selection to
+  the page; manual absolute-path registration remains available. Both paths enter the same server
+  validation. After selection, the server resolves and fingerprints that project; a run captures an
+  immutable project context and never accepts a root from the task request.
+- A private project registry and immutable per-run catalog power the left sidebar. History is rebuilt
+  from the latest validated trace segment through the same dashboard whitelist; it is read-only and
+  does not expose canonical messages or pretend to persist the final answer. Each run is bound to the
+  directory fingerprint captured at start, so replacing a directory cannot inherit its old history;
+  an unterminated trace from an earlier process is labeled `interrupted`.
+- At most one background run is active across all projects, and project changes are locked while it
+  runs. Graceful server shutdown stops accepting tasks and attempts
   a bounded drain before process exit. Browser state is a whitelist projection, not raw events,
   canonical messages, tool output, raw provider response objects, or hidden reasoning.
-- This is a loopback presentation slice, not a remote or multi-user Web product, browser terminal,
-  editor, or alternate Agent implementation.
+- This is a loopback presentation slice, not a remote or multi-user Web product, packaged desktop
+  shell, Git clone/template service, browser terminal, editor, or alternate Agent implementation.
 - Transient connection, timeout, throttling, and selected server failures are retried by the
   project-owned loop, not invisibly by the SDK. Retry scheduling is visible in both event projections
   without exposing provider exception text.
 
 ## M5 reliability and evaluation slice
 
-- SDK retries remain disabled; the Agent owns a bounded `0.5s → 1s` retry policy and retries only
-  explicitly classified transient transport/status failures.
+- SDK retries remain disabled; the Agent owns every bounded retry. Connection/timeouts and
+  `408/409/429/5xx` use `0.5s → 1s` backoff, while malformed function-argument JSON is discarded
+  before tool execution and retried immediately with a fixed, sanitized protocol-correction
+  instruction. Both paths share the configured attempt ceiling and are distinguished in events.
 - Four stable categories cover a single-file repair, cross-file change, new feature, and indirect
   fault. Success requires `AgentState.COMPLETED`, unchanged public-test controls, required source
   changes, no workspace change outside the scenario allowlist, and a separate sibling regression
@@ -185,8 +226,9 @@ verification evidence.
 - Resume restores the canonical transcript, not `PlanState`, the in-memory undo journal, approval decisions, or old verification evidence. Fresh verification is mandatory.
 - Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
 - A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
-- The local Web view is not authenticated for hostile same-machine users. It binds to loopback and
-  applies host/header restrictions, but it is not intended for port forwarding or remote exposure.
+- The local Web view is not authenticated for hostile same-machine users. It binds to loopback,
+  requires a per-process control token for mutations, and applies Host/Origin/header restrictions,
+  but it is not intended for port forwarding or remote exposure.
 - Graceful Web shutdown gives an active run five seconds to drain. A longer run, forced process kill,
   or machine failure can interrupt its final trace/checkpoint write; this is not crash-safe execution.
 - M5 still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
@@ -196,15 +238,19 @@ verification evidence.
 Generic libraries handle HTTP transport, validation, terminal rendering, input editing, process enumeration, ignore matching, and tests. Agent orchestration, context selection, tool definitions and dispatch, command launch/capability policy, stopping rules, checkpoint semantics, verification, and error semantics remain project-owned code.
 
 ```text
-CLI / loopback Web
- └─ Repository application service
-     ├─ OpenAIResponsesModel / ScriptedModel
-     ├─ AgentRunner ─ Context + Stop + Verification
-     │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
-     ├─ SessionStore + RunLease
-     └─ CompositeEventSink
-         ├─ JsonlEventSink       durable audit facts
-         └─ DashboardProjection  bounded CLI/Web presentation
+CLI ───────────────────────────────────────────────┐
+loopback Web ─ WebWorkbench                        │
+                 ├─ ProjectRegistry + RunCatalog   │
+                 └─ one WebRunService ─────────────┤
+                                                   ▼
+                                  Repository application service
+                                    ├─ OpenAIResponsesModel / ScriptedModel
+                                    ├─ AgentRunner ─ Context + Stop + Verification
+                                    │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
+                                    ├─ SessionStore + RunLease
+                                    └─ CompositeEventSink
+                                        ├─ JsonlEventSink       durable audit facts
+                                        └─ DashboardProjection  bounded live/history presentation
 
 evaluate CLI
  └─ isolated public fixture → same application service

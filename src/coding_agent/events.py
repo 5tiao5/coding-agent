@@ -19,6 +19,7 @@ class EventKind(StrEnum):
     MODEL_RETRYING = "model_retrying"
     MODEL_RESPONDED = "model_responded"
     CONTEXT_COMPACTED = "context_compacted"
+    TOOL_BATCH_REJECTED = "tool_batch_rejected"
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
     VERIFICATION_INVALIDATED = "verification_invalidated"

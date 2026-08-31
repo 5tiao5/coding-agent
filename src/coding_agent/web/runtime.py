@@ -15,6 +15,7 @@ from coding_agent.models import AgentResult, AgentState
 from coding_agent.openai_model import ReasoningEffort
 from coding_agent.state import StatePaths
 from coding_agent.web.service import WebRunService
+from coding_agent.web.workbench import WebWorkbench, WebWorkbenchConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,3 +73,16 @@ def create_repository_service(config: WebRepositoryConfig) -> WebRunService:
             return execute_repository_run(spec, event_sink=event_sink, approver=None)
 
     return WebRunService(run_repository)
+
+
+def create_workbench_service(
+    config: WebWorkbenchConfig,
+    *,
+    initial_root: Path | None = None,
+) -> WebWorkbench:
+    """Build the project-aware host and optionally register one CLI-selected root."""
+
+    workbench = WebWorkbench(config)
+    if initial_root is not None:
+        workbench.register_project(root=initial_root)
+    return workbench

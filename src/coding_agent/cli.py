@@ -49,6 +49,8 @@ from coding_agent.openai_model import (
     validate_base_url,
 )
 from coding_agent.presentation import print_agent_response, safe_terminal_text
+from coding_agent.projects import ProjectRegistry
+from coding_agent.run_catalog import RunCatalog, RunCatalogError, normalize_task_title
 from coding_agent.session import LoadedSession, SessionBoundary, SessionStore
 from coding_agent.state import StatePaths, default_state_paths
 from coding_agent.trace import (
@@ -155,7 +157,16 @@ def evaluate_agent(
         case_sensitive=False,
         help="Evaluation supports only omitted or none reasoning for stateless tool turns.",
     ),
-    max_steps: int = typer.Option(12, "--max-steps", min=1, max=20),
+    max_steps: int = typer.Option(
+        12,
+        "--max-steps",
+        min=1,
+        max=20,
+        help=(
+            "Maximum model turns per evaluation case; does not change the fixed budgets "
+            "of 8 tool calls per turn and 40 per case."
+        ),
+    ),
     model_timeout: float = typer.Option(90.0, "--model-timeout", min=1.0, max=600.0),
     oracle_timeout: float = typer.Option(45.0, "--oracle-timeout", min=1.0, max=300.0),
 ) -> None:
@@ -272,15 +283,15 @@ def evaluate_agent(
 
 @app.command("web")
 def web_console(
-    root: Path = typer.Option(
-        Path("."),
+    root: Path | None = typer.Option(
+        None,
         "--root",
         exists=True,
         file_okay=False,
         dir_okay=True,
         readable=True,
         resolve_path=True,
-        help="Repository root fixed for this local Web process.",
+        help="Optional repository root to register and select when Web starts.",
     ),
     model: str | None = typer.Option(
         None,
@@ -314,7 +325,16 @@ def web_console(
         ),
     ),
     state_dir: Path | None = typer.Option(None, "--state-dir", help="Private state root."),
-    max_steps: int = typer.Option(20, "--max-steps", min=1, max=100),
+    max_steps: int = typer.Option(
+        20,
+        "--max-steps",
+        min=1,
+        max=100,
+        help=(
+            "Maximum model turns per live Web run; does not change the fixed budgets of "
+            "8 tool calls per turn and 40 per run."
+        ),
+    ),
     model_timeout: float = typer.Option(
         120.0,
         "--model-timeout",
@@ -337,14 +357,18 @@ def web_console(
     import uvicorn
 
     from coding_agent.demo import DEMO_TASK
-    from coding_agent.web import create_app
+    from coding_agent.web import WebRunService, create_app
+    from coding_agent.web.native_picker import NativeFolderPicker, WindowsNativeFolderPicker
     from coding_agent.web.runtime import (
-        WebRepositoryConfig,
         create_demo_service,
-        create_repository_service,
+        create_workbench_service,
     )
+    from coding_agent.web.workbench import WebWorkbench, WebWorkbenchConfig
 
-    resolved_root = root.resolve(strict=True)
+    resolved_root = root.resolve(strict=True) if root is not None else None
+    workbench: WebWorkbench | None = None
+    native_folder_picker: NativeFolderPicker | None = None
+    service: WebRunService | WebWorkbench
     if offline_demo:
         service = create_demo_service()
         workspace_label = "临时演示工作区"
@@ -355,9 +379,8 @@ def web_console(
         selected_model = _required_model(model)
         paths = _resolve_state_paths(state_dir, workspace=resolved_root)
         _require_api_key()
-        service = create_repository_service(
-            WebRepositoryConfig(
-                root=resolved_root,
+        workbench = create_workbench_service(
+            WebWorkbenchConfig(
                 model_name=selected_model,
                 base_url=base_url,
                 reasoning_effort=reasoning_effort,
@@ -365,9 +388,12 @@ def web_console(
                 paths=paths,
                 max_steps=max_steps,
                 model_timeout=model_timeout,
-            )
+            ),
+            initial_root=resolved_root,
         )
-        workspace_label = resolved_root.name
+        service = workbench
+        native_folder_picker = WindowsNativeFolderPicker()
+        workspace_label = workbench.workspace_label
         mode_label = "安全模式" if mode is CommandPermissionMode.SAFE else "自动模式"
         runtime_label = f"{selected_model} · {mode_label}"
         default_task = None
@@ -379,11 +405,13 @@ def web_console(
         runtime_label=runtime_label,
         default_task=default_task,
         task_locked=task_locked,
+        workbench=workbench,
+        native_folder_picker=native_folder_picker,
     )
     url = f"http://127.0.0.1:{port}"
     console.print(
         Panel(
-            f"本地会话界面：{url}\n仅监听本机回环地址；仓库与模型配置由服务端持有。",
+            (f"本地会话界面：{url}\n仅监听本机回环地址；项目目录与模型配置由服务端持有。"),
             title="CODING AGENT WEB",
             border_style="cyan",
         )
@@ -460,7 +488,10 @@ def run_task(
         "--max-steps",
         min=1,
         max=100,
-        help="Maximum model turns for the complete run.",
+        help=(
+            "Maximum model turns for the complete run; does not change the fixed budgets "
+            "of 8 tool calls per turn and 40 per run."
+        ),
     ),
     model_timeout: float = typer.Option(
         120.0,
@@ -483,6 +514,12 @@ def run_task(
     _require_api_key()
     run_id = uuid4().hex
     try:
+        _ensure_run_catalog_entry(
+            paths=paths,
+            root=resolved_root,
+            run_id=run_id,
+            task=selected_task,
+        )
         with RunLease(paths.root / "leases", run_id):
             result = _execute_live_run(
                 run_id=run_id,
@@ -552,7 +589,10 @@ def resume_task(
         "--max-steps",
         min=1,
         max=100,
-        help="Maximum cumulative model turns, including completed turns.",
+        help=(
+            "Maximum cumulative model turns, including completed turns; does not change "
+            "the fixed budgets of 8 tool calls per turn and 40 per run."
+        ),
     ),
     model_timeout: float = typer.Option(
         120.0,
@@ -577,6 +617,12 @@ def resume_task(
             trace_summary = TraceStore(paths.traces).summarize(run_id)
             if trace_summary.status is TraceRunStatus.COMPLETED:
                 raise ValueError("trace shows that this run already completed")
+            _ensure_run_catalog_entry(
+                paths=paths,
+                root=resolved_root,
+                run_id=run_id,
+                task=loaded.checkpoint.task,
+            )
             result = _execute_live_run(
                 run_id=run_id,
                 task=loaded.checkpoint.task,
@@ -787,6 +833,60 @@ def _resolve_state_paths(
                 param_hint="--state-dir",
             )
     return paths
+
+
+def _ensure_run_catalog_entry(
+    *,
+    paths: StatePaths,
+    root: Path,
+    run_id: str,
+    task: str,
+) -> None:
+    """Best-effort bind a CLI run without weakening explicit ``--root`` authority."""
+
+    try:
+        _record_run_catalog_entry(
+            paths=paths,
+            root=root,
+            run_id=run_id,
+            task=task,
+        )
+    except (CodedError, OSError, ValueError):
+        typer.echo(
+            "Warning: project history metadata could not be saved; the Agent run will continue.",
+            err=True,
+        )
+
+
+def _record_run_catalog_entry(
+    *,
+    paths: StatePaths,
+    root: Path,
+    run_id: str,
+    task: str,
+) -> None:
+    project = ProjectRegistry(paths.projects_file).register(root)
+    catalog = RunCatalog(paths.runs, workspace_root=root)
+    try:
+        existing = catalog.get(run_id)
+    except RunCatalogError as exc:
+        if exc.code != "run_not_found":
+            raise
+        catalog.create(
+            run_id=run_id,
+            project_id=project.project_id,
+            workspace_fingerprint=project.workspace_fingerprint,
+            task_title=normalize_task_title(task),
+        )
+        return
+    if (
+        existing.project_id != project.project_id
+        or existing.workspace_fingerprint != project.workspace_fingerprint
+    ):
+        raise RunCatalogError(
+            "run_project_conflict",
+            "run history belongs to a different physical project identity",
+        )
 
 
 def _print_trace_summary(summary: TraceSummary) -> None:

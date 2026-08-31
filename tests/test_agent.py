@@ -10,9 +10,13 @@ import pytest
 from pydantic import BaseModel, Field, TypeAdapter
 
 from coding_agent.agent import AgentRunner
-from coding_agent.context import ContextManager
+from coding_agent.context import ContextManager, context_char_count
 from coding_agent.events import EventKind, MemoryEventSink
-from coding_agent.model import RetryableModelError, ScriptedModel
+from coding_agent.model import (
+    RecoverableModelResponseError,
+    RetryableModelError,
+    ScriptedModel,
+)
 from coding_agent.models import (
     AgentState,
     ChatMessage,
@@ -348,6 +352,7 @@ def test_retryable_model_failures_use_bounded_exponential_backoff() -> None:
             "max_attempts": 3,
             "delay_seconds": 0.25,
             "error_code": "model_request_transient",
+            "retry_kind": "transport_backoff",
         },
         {
             "attempt": 2,
@@ -355,8 +360,184 @@ def test_retryable_model_failures_use_bounded_exponential_backoff() -> None:
             "max_attempts": 3,
             "delay_seconds": 0.5,
             "error_code": "model_request_transient",
+            "retry_kind": "transport_backoff",
         },
     ]
+
+
+def test_invalid_model_arguments_request_a_bounded_sanitized_protocol_correction() -> None:
+    secret = "TEST_PRIVATE_MALFORMED_RESPONSE_SENTINEL"
+    model = OutcomeModel(
+        [
+            RecoverableModelResponseError(secret, secret),
+            ModelResponse(content="Recovered with a valid response."),
+        ]
+    )
+    events = MemoryEventSink()
+    delays: list[float] = []
+    context_limit = 10_000
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        max_model_retries=2,
+        model_retry_sleeper=delays.append,
+        context_manager=ContextManager(max_chars=context_limit),
+    ).run("Recover a malformed function call")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.steps == 1
+    assert len(model.requests) == 2
+    assert delays == []
+    first_system = model.requests[0][0][0].content or ""
+    corrected_system = model.requests[1][0][0].content or ""
+    canonical_system = result.messages[0].content or ""
+    assert "[CODING_AGENT_PROTOCOL_CORRECTION]" not in first_system
+    assert corrected_system.count("[CODING_AGENT_PROTOCOL_CORRECTION]") == 1
+    assert "arguments field of every function call is a valid JSON object" in corrected_system
+    assert "not an array or scalar" in corrected_system
+    assert "[CODING_AGENT_PROTOCOL_CORRECTION]" not in canonical_system
+    assert secret not in corrected_system
+    assert secret not in str(events.events)
+    assert secret not in str(result)
+    retry = [event for event in events.events if event.kind is EventKind.MODEL_RETRYING]
+    assert len(retry) == 1
+    assert retry[0].message == "Requesting a corrected model protocol response"
+    assert retry[0].data == {
+        "attempt": 1,
+        "next_attempt": 2,
+        "max_attempts": 3,
+        "delay_seconds": 0.0,
+        "error_code": "model_response_invalid",
+        "retry_kind": "protocol_correction",
+        "instruction_chars": len(corrected_system) - len(first_system),
+        "prepared_context_chars": retry[0].data["prepared_context_chars"],
+    }
+    assert isinstance(retry[0].data["prepared_context_chars"], int)
+    assert retry[0].data["prepared_context_chars"] <= context_limit
+    assert EventKind.TOOL_STARTED not in [event.kind for event in events.events]
+    assert EventKind.TOOL_FINISHED not in [event.kind for event in events.events]
+
+
+def test_protocol_correction_refuses_to_exceed_the_context_budget() -> None:
+    task = "Bound the protocol correction context"
+    probe = OutcomeModel(
+        [
+            RecoverableModelResponseError("invalid", "invalid"),
+            ModelResponse(content="Recovered."),
+        ]
+    )
+    probe_result = AgentRunner(
+        probe,
+        ToolRegistry(),
+        context_manager=ContextManager(max_chars=10_000),
+    ).run(task)
+    assert probe_result.state is AgentState.COMPLETED_UNVERIFIED
+    initial_chars = context_char_count(probe.requests[0][0])
+    corrected_chars = context_char_count(probe.requests[1][0])
+    assert corrected_chars > initial_chars
+
+    secret = "TEST_PRIVATE_CONTEXT_PROTOCOL_SENTINEL"
+    model = OutcomeModel([RecoverableModelResponseError(secret, secret)])
+    events = MemoryEventSink()
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        context_manager=ContextManager(max_chars=corrected_chars - 1),
+    ).run(task)
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.CONTEXT_LIMIT
+    assert result.error is not None
+    assert result.error.startswith("Model response recovery context could not be prepared:")
+    assert len(model.requests) == 1
+    assert len(result.messages) == 2
+    assert "[CODING_AGENT_PROTOCOL_CORRECTION]" not in (result.messages[0].content or "")
+    assert EventKind.MODEL_RETRYING not in [event.kind for event in events.events]
+    assert EventKind.TOOL_STARTED not in [event.kind for event in events.events]
+    assert secret not in str(events.events)
+    assert secret not in str(result)
+
+
+def test_protocol_correction_does_not_spend_a_step_or_tool_budget() -> None:
+    tool = EchoTool()
+    model = OutcomeModel(
+        [
+            RecoverableModelResponseError("private-code", "private malformed response"),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(id="echo-once", name="echo", arguments={"text": "recovered"}),
+                )
+            ),
+            ModelResponse(content="Finished after one real tool call."),
+        ]
+    )
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([tool]),
+        event_sink=events,
+        max_steps=2,
+        max_total_tool_calls=1,
+        max_model_retries=1,
+    ).run("Recover, then use the sole tool budget")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.steps == 2
+    assert [call.text for call in tool.calls] == ["recovered"]
+    assert len(model.requests) == 3
+    assert [event.kind for event in events.events].count(EventKind.MODEL_REQUESTED) == 3
+    assert [event.kind for event in events.events].count(EventKind.MODEL_RETRYING) == 1
+    assert [event.kind for event in events.events].count(EventKind.TOOL_STARTED) == 1
+    assert [message.role for message in result.messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+    ]
+    assert "[CODING_AGENT_PROTOCOL_CORRECTION]" not in str(result.messages)
+
+
+def test_exhausted_protocol_corrections_fail_without_tools_or_private_response_data() -> None:
+    secret = "TEST_PRIVATE_PROTOCOL_FAILURE_SENTINEL"
+    model = OutcomeModel(
+        [RecoverableModelResponseError(secret, secret) for _ in range(3)]
+    )
+    events = MemoryEventSink()
+    delays: list[float] = []
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        max_model_retries=2,
+        model_retry_sleeper=delays.append,
+    ).run("Exhaust protocol correction attempts")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.steps == 1
+    assert result.error == (
+        "Model returned invalid tool-call arguments after protocol recovery attempts"
+    )
+    assert len(model.requests) == 3
+    assert delays == []
+    assert len(result.messages) == 2
+    assert all(
+        (request[0].content or "").count("[CODING_AGENT_PROTOCOL_CORRECTION]") == 1
+        for request, _ in model.requests[1:]
+    )
+    kinds = [event.kind for event in events.events]
+    assert kinds.count(EventKind.MODEL_RETRYING) == 2
+    assert EventKind.MODEL_RESPONDED not in kinds
+    assert EventKind.TOOL_STARTED not in kinds
+    assert EventKind.TOOL_FINISHED not in kinds
+    assert secret not in str(events.events)
+    assert secret not in str(result)
 
 
 def test_exhausted_retryable_model_failure_is_terminal() -> None:
@@ -704,7 +885,7 @@ def test_runner_compacts_only_the_model_view_and_keeps_canonical_history() -> No
         model,
         ToolRegistry([LargeOutputTool()]),
         event_sink=events,
-        context_manager=ContextManager(max_chars=1_000),
+        context_manager=ContextManager(max_chars=1_500),
     ).run("Observe a large output")
 
     assert result.state is AgentState.COMPLETED_UNVERIFIED
@@ -715,7 +896,7 @@ def test_runner_compacts_only_the_model_view_and_keeps_canonical_history() -> No
     compacted = [event for event in events.events if event.kind is EventKind.CONTEXT_COMPACTED]
     assert len(compacted) == 1
     assert compacted[0].data["compacted_blocks"] == 1
-    assert compacted[0].data["prepared_chars"] <= 1_000
+    assert compacted[0].data["prepared_chars"] <= 1_500
 
 
 def test_context_anchor_overflow_stops_before_calling_the_model() -> None:
@@ -814,7 +995,7 @@ def test_keyboard_interrupt_during_tool_execution_is_a_structured_failure() -> N
     assert events.events[-1].data == {"stop_reason": StopReason.USER_INTERRUPTED.value}
 
 
-def test_per_step_tool_call_limit_rejects_the_whole_batch_before_execution() -> None:
+def test_per_step_tool_call_limit_rejects_atomically_then_accepts_a_smaller_retry() -> None:
     tool = EchoTool()
     model = ScriptedModel(
         [
@@ -824,7 +1005,11 @@ def test_per_step_tool_call_limit_rejects_the_whole_batch_before_execution() -> 
                     ToolCall(id="echo-2", name="echo", arguments={"text": "two"}),
                     ToolCall(id="echo-3", name="echo", arguments={"text": "three"}),
                 )
-            )
+            ),
+            ModelResponse(
+                tool_calls=(ToolCall(id="echo-4", name="echo", arguments={"text": "recovered"}),)
+            ),
+            ModelResponse(content="Recovered with a smaller batch."),
         ]
     )
     events = MemoryEventSink()
@@ -833,14 +1018,14 @@ def test_per_step_tool_call_limit_rejects_the_whole_batch_before_execution() -> 
         model,
         ToolRegistry([tool]),
         event_sink=events,
+        max_steps=3,
         max_tool_calls_per_step=2,
     ).run("Request too many tools at once")
 
-    assert result.state is AgentState.FAILED
-    assert result.stop_reason is StopReason.TOOL_LIMIT
-    assert result.steps == 1
-    assert result.error == "Model exceeded the per-step tool call limit: 3 > 2"
-    assert tool.calls == []
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.stop_reason is StopReason.FINAL_RESPONSE
+    assert result.steps == 3
+    assert [call.text for call in tool.calls] == ["recovered"]
     assert [message.role for message in result.messages] == [
         MessageRole.SYSTEM,
         MessageRole.USER,
@@ -848,9 +1033,109 @@ def test_per_step_tool_call_limit_rejects_the_whole_batch_before_execution() -> 
         MessageRole.TOOL,
         MessageRole.TOOL,
         MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
     ]
+    retry_messages = model.requests[1].messages
+    rejected_payloads = [
+        _TOOL_PAYLOAD_ADAPTER.validate_json(message.content or "")
+        for message in retry_messages[-3:]
+    ]
+    assert [payload["error_code"] for payload in rejected_payloads] == [
+        "tool_batch_rejected",
+        "tool_batch_rejected",
+        "tool_batch_rejected",
+    ]
+    assert [event.kind for event in events.events].count(EventKind.TOOL_STARTED) == 1
+    rejected = [event for event in events.events if event.kind is EventKind.TOOL_BATCH_REJECTED]
+    assert [event.data for event in rejected] == [
+        {
+            "requested_calls": 3,
+            "max_calls_per_turn": 2,
+            "rejection_count": 1,
+            "max_rejections": 3,
+        }
+    ]
+
+
+def test_third_consecutive_over_limit_batch_trips_the_tool_limit_circuit() -> None:
+    tool = EchoTool()
+    outcomes = [
+        ModelResponse(
+            tool_calls=tuple(
+                ToolCall(
+                    id=f"batch-{batch}-{index}",
+                    name="echo",
+                    arguments={"text": f"{batch}-{index}"},
+                )
+                for index in range(3)
+            )
+        )
+        for batch in range(3)
+    ]
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        ScriptedModel(outcomes),
+        ToolRegistry([tool]),
+        event_sink=events,
+        max_steps=4,
+        max_tool_calls_per_step=2,
+    ).run("Keep exceeding the per-turn tool budget")
+
+    assert result.state is AgentState.FAILED
+    assert result.stop_reason is StopReason.TOOL_LIMIT
+    assert result.steps == 3
+    assert result.error == (
+        "Model exceeded the per-step tool call limit 3 consecutive times: 3 > 2"
+    )
+    assert tool.calls == []
     assert EventKind.TOOL_STARTED not in [event.kind for event in events.events]
-    assert events.events[-1].data == {"stop_reason": StopReason.TOOL_LIMIT.value}
+    rejected = [event for event in events.events if event.kind is EventKind.TOOL_BATCH_REJECTED]
+    assert [event.data["rejection_count"] for event in rejected] == [1, 2, 3]
+    assert all(
+        event.data
+        == {
+            "requested_calls": 3,
+            "max_calls_per_turn": 2,
+            "rejection_count": index,
+            "max_rejections": 3,
+        }
+        for index, event in enumerate(rejected, start=1)
+    )
+
+
+def test_runtime_limits_are_visible_to_the_model_and_run_started_event() -> None:
+    model = ScriptedModel([ModelResponse(content="Done within budget.")])
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry(),
+        event_sink=events,
+        max_steps=7,
+        max_tool_calls_per_step=3,
+        max_total_tool_calls=11,
+    ).run("Inspect the runtime limits")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    system_message = model.requests[0].messages[0]
+    assert system_message.role is MessageRole.SYSTEM
+    assert system_message.content is not None
+    assert "Maximum model turns: 7." in system_message.content
+    assert "Maximum tool calls in one model response: 3." in system_message.content
+    assert "Maximum accepted tool calls across the run: 11." in system_message.content
+    assert "split independent calls across turns" in system_message.content
+    assert events.events[0].kind is EventKind.RUN_STARTED
+    assert events.events[0].data == {
+        "task_chars": len("Inspect the runtime limits"),
+        "limits": {
+            "max_model_turns": 7,
+            "max_calls_per_turn": 3,
+            "max_total_tool_calls": 11,
+        },
+    }
 
 
 def test_duplicate_tool_call_id_is_rejected_before_a_second_side_effect() -> None:

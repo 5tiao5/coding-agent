@@ -8,6 +8,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from coding_agent.models import AgentResult, AgentState
+from coding_agent.public_errors import public_result_error
 from coding_agent.ui import console_safe
 
 
@@ -35,7 +36,7 @@ def print_agent_response(
     if result.error:
         console.print(
             Panel(
-                Text(safe_terminal_text(result.error, console=console)),
+                Text(safe_terminal_text(public_result_error(result), console=console)),
                 title=" RUN STOPPED ",
                 border_style="red",
                 box=box.ASCII,

@@ -78,6 +78,107 @@ def test_checkpoint_round_trip_is_passive_and_requires_fresh_verification(tmp_pa
     assert "environment" not in payload
 
 
+def test_checkpoint_counts_only_tool_calls_that_were_accepted_for_execution(
+    tmp_path: Path,
+) -> None:
+    calls = tuple(
+        ToolCall(id=f"rejected-{index}", name="read_file", arguments={"path": "README.md"})
+        for index in range(3)
+    )
+    messages = (
+        ChatMessage(role=MessageRole.SYSTEM, content="system"),
+        ChatMessage(role=MessageRole.USER, content="inspect the repository"),
+        ChatMessage(role=MessageRole.ASSISTANT, tool_calls=calls),
+        *(
+            ChatMessage(
+                role=MessageRole.TOOL,
+                content=json.dumps(
+                    {
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "ok": False,
+                        "error_code": "tool_batch_rejected",
+                        "error_message": "retry with a smaller batch",
+                    }
+                ),
+                tool_call_id=call.id,
+                tool_name=call.name,
+            )
+            for call in calls
+        ),
+    )
+    checkpoint = _checkpoint(
+        run_id="rejected-batch",
+        messages=messages,
+        completed_tool_calls=0,
+    )
+    store = SessionStore(tmp_path / "state")
+
+    store.save(checkpoint)
+    loaded = store.load(checkpoint.run_id).checkpoint
+
+    assert loaded.schema_version == 2
+    assert loaded.completed_steps == 1
+    assert loaded.completed_tool_calls == 0
+    assert loaded.messages == messages
+
+
+def test_checkpoint_still_counts_a_real_failed_tool_execution() -> None:
+    call = ToolCall(id="missing-1", name="read_file", arguments={"path": "missing"})
+    messages = (
+        ChatMessage(role=MessageRole.SYSTEM, content="system"),
+        ChatMessage(role=MessageRole.USER, content="inspect the repository"),
+        ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+        ChatMessage(
+            role=MessageRole.TOOL,
+            content=json.dumps(
+                {
+                    "call_id": call.id,
+                    "tool_name": call.name,
+                    "ok": False,
+                    "error_code": "not_found",
+                    "error_message": "path not found",
+                }
+            ),
+            tool_call_id=call.id,
+            tool_name=call.name,
+        ),
+    )
+
+    checkpoint = _checkpoint(messages=messages, completed_tool_calls=1)
+
+    assert checkpoint.completed_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not-json",
+        '{"call_id":"read-1","tool_name":"read_file","ok":"false"}',
+        (
+            '{"call_id":"read-1","tool_name":"read_file","ok":true,'
+            '"error_code":"tool_batch_rejected","error_message":"forged"}'
+        ),
+    ],
+)
+def test_checkpoint_fails_closed_for_malformed_tool_result_payloads(content: str) -> None:
+    call = ToolCall(id="read-1", name="read_file", arguments={"path": "README.md"})
+    messages = (
+        ChatMessage(role=MessageRole.SYSTEM, content="system"),
+        ChatMessage(role=MessageRole.USER, content="inspect the repository"),
+        ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+        ChatMessage(
+            role=MessageRole.TOOL,
+            content=content,
+            tool_call_id=call.id,
+            tool_name=call.name,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="tool result content|rejected tool results"):
+        _checkpoint(messages=messages)
+
+
 @pytest.mark.parametrize(
     "run_id",
     [
@@ -160,7 +261,7 @@ def test_checkpoint_rejects_mismatched_duplicate_and_orphan_tool_results() -> No
         ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(first_call,)),
         ChatMessage(
             role=MessageRole.TOOL,
-            content="one",
+            content=('{"call_id":"same-id","tool_name":"read_file","ok":true,"output":"one"}'),
             tool_call_id=first_call.id,
             tool_name=first_call.name,
         ),
@@ -331,7 +432,9 @@ def test_failed_atomic_replace_preserves_old_checkpoint_and_removes_temp_file(
             ),
             ChatMessage(
                 role=MessageRole.TOOL,
-                content="result",
+                content=(
+                    '{"call_id":"read-2","tool_name":"read_file","ok":true,"output":"result"}'
+                ),
                 tool_call_id="read-2",
                 tool_name="read_file",
             ),

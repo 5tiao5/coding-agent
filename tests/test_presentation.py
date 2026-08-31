@@ -47,14 +47,14 @@ def test_completed_response_is_sanitized_and_can_show_the_run_id() -> None:
     assert "\x00" not in output
 
 
-def test_failed_response_uses_the_stopped_card_without_a_run_id() -> None:
+def test_failed_response_uses_a_safe_localized_stopped_card_without_a_run_id() -> None:
     stream = StringIO()
     result = AgentResult(
         run_id="run-2",
         state=AgentState.FAILED,
         stop_reason=StopReason.MODEL_ERROR,
         steps=0,
-        error="Provider failed",
+        error="Provider failed with TEST_PRIVATE_SECRET",
         messages=_messages(),
     )
 
@@ -62,7 +62,8 @@ def test_failed_response_uses_the_stopped_card_without_a_run_id() -> None:
 
     output = stream.getvalue()
     assert "RUN STOPPED" in output
-    assert "Provider failed" in output
+    assert "模型请求失败。请检查模型配置或稍后重试。" in output
+    assert "TEST_PRIVATE_SECRET" not in output
     assert "Run ID:" not in output
 
 

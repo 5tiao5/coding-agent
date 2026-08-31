@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from math import isfinite
 from time import sleep
@@ -9,7 +10,11 @@ from uuid import uuid4
 
 from coding_agent.context import ContextError, ContextManager
 from coding_agent.events import EventKind, EventSink, NullEventSink, RunEvent
-from coding_agent.model import ModelAdapter, RetryableModelError
+from coding_agent.model import (
+    ModelAdapter,
+    RecoverableModelResponseError,
+    RetryableModelError,
+)
 from coding_agent.models import (
     AgentResult,
     AgentState,
@@ -35,6 +40,17 @@ DEFAULT_SYSTEM_PROMPT = """You are a coding agent. Use the available local tools
 Keep plans and action summaries explicit, but never provide hidden reasoning or chain of thought.
 After changing files, run a recognized test, build, or check before giving a concise final answer.
 Runtime evidence, not your textual claim, determines whether the result is verified."""
+
+_RUNTIME_LIMITS_MARKER = "[CODING_AGENT_RUNTIME_LIMITS]"
+_RUNTIME_LIMITS_END_MARKER = "[/CODING_AGENT_RUNTIME_LIMITS]"
+_MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS = 3
+_TOOL_BATCH_REJECTED_ERROR_CODE = "tool_batch_rejected"
+_PROTOCOL_CORRECTION_MARKER = "[CODING_AGENT_PROTOCOL_CORRECTION]"
+_PROTOCOL_CORRECTION_INSTRUCTION = (
+    f"\n\n{_PROTOCOL_CORRECTION_MARKER}\n"
+    "The previous response was discarded. Return a fresh response and ensure the "
+    "arguments field of every function call is a valid JSON object, not an array or scalar."
+)
 
 _PRESENTATION_PREVIEW_TOOLS = frozenset(
     {"replace_text", "undo_change", "update_plan", "write_file"}
@@ -147,6 +163,18 @@ class AgentRunner:
         if not task.strip():
             raise ValueError("task cannot be empty")
 
+        system_prompt = _with_runtime_limits(
+            system_prompt,
+            max_model_turns=self._max_steps,
+            max_calls_per_turn=self._max_tool_calls_per_step,
+            max_total_tool_calls=self._max_total_tool_calls,
+        )
+        limits = {
+            "max_model_turns": self._max_steps,
+            "max_calls_per_turn": self._max_tool_calls_per_step,
+            "max_total_tool_calls": self._max_total_tool_calls,
+        }
+
         if resumed is None:
             state = AgentState.CREATED
             messages: list[ChatMessage] = [
@@ -159,7 +187,7 @@ class AgentRunner:
                 run_id,
                 EventKind.RUN_STARTED,
                 "Run started",
-                data={"task_chars": len(task)},
+                data={"task_chars": len(task), "limits": limits},
             )
             state = self._transition(run_id, state, AgentState.PLANNING)
             total_tool_calls = 0
@@ -174,11 +202,13 @@ class AgentRunner:
                 messages,
                 SessionBoundary.READY_FOR_MODEL,
                 0,
+                completed_tool_calls=0,
             )
         else:
             checkpoint = resumed.checkpoint
             state = AgentState.OBSERVING
             messages = list(checkpoint.messages)
+            messages[0] = messages[0].model_copy(update={"content": system_prompt})
             total_tool_calls = checkpoint.completed_tool_calls
             first_step = checkpoint.completed_steps + 1
             self._emit(
@@ -191,6 +221,7 @@ class AgentRunner:
                     "completed_tool_calls": checkpoint.completed_tool_calls,
                     "requires_reverification": resumed.requires_reverification,
                     "auto_replay_tool_calls": resumed.auto_replay_tool_calls,
+                    "limits": limits,
                 },
             )
         verification = VerificationLedger()
@@ -201,6 +232,7 @@ class AgentRunner:
             if message.role is MessageRole.ASSISTANT
             for call in message.tool_calls
         }
+        consecutive_batch_rejections = _trailing_tool_batch_rejections(messages)
 
         for step in range(first_step, self._max_steps + 1):
             state = self._transition(run_id, state, AgentState.ACTING, step)
@@ -229,6 +261,7 @@ class AgentRunner:
                     },
                 )
             response = None
+            request_view = prepared.model_view
             max_attempts = self._max_model_retries + 1
             for attempt in range(1, max_attempts + 1):
                 self._emit(
@@ -239,7 +272,7 @@ class AgentRunner:
                     {"attempt": attempt, "max_attempts": max_attempts},
                 )
                 try:
-                    response = self._model.complete(prepared.model_view, tool_specs)
+                    response = self._model.complete(request_view, tool_specs)
                 except KeyboardInterrupt:
                     return self._failure(
                         run_id,
@@ -274,6 +307,7 @@ class AgentRunner:
                             "max_attempts": max_attempts,
                             "delay_seconds": delay_seconds,
                             "error_code": "model_request_transient",
+                            "retry_kind": "transport_backoff",
                         },
                     )
                     try:
@@ -287,6 +321,48 @@ class AgentRunner:
                             messages,
                             "Run interrupted by user during model retry delay",
                         )
+                except RecoverableModelResponseError:
+                    if attempt == max_attempts:
+                        return self._failure(
+                            run_id,
+                            state,
+                            StopReason.MODEL_ERROR,
+                            step,
+                            messages,
+                            "Model returned invalid tool-call arguments after protocol "
+                            "recovery attempts",
+                        )
+                    try:
+                        corrected = self._context.prepare(
+                            _with_protocol_correction(messages),
+                            tool_specs,
+                        )
+                    except ContextError as exc:
+                        return self._failure(
+                            run_id,
+                            state,
+                            StopReason.CONTEXT_LIMIT,
+                            step,
+                            messages,
+                            f"Model response recovery context could not be prepared: {exc}",
+                        )
+                    request_view = corrected.model_view
+                    self._emit(
+                        run_id,
+                        EventKind.MODEL_RETRYING,
+                        "Requesting a corrected model protocol response",
+                        step,
+                        {
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "delay_seconds": 0.0,
+                            "error_code": "model_response_invalid",
+                            "retry_kind": "protocol_correction",
+                            "instruction_chars": len(_PROTOCOL_CORRECTION_INSTRUCTION),
+                            "prepared_context_chars": corrected.metadata.prepared,
+                        },
+                    )
                 except Exception as exc:  # noqa: BLE001 - adapter errors terminate the run.
                     return self._failure(
                         run_id,
@@ -338,21 +414,53 @@ class AgentRunner:
                 seen_tool_call_ids.update(response_call_ids)
                 requested_calls = len(response.tool_calls)
                 if requested_calls > self._max_tool_calls_per_step:
+                    consecutive_batch_rejections += 1
                     _append_cancelled_tool_results(
                         messages,
                         response.tool_calls,
-                        error_code="tool_batch_rejected",
-                        error_message="tool batch exceeded the per-step call limit",
+                        error_code=_TOOL_BATCH_REJECTED_ERROR_CODE,
+                        error_message=(
+                            "tool batch exceeded the per-step call limit "
+                            f"({requested_calls} requested, "
+                            f"{self._max_tool_calls_per_step} allowed); "
+                            "retry with a smaller batch"
+                        ),
                     )
-                    return self._failure(
+                    self._emit(
                         run_id,
-                        state,
-                        StopReason.TOOL_LIMIT,
+                        EventKind.TOOL_BATCH_REJECTED,
+                        "Rejected an over-limit model tool batch before execution",
                         step,
-                        messages,
-                        "Model exceeded the per-step tool call limit: "
-                        f"{requested_calls} > {self._max_tool_calls_per_step}",
+                        {
+                            "requested_calls": requested_calls,
+                            "max_calls_per_turn": self._max_tool_calls_per_step,
+                            "rejection_count": consecutive_batch_rejections,
+                            "max_rejections": _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS,
+                        },
                     )
+                    if consecutive_batch_rejections >= _MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS:
+                        return self._failure(
+                            run_id,
+                            state,
+                            StopReason.TOOL_LIMIT,
+                            step,
+                            messages,
+                            "Model exceeded the per-step tool call limit "
+                            f"{consecutive_batch_rejections} consecutive times: "
+                            f"{requested_calls} > {self._max_tool_calls_per_step}",
+                        )
+                    state = self._transition(run_id, state, AgentState.OBSERVING, step)
+                    self._save_checkpoint(
+                        run_id,
+                        task,
+                        system_prompt,
+                        messages,
+                        SessionBoundary.READY_FOR_MODEL,
+                        step,
+                        completed_tool_calls=total_tool_calls,
+                    )
+                    continue
+                consecutive_batch_rejections = 0
                 if total_tool_calls + requested_calls > self._max_total_tool_calls:
                     _append_cancelled_tool_results(
                         messages,
@@ -472,6 +580,7 @@ class AgentRunner:
                     messages,
                     SessionBoundary.READY_FOR_MODEL,
                     step,
+                    completed_tool_calls=total_tool_calls,
                 )
                 continue
 
@@ -501,6 +610,7 @@ class AgentRunner:
                 messages,
                 SessionBoundary.TERMINAL,
                 step,
+                completed_tool_calls=total_tool_calls,
                 stop_reason=StopReason.FINAL_RESPONSE,
             )
             # Keep the terminal event truly terminal. Renderers can now print one final
@@ -544,6 +654,7 @@ class AgentRunner:
         boundary: SessionBoundary,
         step: int,
         *,
+        completed_tool_calls: int,
         stop_reason: StopReason | None = None,
     ) -> None:
         if self._session_store is None:
@@ -556,7 +667,7 @@ class AgentRunner:
                 system_prompt=system_prompt,
                 messages=tuple(messages),
                 completed_steps=sum(message.role is MessageRole.ASSISTANT for message in messages),
-                completed_tool_calls=sum(message.role is MessageRole.TOOL for message in messages),
+                completed_tool_calls=completed_tool_calls,
                 stop_boundary=boundary,
                 stop_reason=stop_reason,
             )
@@ -702,3 +813,77 @@ def _append_cancelled_tool_results(
                 tool_name=call.name,
             )
         )
+
+
+def _with_runtime_limits(
+    system_prompt: str,
+    *,
+    max_model_turns: int,
+    max_calls_per_turn: int,
+    max_total_tool_calls: int,
+) -> str:
+    """Replace the host-owned runtime budget block with current runner limits."""
+
+    base = system_prompt
+    marker_index = base.find(_RUNTIME_LIMITS_MARKER)
+    if marker_index >= 0:
+        end_index = base.find(_RUNTIME_LIMITS_END_MARKER, marker_index)
+        if end_index >= 0:
+            base = base[:marker_index] + base[end_index + len(_RUNTIME_LIMITS_END_MARKER) :]
+    base = base.rstrip()
+    return (
+        f"{base}\n\n{_RUNTIME_LIMITS_MARKER}\n"
+        "Runtime budgets enforced for this run:\n"
+        f"- Maximum model turns: {max_model_turns}.\n"
+        f"- Maximum tool calls in one model response: {max_calls_per_turn}. "
+        "Never exceed this per-turn limit; split independent calls across turns.\n"
+        f"- Maximum accepted tool calls across the run: {max_total_tool_calls}.\n"
+        "An over-limit per-turn batch is rejected atomically: none of its calls execute. "
+        "Use the returned tool errors to retry with a smaller batch.\n"
+        f"{_RUNTIME_LIMITS_END_MARKER}"
+    )
+
+
+def _with_protocol_correction(messages: Sequence[ChatMessage]) -> tuple[ChatMessage, ...]:
+    """Add one bounded, sanitized retry instruction to a transient request view only."""
+
+    system = messages[0]
+    assert system.role is MessageRole.SYSTEM
+    assert system.content is not None
+    content = f"{system.content.rstrip()}{_PROTOCOL_CORRECTION_INSTRUCTION}"
+    return (system.model_copy(update={"content": content}), *messages[1:])
+
+
+def _trailing_tool_batch_rejections(messages: Sequence[ChatMessage]) -> int:
+    """Recover the consecutive rejection streak from a stable transcript."""
+
+    consecutive = 0
+    cursor = 2
+    while cursor < len(messages):
+        assistant = messages[cursor]
+        cursor += 1
+        if assistant.role is not MessageRole.ASSISTANT or not assistant.tool_calls:
+            consecutive = 0
+            continue
+        results = messages[cursor : cursor + len(assistant.tool_calls)]
+        cursor += len(assistant.tool_calls)
+        if len(results) == len(assistant.tool_calls) and all(
+            _tool_result_error_code(result) == _TOOL_BATCH_REJECTED_ERROR_CODE for result in results
+        ):
+            consecutive += 1
+        else:
+            consecutive = 0
+    return consecutive
+
+
+def _tool_result_error_code(message: ChatMessage) -> str | None:
+    if message.role is not MessageRole.TOOL or message.content is None:
+        return None
+    try:
+        payload = json.loads(message.content)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not False:
+        return None
+    error_code = payload.get("error_code")
+    return error_code if isinstance(error_code, str) else None

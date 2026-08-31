@@ -322,6 +322,14 @@
   color: var(--red);
 }
 
+.metric-budget {
+  margin: 8px 1px 0;
+  color: var(--muted-dark);
+  font-size: 8px;
+  line-height: 1.45;
+  text-align: center;
+}
+
 .active-tools {
   margin-top: 11px;
   padding-top: 10px;

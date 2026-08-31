@@ -11,7 +11,9 @@ from coding_agent.events import EventKind, MemoryEventSink
 from coding_agent.model import ScriptedModel
 from coding_agent.models import (
     AgentState,
+    MessageRole,
     ModelResponse,
+    StopReason,
     ToolCall,
     ToolControlFacts,
     ToolOutput,
@@ -97,7 +99,11 @@ def test_resume_never_replays_tools_and_requires_fresh_verification(tmp_path: Pa
     assert resumed.state is AgentState.COMPLETED_UNVERIFIED
     assert resumed_tool.calls == 0
     assert len(resumed_model.requests) == 1
-    assert resumed_model.requests[0].messages == loaded.checkpoint.messages
+    resumed_messages = resumed_model.requests[0].messages
+    assert resumed_messages[1:] == loaded.checkpoint.messages[1:]
+    assert resumed_messages[0].content is not None
+    assert "Maximum model turns: 20." in resumed_messages[0].content
+    assert "Maximum model turns: 1." not in resumed_messages[0].content
     assert events.events[0].kind is EventKind.RUN_RESUMED
     assert events.events[0].data["requires_reverification"] is True
     assert EventKind.VERIFICATION_RECORDED not in [event.kind for event in events.events]
@@ -165,3 +171,133 @@ def test_resume_can_establish_fresh_verification_and_replace_the_checkpoint(
     assert terminal.messages == resumed.messages
     assert terminal.completed_steps == 3
     assert terminal.completed_tool_calls == 2
+
+
+def test_rejected_batch_checkpoint_resumes_with_feedback_and_current_limits(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore((tmp_path / "state").resolve())
+    rejected_calls = tuple(
+        ToolCall(id=f"rejected-{index}", name="verify_fixture", arguments={}) for index in range(2)
+    )
+    initial_tool = CountingVerifyTool()
+    initial = AgentRunner(
+        ScriptedModel([ModelResponse(tool_calls=rejected_calls)]),
+        ToolRegistry([initial_tool]),
+        session_store=store,
+        max_steps=2,
+        max_tool_calls_per_step=1,
+        max_total_tool_calls=2,
+    ).run("Checkpoint an over-limit batch")
+
+    assert initial.state is AgentState.FAILED
+    assert initial_tool.calls == 0
+    loaded = store.load(initial.run_id)
+    checkpoint = loaded.checkpoint
+    assert checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.completed_steps == 1
+    assert checkpoint.completed_tool_calls == 0
+    assert [message.role for message in checkpoint.messages[-3:]] == [
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.TOOL,
+    ]
+    assert all(
+        message.content is not None and "tool_batch_rejected" in message.content
+        for message in checkpoint.messages[-2:]
+    )
+
+    resumed_tool = CountingVerifyTool()
+    resumed_model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-retry", name="verify_fixture", arguments={}),)
+            ),
+            ModelResponse(content="Recovered after the smaller retry."),
+        ]
+    )
+    events = MemoryEventSink()
+    resumed = AgentRunner(
+        resumed_model,
+        ToolRegistry([resumed_tool]),
+        session_store=store,
+        event_sink=events,
+        max_steps=4,
+        max_tool_calls_per_step=2,
+        max_total_tool_calls=5,
+    ).resume(loaded)
+
+    assert resumed.state is AgentState.COMPLETED
+    assert resumed_tool.calls == 1
+    visible_prompt = resumed_model.requests[0].messages[0].content
+    assert visible_prompt is not None
+    assert "Maximum model turns: 4." in visible_prompt
+    assert "Maximum tool calls in one model response: 2." in visible_prompt
+    assert "Maximum accepted tool calls across the run: 5." in visible_prompt
+    assert "Maximum model turns: 2." not in visible_prompt
+    assert events.events[0].kind is EventKind.RUN_RESUMED
+    assert events.events[0].data["limits"] == {
+        "max_model_turns": 4,
+        "max_calls_per_turn": 2,
+        "max_total_tool_calls": 5,
+    }
+    terminal = store.load(resumed.run_id).checkpoint
+    assert terminal.completed_tool_calls == 1
+    assert terminal.system_prompt == visible_prompt
+    assert terminal.messages[0].content == visible_prompt
+
+
+def test_consecutive_rejection_circuit_survives_checkpoint_resume(tmp_path: Path) -> None:
+    store = SessionStore((tmp_path / "state").resolve())
+
+    def rejected_batch(prefix: str) -> ModelResponse:
+        return ModelResponse(
+            tool_calls=tuple(
+                ToolCall(
+                    id=f"{prefix}-{index}",
+                    name="verify_fixture",
+                    arguments={},
+                )
+                for index in range(2)
+            )
+        )
+
+    initial_tool = CountingVerifyTool()
+    initial = AgentRunner(
+        ScriptedModel([rejected_batch("first"), rejected_batch("second")]),
+        ToolRegistry([initial_tool]),
+        session_store=store,
+        max_steps=2,
+        max_tool_calls_per_step=1,
+    ).run("Preserve the rejection circuit")
+
+    assert initial.stop_reason is StopReason.MAX_STEPS
+    assert initial_tool.calls == 0
+    loaded = store.load(initial.run_id)
+    assert loaded.checkpoint.completed_steps == 2
+    assert loaded.checkpoint.completed_tool_calls == 0
+
+    resumed_tool = CountingVerifyTool()
+    events = MemoryEventSink()
+    resumed = AgentRunner(
+        ScriptedModel([rejected_batch("third")]),
+        ToolRegistry([resumed_tool]),
+        session_store=store,
+        event_sink=events,
+        max_steps=3,
+        max_tool_calls_per_step=1,
+    ).resume(loaded)
+
+    assert resumed.state is AgentState.FAILED
+    assert resumed.stop_reason is StopReason.TOOL_LIMIT
+    assert resumed.steps == 3
+    assert resumed_tool.calls == 0
+    rejected_event = next(
+        event for event in events.events if event.kind is EventKind.TOOL_BATCH_REJECTED
+    )
+    assert rejected_event.data == {
+        "requested_calls": 2,
+        "max_calls_per_turn": 1,
+        "rejection_count": 3,
+        "max_rejections": 3,
+    }

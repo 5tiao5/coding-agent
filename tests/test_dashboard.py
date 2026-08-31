@@ -42,7 +42,18 @@ def _plain_console(stream: StringIO, *, width: int = 100) -> Console:
 def test_projection_folds_a_verified_run_without_agent_internals() -> None:
     projection = DashboardProjection(task_label="Repair discount bug", max_timeline=20)
     events = [
-        _event(EventKind.RUN_STARTED, data={"task_chars": 500}),
+        _event(
+            EventKind.RUN_STARTED,
+            data={
+                "task_chars": 500,
+                "limits": {
+                    "max_model_turns": 20,
+                    "max_calls_per_turn": 8,
+                    "max_total_tool_calls": 40,
+                    "private": "must remain hidden",
+                },
+            },
+        ),
         _event(
             EventKind.STATE_CHANGED,
             step=1,
@@ -130,6 +141,10 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
     assert snapshot.task_label == "Repair discount bug"
     assert snapshot.phase == "COMPLETED"
     assert snapshot.current_step == 3
+    assert snapshot.limits is not None
+    assert snapshot.limits.max_model_turns == 20
+    assert snapshot.limits.max_calls_per_turn == 8
+    assert snapshot.limits.max_total_tool_calls == 40
     assert snapshot.tools_started == 1
     assert snapshot.tools_finished == 1
     assert snapshot.tools_failed == 0
@@ -157,6 +172,7 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
     )
     assert tool_result.duration_ms == 300
     assert all("must remain hidden" not in str(item) for item in snapshot.timeline)
+    assert "must remain hidden" not in str(snapshot)
 
 
 def test_projection_covers_resume_failure_and_safe_fallbacks() -> None:
@@ -261,6 +277,103 @@ def test_projection_exposes_only_bounded_model_retry_facts() -> None:
     assert entry.headline == "Transient model failure; retry scheduled"
     assert entry.detail == "Attempt 2 of 3 · after 0.5s · MODEL REQUEST TRANSIENT"
     assert "provider" not in entry.detail.casefold()
+
+
+def test_projection_distinguishes_protocol_correction_without_exposing_response() -> None:
+    projection = DashboardProjection(max_timeline=4)
+    projection.apply(_event(EventKind.RUN_STARTED))
+
+    entry = projection.apply(
+        _event(
+            EventKind.MODEL_RETRYING,
+            step=2,
+            seconds=1,
+            message="malformed provider arguments must stay private",
+            data={
+                "attempt": 1,
+                "next_attempt": 2,
+                "max_attempts": 3,
+                "delay_seconds": 0.0,
+                "error_code": "model_response_invalid",
+                "retry_kind": "protocol_correction",
+                "raw_arguments": "TEST_PRIVATE_MALFORMED_JSON",
+            },
+        )
+    )
+
+    assert entry is not None
+    assert projection.snapshot.phase == "RETRYING"
+    assert entry.level == "warning"
+    assert entry.headline == "Invalid model response; protocol correction scheduled"
+    assert entry.detail == "Attempt 2 of 3 · after 0s · MODEL RESPONSE INVALID"
+    assert "TEST_PRIVATE" not in str(entry)
+
+
+def test_projection_whitelists_run_limits_and_treats_batch_rejection_as_retry() -> None:
+    projection = DashboardProjection(max_timeline=5)
+    projection.apply(
+        _event(
+            EventKind.RUN_STARTED,
+            data={
+                "limits": {
+                    "max_model_turns": 20,
+                    "max_calls_per_turn": 8,
+                    "max_total_tool_calls": 40,
+                    "provider_private": "SECRET",
+                }
+            },
+        )
+    )
+
+    entry = projection.apply(
+        _event(
+            EventKind.TOOL_BATCH_REJECTED,
+            step=2,
+            data={
+                "requested_calls": 9,
+                "max_calls_per_turn": 8,
+                "rejection_count": 1,
+                "max_rejections": 3,
+                "raw_tool_arguments": "SECRET",
+            },
+        )
+    )
+
+    snapshot = projection.snapshot
+    assert snapshot.limits is not None
+    assert snapshot.limits.max_model_turns == 20
+    assert snapshot.limits.max_calls_per_turn == 8
+    assert snapshot.limits.max_total_tool_calls == 40
+    assert snapshot.phase == "REPLANNING"
+    assert snapshot.tools_started == snapshot.tools_finished == snapshot.tools_failed == 0
+    assert entry is not None
+    assert entry.category == "MODEL"
+    assert entry.level == "warning"
+    assert entry.headline == "Tool batch too large; split retry requested"
+    assert entry.detail == (
+        "Requested 9 tool calls; per-turn limit 8; split retry requested; rejection 1 of 3"
+    )
+    assert "SECRET" not in str(snapshot)
+
+    legacy = DashboardProjection()
+    legacy.apply(_event(EventKind.RUN_STARTED, data={"limits": {"max_model_turns": 20}}))
+    assert legacy.snapshot.limits is None
+
+    resumed = DashboardProjection()
+    resumed.apply(
+        _event(
+            EventKind.RUN_RESUMED,
+            data={
+                "limits": {
+                    "max_model_turns": 30,
+                    "max_calls_per_turn": 6,
+                    "max_total_tool_calls": 35,
+                }
+            },
+        )
+    )
+    assert resumed.snapshot.limits is not None
+    assert resumed.snapshot.limits.max_model_turns == 30
 
 
 def test_projection_bounds_timeline_and_rejects_mixed_runs() -> None:

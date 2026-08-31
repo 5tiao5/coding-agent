@@ -12,7 +12,7 @@ from typing import Any, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
 
 from coding_agent.errors import CodedError
-from coding_agent.model import RetryableModelError
+from coding_agent.model import RecoverableModelResponseError, RetryableModelError
 from coding_agent.models import (
     ChatMessage,
     MessageRole,
@@ -332,9 +332,9 @@ def _decode_arguments(raw_arguments: str) -> dict[str, Any]:
             parse_constant=_reject_nonstandard_json_constant,
         )
     except (json.JSONDecodeError, ValueError):
-        _raise_invalid_response("function call arguments are not valid JSON")
+        _raise_recoverable_invalid_arguments("arguments are not valid JSON")
     if not isinstance(parsed, dict):
-        _raise_invalid_response("function call arguments are not a JSON object")
+        _raise_recoverable_invalid_arguments("arguments are not a JSON object")
     if not all(isinstance(key, str) for key in parsed):
         _raise_invalid_response("function call argument keys are not strings")
     return cast(dict[str, Any], parsed)
@@ -348,6 +348,15 @@ def _raise_invalid_response(reason: str) -> NoReturn:
     raise OpenAIModelError(
         "openai_invalid_response",
         f"OpenAI returned an invalid response: {reason}",
+    )
+
+
+def _raise_recoverable_invalid_arguments(reason: str) -> NoReturn:
+    """Reject one malformed call without retaining or exposing its raw arguments."""
+
+    raise RecoverableModelResponseError(
+        "openai_invalid_function_arguments",
+        f"OpenAI returned invalid function-call arguments: {reason}",
     )
 
 

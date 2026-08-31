@@ -45,6 +45,7 @@ _NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
 _MAX_PLAN_LINES = 8
 _MAX_EVIDENCE_LABELS = 8
 _MAX_CHANGED_FILES = 12
+_MAX_VISIBLE_RUNTIME_LIMIT = 1_000_000
 _LEVEL_STYLE: dict[TimelineLevel, str] = {
     "info": "cyan",
     "success": "green",
@@ -74,6 +75,15 @@ class TimelineEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class RunLimits:
+    """Strictly whitelisted run budgets safe for presentation and trace replay."""
+
+    max_model_turns: int
+    max_calls_per_turn: int
+    max_total_tool_calls: int
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
     """Immutable view useful to renderers and deterministic tests."""
 
@@ -81,6 +91,7 @@ class DashboardSnapshot:
     task_label: str
     phase: str
     current_step: int
+    limits: RunLimits | None
     tools_started: int
     tools_finished: int
     tools_failed: int
@@ -119,6 +130,7 @@ class DashboardProjection:
         self._run_id: str | None = None
         self._phase = "WAITING"
         self._current_step = 0
+        self._limits: RunLimits | None = None
         self._tools_started = 0
         self._tools_finished = 0
         self._tools_failed = 0
@@ -144,6 +156,7 @@ class DashboardProjection:
             task_label=self._task_label,
             phase=self._phase,
             current_step=self._current_step,
+            limits=self._limits,
             tools_started=self._tools_started,
             tools_finished=self._tools_finished,
             tools_failed=self._tools_failed,
@@ -184,9 +197,11 @@ class DashboardProjection:
         data = event.data
         if kind is EventKind.RUN_STARTED:
             self._phase = "PLANNING"
+            self._limits = _run_limits(data)
             return self._entry(event, "RUN", "Task accepted", "Workspace run started")
         if kind is EventKind.RUN_RESUMED:
             self._phase = "RESUMED"
+            self._limits = _run_limits(data)
             completed = _data_int(data, "completed_steps")
             detail = "Fresh verification is required"
             if completed is not None:
@@ -211,12 +226,25 @@ class DashboardProjection:
             if delay_seconds is not None:
                 detail_parts.append(f"after {delay_seconds:g}s")
             error_code = _data_string(data, "error_code")
-            if error_code:
-                detail_parts.append(_status_label(error_code))
+            retry_kind = _data_string(data, "retry_kind")
+            protocol_correction = retry_kind == "protocol_correction" or error_code in {
+                "model_response_invalid",
+                "openai_invalid_function_arguments",
+            }
+            if protocol_correction:
+                detail_parts.append("MODEL RESPONSE INVALID")
+            elif error_code == "model_request_transient":
+                detail_parts.append("MODEL REQUEST TRANSIENT")
+            else:
+                detail_parts.append("MODEL REQUEST FAILURE")
             return self._entry(
                 event,
                 "MODEL",
-                "Transient model failure; retry scheduled",
+                (
+                    "Invalid model response; protocol correction scheduled"
+                    if protocol_correction
+                    else "Transient model failure; retry scheduled"
+                ),
                 " · ".join(detail_parts) or None,
                 level="warning",
             )
@@ -230,6 +258,16 @@ class DashboardProjection:
             else:
                 detail = "Response received"
             return self._entry(event, "MODEL", "Action selected", detail)
+        if kind is EventKind.TOOL_BATCH_REJECTED:
+            self._phase = "REPLANNING"
+            batch_detail = _tool_batch_rejection_detail(data)
+            return self._entry(
+                event,
+                "MODEL",
+                "Tool batch too large; split retry requested",
+                batch_detail,
+                level="warning",
+            )
         if kind is EventKind.CONTEXT_COMPACTED:
             blocks = _data_int(data, "compacted_blocks")
             context_detail = (
@@ -776,6 +814,56 @@ def _data_bool(data: Mapping[str, object], key: str) -> bool | None:
 def _data_int(data: Mapping[str, object], key: str) -> int | None:
     value = data.get(key)
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _bounded_positive_int(data: Mapping[str, object], key: str) -> int | None:
+    value = _data_int(data, key)
+    if value is None or not 1 <= value <= _MAX_VISIBLE_RUNTIME_LIMIT:
+        return None
+    return value
+
+
+def _run_limits(data: Mapping[str, object]) -> RunLimits | None:
+    raw_limits = data.get("limits")
+    if not isinstance(raw_limits, Mapping):
+        return None
+    max_model_turns = _bounded_positive_int(raw_limits, "max_model_turns")
+    max_calls_per_turn = _bounded_positive_int(raw_limits, "max_calls_per_turn")
+    max_total_tool_calls = _bounded_positive_int(raw_limits, "max_total_tool_calls")
+    if None in (max_model_turns, max_calls_per_turn, max_total_tool_calls):
+        return None
+    assert max_model_turns is not None
+    assert max_calls_per_turn is not None
+    assert max_total_tool_calls is not None
+    return RunLimits(
+        max_model_turns=max_model_turns,
+        max_calls_per_turn=max_calls_per_turn,
+        max_total_tool_calls=max_total_tool_calls,
+    )
+
+
+def _tool_batch_rejection_detail(data: Mapping[str, object]) -> str | None:
+    requested_calls = _bounded_positive_int(data, "requested_calls")
+    max_calls_per_turn = _bounded_positive_int(data, "max_calls_per_turn")
+    rejection_count = _bounded_positive_int(data, "rejection_count")
+    max_rejections = _bounded_positive_int(data, "max_rejections")
+    if (
+        requested_calls is None
+        or max_calls_per_turn is None
+        or requested_calls <= max_calls_per_turn
+    ):
+        return None
+    detail = (
+        f"Requested {requested_calls} tool calls; per-turn limit {max_calls_per_turn}; "
+        "split retry requested"
+    )
+    if (
+        rejection_count is not None
+        and max_rejections is not None
+        and rejection_count <= max_rejections
+    ):
+        detail += f"; rejection {rejection_count} of {max_rejections}"
+    return detail
 
 
 def _data_number(data: Mapping[str, object], key: str) -> float | None:
