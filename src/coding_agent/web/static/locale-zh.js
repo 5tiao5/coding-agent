@@ -65,6 +65,47 @@ const RETRY_REASON_LABELS = {
   "MODEL RESPONSE INVALID": "模型工具参数格式无效",
 };
 
+const ACTIVITY_FACT_LABELS = {
+  Category: "类别",
+  Command: "命令",
+  Gate: "验证门禁",
+  Kind: "证据类型",
+  "Missing scopes": "缺失范围",
+  Output: "输出",
+  "Passed scopes": "已通过范围",
+  "Required scopes": "必需范围",
+  Result: "结果",
+  Scopes: "范围",
+  Step: "步骤",
+  Verification: "验证项",
+  "Working directory": "工作目录",
+  "Workspace revision": "工作区修订",
+};
+
+const ACTIVITY_FACT_VALUES = {
+  Failed: "失败",
+  Passed: "通过",
+  build: "构建",
+  check: "检查",
+  checks: "检查",
+  checks_only: "仅检查通过",
+  failed: "失败",
+  general: "普通命令",
+  missing: "缺少证据",
+  None: "无",
+  passed: "通过",
+  pending: "等待验证",
+  read_only: "只读命令",
+  "runtime:entrypoint": "运行时入口",
+  stale: "已过期",
+  test: "测试",
+  tests: "测试",
+  types: "类型检查",
+  unverified: "未验证",
+  verifier: "可信验证命令",
+  verified: "已验证",
+};
+
 function asText(value, fallback = "") {
   return typeof value === "string" ? value : fallback;
 }
@@ -109,6 +150,69 @@ export function historyFinalFallback(status) {
     return "此次运行以失败结束；这里只回放经过白名单过滤的事件，错误详情未纳入历史回放。";
   }
   return "未能从终态检查点恢复最终回复；代码修改与验证记录仍已保留。";
+}
+
+export function translateActivityFactLabel(value) {
+  const text = asText(value).trim();
+  return mappedText(ACTIVITY_FACT_LABELS, text);
+}
+
+export function translateActivityFactValue(value, format = "text") {
+  const text = asText(value).trim();
+  if (format === "code") {
+    const hiddenArguments = text.match(
+      /^([A-Za-z0-9][A-Za-z0-9._+-]{0,119}) \((\d+) argument\(s\) hidden by safety policy\)$/,
+    );
+    if (hiddenArguments) {
+      return `${hiddenArguments[1]}（${hiddenArguments[2]} 个参数已按安全策略隐藏）`;
+    }
+    return text;
+  }
+  const exact = mappedText(ACTIVITY_FACT_VALUES, text);
+  if (exact !== text) {
+    return exact;
+  }
+
+  let match = text.match(/^(test|build|check) \/ (.+)$/);
+  if (match) {
+    const kinds = { build: "构建", check: "检查", test: "测试" };
+    return `${kinds[match[1]]} / ${match[2]}`;
+  }
+  match = text.match(/^Exited with code (-?\d+)$/);
+  if (match) {
+    return `已退出，退出码 ${match[1]}`;
+  }
+  if (text === "Exited") {
+    return "已退出";
+  }
+  if (text === "Timed out") {
+    return "已超时";
+  }
+  if (text === "Process control failed") {
+    return "进程控制失败";
+  }
+  if (text === "Trusted verification rejected") {
+    return "可信验证被拒绝";
+  }
+  match = text.match(/^Failed \((.+)\)$/);
+  if (match) {
+    return `失败（${match[1]}）`;
+  }
+  match = text.match(/^Captured (\d+) of (\d+) byte\(s\)(; output truncated)?$/);
+  if (match) {
+    const suffix = match[3] ? "；输出已截断" : "";
+    return `已捕获 ${match[1]} / ${match[2]} 字节${suffix}`;
+  }
+  match = text.match(/^(\d+) output character\(s\)(; output truncated)?$/);
+  if (match) {
+    const suffix = match[2] ? "；输出已截断" : "";
+    return `${match[1]} 个输出字符${suffix}`;
+  }
+
+  return text
+    .split(", ")
+    .map((part) => mappedText(ACTIVITY_FACT_VALUES, part))
+    .join("，");
 }
 
 export function translateTimelineHeadline(value) {

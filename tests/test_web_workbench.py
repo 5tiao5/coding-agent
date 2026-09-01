@@ -722,6 +722,52 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         )
         started.set()
         assert release.wait(timeout=3)
+        invocation = {
+            "executable": "python",
+            "argument_count": 3,
+            "display_command": "python -m pytest -q",
+            "verification_label": "pytest",
+            "verification_kind": "test",
+            "private": "PRIVATE INVOCATION",
+        }
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.TOOL_STARTED,
+                message="PRIVATE COMMAND START",
+                step=1,
+                data={
+                    "call_id": "provider-command-call",
+                    "tool_name": "run_command",
+                    "public_invocation": invocation,
+                },
+            )
+        )
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.TOOL_FINISHED,
+                message="PRIVATE COMMAND FINISH",
+                step=1,
+                data={
+                    "call_id": "provider-command-call",
+                    "tool_name": "run_command",
+                    "ok": True,
+                    "summary": "Command exited 0 in .",
+                    "truncated": False,
+                    "public_invocation": invocation,
+                    "metadata": {
+                        "command_class": "verifier",
+                        "cwd": ".",
+                        "status": "exited",
+                        "exit_code": 0,
+                        "captured_output_bytes": 10,
+                        "total_output_bytes": 10,
+                        "private": "PRIVATE COMMAND METADATA",
+                    },
+                },
+            )
+        )
         expanded_diff = [
             "--- a/src/example.py",
             "+++ b/src/example.py",
@@ -807,6 +853,7 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     release.set()
     assert workbench.wait(timeout=3)
     assert captured[0].root == first.resolve()
+    live_state = client.get("/api/state").json()
 
     runs_response = client.get(f"/api/projects/{first_record['project_id']}/runs")
     assert runs_response.status_code == 200
@@ -835,18 +882,48 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     assert "PRIVATE_RAW_TRACE" not in history.text
     assert "PRIVATE_MUTATION" not in history.text
     assert history.json()["run"]["final_text"] == "Repository task complete"
+    live_command_entries = [
+        entry
+        for entry in live_state["snapshot"]["timeline"]
+        if entry["activity_state"] in {"started", "finished"} and "run_command" in entry["headline"]
+    ]
+    history_command_entries = [
+        entry
+        for entry in history.json()["snapshot"]["timeline"]
+        if entry["activity_state"] in {"started", "finished"}
+        and "run_command" in entry["headline"]
+        and entry["category"] == "TOOL"
+    ]
+    assert history_command_entries == live_command_entries
+    assert len(history_command_entries) == 2
+    assert history_command_entries[0]["activity_id"] == history_command_entries[1]["activity_id"]
+    assert history_command_entries[0]["activity_id"].startswith("act_")
+    assert history_command_entries[1]["facts"][0] == {
+        "label": "Command",
+        "value": "python (3 argument(s) hidden by safety policy)",
+        "format": "code",
+    }
+    assert history_command_entries[1]["facts_complete"] is False
     latest_change = history.json()["snapshot"]["latest_change"]
     assert len(latest_change["preview"]) == 6
     assert len(latest_change["expanded_preview"]) == 33
     assert latest_change["expanded_preview"][-1] == "+visible line 29"
     assert latest_change["expanded_preview_complete"] is True
     assert all("expanded_preview" not in entry for entry in history.json()["snapshot"]["timeline"])
+    assert latest_change["activity_id"] is None
+    assert latest_change["activity_state"] == "finished"
+    assert latest_change["facts"] == []
 
     restarted_history = _client(_workbench(tmp_path)).get(f"/api/history/{run_id}")
     assert restarted_history.status_code == 200, restarted_history.text
     assert restarted_history.json()["run"]["final_text"] == "Repository task complete"
     assert restarted_history.json()["snapshot"]["latest_change"] == latest_change
+    assert (
+        restarted_history.json()["snapshot"]["timeline"] == history.json()["snapshot"]["timeline"]
+    )
     assert "PRIVATE_RAW_TRACE" not in restarted_history.text
+    assert "PRIVATE COMMAND" not in restarted_history.text
+    assert "provider-command-call" not in restarted_history.text
 
     selected_second = client.post(
         "/api/projects",

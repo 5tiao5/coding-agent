@@ -120,6 +120,142 @@ test("history final fallback distinguishes missing, failed, and interrupted resu
   );
 });
 
+test("activity view replaces paired starts with their finished activity", async () => {
+  const { visibleActivityEntries } = await importBrowserModule(
+    "src/coding_agent/web/static/_activity_view.js",
+  );
+  const unpaired = { activity_id: "read-2", activity_state: "started", headline: "reading" };
+  const finished = { activity_id: "read-1", activity_state: "finished", headline: "read" };
+  const standalone = { activity_id: null, activity_state: null, headline: "checkpoint" };
+  const visible = visibleActivityEntries([
+    { activity_id: "read-1", activity_state: "started", headline: "reading" },
+    unpaired,
+    finished,
+    standalone,
+  ]);
+
+  assert.deepEqual(visible, [unpaired, finished, standalone]);
+});
+
+test("activity details are available only for bounded public facts and default folded", async () => {
+  const { activityCardView } = await importBrowserModule(
+    "src/coding_agent/web/static/_activity_view.js",
+  );
+  const entry = {
+    facts: [
+      { format: "code", label: "命令", value: "python -m pytest" },
+      { format: "status", label: "结果", value: "通过" },
+    ],
+    facts_complete: true,
+  };
+  const folded = activityCardView(entry);
+  assert.equal(folded.canToggle, true);
+  assert.equal(folded.isExpanded, false);
+  assert.equal(folded.factsComplete, true);
+  assert.equal(folded.toggleLabel, "查看操作详情");
+
+  const expanded = activityCardView(entry, true);
+  assert.equal(expanded.isExpanded, true);
+  assert.equal(expanded.toggleLabel, "收起操作详情");
+
+  const empty = activityCardView({ facts: [], facts_complete: true }, true);
+  assert.equal(empty.canToggle, false);
+  assert.equal(empty.isExpanded, false);
+});
+
+test("activity facts cap at eight and unknown formats degrade to text", async () => {
+  const { MAX_ACTIVITY_FACTS, activityCardView } = await importBrowserModule(
+    "src/coding_agent/web/static/_activity_view.js",
+  );
+  const facts = Array.from({ length: MAX_ACTIVITY_FACTS + 2 }, (_, index) => ({
+    format: index === 0 ? "private-html" : "text",
+    label: `字段 ${index}`,
+    value: `值 ${index}`,
+  }));
+  const view = activityCardView({ facts, facts_complete: true });
+
+  assert.equal(view.facts.length, MAX_ACTIVITY_FACTS);
+  assert.equal(view.facts[0].format, "text");
+  assert.equal(view.factsComplete, false);
+  assert.equal(view.facts.some((fact) => fact.label === `字段 ${MAX_ACTIVITY_FACTS}`), false);
+});
+
+test("activity expansion keys are stable, run-scoped, and prefer activity ids", async () => {
+  const { activityEntryKey } = await importBrowserModule(
+    "src/coding_agent/web/static/_activity_view.js",
+  );
+  const entry = {
+    activity_id: "command-1",
+    headline: "run command",
+    offset_seconds: 1,
+    step: 2,
+  };
+
+  assert.equal(activityEntryKey(entry, "run-1", 0), activityEntryKey(entry, "run-1", 9));
+  assert.notEqual(activityEntryKey(entry, "run-1", 0), activityEntryKey(entry, "run-2", 0));
+
+  const started = {
+    ...entry,
+    activity_state: "started",
+    category: "TOOL",
+    headline: "Running run_command",
+  };
+  const finished = {
+    ...entry,
+    activity_state: "finished",
+    category: "TOOL",
+    headline: "run_command completed",
+  };
+  const verification = {
+    ...entry,
+    activity_state: null,
+    category: "VERIFY",
+    headline: "Passing evidence recorded",
+  };
+  assert.equal(
+    activityEntryKey(started, "run-1", 0),
+    activityEntryKey(finished, "run-1", 1),
+  );
+  assert.notEqual(
+    activityEntryKey(finished, "run-1", 1),
+    activityEntryKey(verification, "run-1", 2),
+  );
+  assert.equal(
+    activityEntryKey(verification, "run-1", 2),
+    activityEntryKey(verification, "run-1", 7),
+  );
+});
+
+test("activity fact labels and safe values are localized without changing commands", async () => {
+  const { translateActivityFactLabel, translateActivityFactValue } =
+    await importBrowserModule("src/coding_agent/web/static/locale-zh.js");
+
+  assert.equal(translateActivityFactLabel("Command"), "命令");
+  assert.equal(translateActivityFactLabel("Verification"), "验证项");
+  assert.equal(translateActivityFactLabel("Working directory"), "工作目录");
+  assert.equal(translateActivityFactLabel("Workspace revision"), "工作区修订");
+  assert.equal(translateActivityFactLabel("Required scopes"), "必需范围");
+  assert.equal(translateActivityFactValue("python -m pytest", "code"), "python -m pytest");
+  assert.equal(
+    translateActivityFactValue(
+      "python (4 argument(s) hidden by safety policy)",
+      "code",
+    ),
+    "python（4 个参数已按安全策略隐藏）",
+  );
+  assert.equal(translateActivityFactValue("verifier"), "可信验证命令");
+  assert.equal(translateActivityFactValue("test / pytest"), "测试 / pytest");
+  assert.equal(translateActivityFactValue("Exited with code 0", "status"), "已退出，退出码 0");
+  assert.equal(
+    translateActivityFactValue("tests, runtime:entrypoint"),
+    "测试，运行时入口",
+  );
+  assert.equal(
+    translateActivityFactValue("Captured 12 of 20 byte(s); output truncated"),
+    "已捕获 12 / 20 字节；输出已截断",
+  );
+});
+
 test("diff view shows small previews completely and folds larger previews", async () => {
   const { COLLAPSED_DIFF_LINES, diffPreviewView } = await importBrowserModule(
     "src/coding_agent/web/static/_diff_view.js",

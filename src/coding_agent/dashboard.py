@@ -23,6 +23,15 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from coding_agent._dashboard_activity import (
+    ActivityFact,
+    ActivityState,
+    activity_id,
+    public_verification_kind,
+    tool_activity_facts,
+    verification_gate_facts,
+    verification_recorded_facts,
+)
 from coding_agent._dashboard_evidence import (
     ChangedFile,
     VerificationEvidenceItem,
@@ -31,6 +40,7 @@ from coding_agent._dashboard_evidence import (
     verification_evidence_items,
     verification_evidence_label,
 )
+from coding_agent._presentation_safety import sanitize_public_label
 from coding_agent.events import EventKind, RunEvent
 from coding_agent.ui import console_safe
 
@@ -81,6 +91,10 @@ class TimelineEntry:
     offset_seconds: float
     duration_ms: float | None = None
     preview: tuple[str, ...] = ()
+    activity_id: str | None = None
+    activity_state: ActivityState | None = None
+    facts: tuple[ActivityFact, ...] = ()
+    facts_complete: bool = True
     expanded_preview: tuple[str, ...] = ()
     expanded_preview_complete: bool = True
 
@@ -313,7 +327,17 @@ class DashboardProjection:
                 self._tools_started += 1
             self._active_tools[call_id] = name
             self._phase = f"RUNNING {_status_label(name)}"
-            return self._entry(event, "TOOL", f"Running {name}", None)
+            facts, facts_complete = tool_activity_facts(name, data, finished=False)
+            return self._entry(
+                event,
+                "TOOL",
+                f"Running {name}",
+                None,
+                activity_id=activity_id(event.run_id, data),
+                activity_state="started",
+                facts=facts,
+                facts_complete=facts_complete,
+            )
         if kind is EventKind.TOOL_FINISHED:
             return self._tool_finished(event)
         if kind is EventKind.VERIFICATION_INVALIDATED:
@@ -339,12 +363,15 @@ class DashboardProjection:
             level: TimelineLevel = (
                 "success" if self._verification_status == "verified" else "warning"
             )
+            facts, facts_complete = verification_gate_facts(data)
             return self._entry(
                 event,
                 "VERIFY",
                 "Verification gate evaluated",
                 _status_label(self._verification_status),
                 level=level,
+                facts=facts,
+                facts_complete=facts_complete,
             )
         if kind is EventKind.SESSION_CHECKPOINTED:
             boundary = _data_string(data, "boundary")
@@ -397,6 +424,7 @@ class DashboardProjection:
             data.get("preview"),
             max_lines=_MAX_PLAN_LINES if name == "update_plan" else 6,
         )
+        facts, facts_complete = tool_activity_facts(name, data, finished=True)
         successful_mutation = name in _MUTATION_TOOLS and explicit_ok is True
         entry = self._entry(
             event,
@@ -406,6 +434,10 @@ class DashboardProjection:
             level=level,
             duration_ms=duration_ms,
             preview=preview,
+            activity_id=activity_id(event.run_id, data),
+            activity_state="finished",
+            facts=facts,
+            facts_complete=facts_complete,
         )
         if name == "update_plan" and explicit_ok is True:
             # The plan is durable presentation state, not merely a recent event.  An
@@ -444,14 +476,14 @@ class DashboardProjection:
         data = event.data
         passed = _data_bool(data, "passed") is True
         self._verification_status = "passed" if passed else "failed"
-        label = _data_string(data, "label")
+        label, _ = sanitize_public_label(data.get("label"), limit=100)
         if (
             label
             and label not in self._verification_labels
             and len(self._verification_labels) < _MAX_EVIDENCE_LABELS
         ):
             self._verification_labels.append(label)
-        kind = _data_string(data, "kind")
+        kind = public_verification_kind(data.get("kind"))
         epoch = _data_int(data, "epoch")
         if epoch is not None:
             self._verification_epoch = max(self._verification_epoch, epoch)
@@ -472,12 +504,16 @@ class DashboardProjection:
             )
         detail_parts = [part for part in (kind, label) if part]
         detail = " / ".join(detail_parts) if detail_parts else None
+        facts, facts_complete = verification_recorded_facts(event, data)
         return self._entry(
             event,
             "VERIFY",
             "Passing evidence recorded" if passed else "Failing evidence recorded",
             detail,
             level="success" if passed else "error",
+            activity_id=activity_id(event.run_id, data),
+            facts=facts,
+            facts_complete=facts_complete,
         )
 
     def _update_verification_status(self, data: Mapping[str, object]) -> None:
@@ -499,11 +535,9 @@ class DashboardProjection:
         invalidations = _data_int(data, "invalidation_count")
         if invalidations is not None:
             self._invalidation_count = max(0, invalidations)
-        labels = _data_string_sequence(
-            data,
-            "evidence_labels",
+        labels = _verification_label_sequence(
+            data.get("evidence_labels"),
             max_items=_MAX_EVIDENCE_LABELS,
-            item_limit=100,
         )
         if self._verification_status in _NO_CURRENT_EVIDENCE_STATUSES:
             labels = ()
@@ -533,6 +567,10 @@ class DashboardProjection:
         level: TimelineLevel = "info",
         duration_ms: float | None = None,
         preview: tuple[str, ...] = (),
+        activity_id: str | None = None,
+        activity_state: ActivityState | None = None,
+        facts: tuple[ActivityFact, ...] = (),
+        facts_complete: bool = True,
     ) -> TimelineEntry:
         return TimelineEntry(
             step=event.step,
@@ -543,6 +581,10 @@ class DashboardProjection:
             offset_seconds=self._event_offset(event.timestamp),
             duration_ms=duration_ms,
             preview=preview,
+            activity_id=activity_id,
+            activity_state=activity_state,
+            facts=facts,
+            facts_complete=facts_complete,
         )
 
     def _event_offset(self, timestamp: datetime) -> float:
@@ -920,24 +962,20 @@ def _data_number(data: Mapping[str, object], key: str) -> float | None:
     return numeric if numeric >= 0 and math.isfinite(numeric) else None
 
 
-def _data_string_sequence(
-    data: Mapping[str, object],
-    key: str,
+def _verification_label_sequence(
+    value: object,
     *,
     max_items: int,
-    item_limit: int,
 ) -> tuple[str, ...]:
-    """Read one explicitly whitelisted, bounded list without stringifying values."""
-    value = data.get(key)
+    """Read bounded, credential-free verifier labels from a terminal report."""
+
     if not isinstance(value, Sequence) or isinstance(value, str | bytes):
         return ()
     result: list[str] = []
     for candidate in value[:max_items]:
-        if not isinstance(candidate, str):
-            continue
-        cleaned = _clean_text(candidate, limit=item_limit)
-        if cleaned and cleaned not in result:
-            result.append(cleaned)
+        label, _ = sanitize_public_label(candidate, limit=100)
+        if label and label not in result:
+            result.append(label)
     return tuple(result)
 
 

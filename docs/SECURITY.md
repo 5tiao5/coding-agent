@@ -120,6 +120,13 @@ instead of misreporting an already-applied change as a normal failure.
   exception is the mutation tool's explicit presentation-safe Diff: timeline entries keep six lines,
   while only `latest_change` may expose at most 80 ordered lines plus an honest completeness flag.
   Runs created before M5.5 metadata are not automatically listed.
+- Expandable activity details are not a terminal-log escape hatch. `run_command` event metadata is
+  rebuilt from an allowlist; ordinary argv, environment data, stdout/stderr, arbitrary adapter
+  metadata, prompts, and reasoning are omitted before tracing. Even exact registered verifiers never
+  reconstruct a display string from argv: the activity view receives only a sanitized executable
+  basename, a hidden argument count, and sanitized host-owned verification identity/scopes. The
+  Dashboard applies a second bounded whitelist for live events and legacy trace replay, reports
+  incomplete disclosures, and the browser renders facts with text nodes rather than HTML.
 - API credentials remain in the backend environment. A process entry point may populate that
   environment from the exact launch-directory `.env.local`; it never searches parents, loads only
   the four allowlisted model settings, disables interpolation, and preserves existing environment

@@ -8,6 +8,7 @@ from threading import RLock, Thread
 from typing import Literal, Protocol, TypedDict, cast, overload
 from uuid import uuid4
 
+from coding_agent._dashboard_activity import ActivityFact
 from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.dashboard import (
     MAX_EXPANDED_MUTATION_PREVIEW_LINES,
@@ -25,6 +26,14 @@ DEFAULT_CANCELLATION_GRACE_SECONDS = 0.25
 MAX_CANCELLATION_GRACE_SECONDS = 1.0
 
 
+class ActivityFactPayload(TypedDict):
+    """One bounded, presentation-safe fact disclosed by an activity card."""
+
+    label: str
+    value: str
+    format: Literal["text", "code", "status"]
+
+
 class TimelinePayload(TypedDict):
     """Whitelisted presentation fields for one projected timeline entry."""
 
@@ -36,6 +45,10 @@ class TimelinePayload(TypedDict):
     offset_seconds: float
     duration_ms: float | None
     preview: list[str]
+    activity_id: str | None
+    activity_state: Literal["started", "finished"] | None
+    facts: list[ActivityFactPayload]
+    facts_complete: bool
 
 
 class LatestChangePayload(TimelinePayload):
@@ -433,6 +446,18 @@ def _timeline_payload(entry: TimelineEntry) -> TimelinePayload:
         "offset_seconds": entry.offset_seconds,
         "duration_ms": entry.duration_ms,
         "preview": list(entry.preview),
+        "activity_id": entry.activity_id,
+        "activity_state": entry.activity_state,
+        "facts": [_activity_fact_payload(fact) for fact in entry.facts],
+        "facts_complete": entry.facts_complete,
+    }
+
+
+def _activity_fact_payload(fact: ActivityFact) -> ActivityFactPayload:
+    return {
+        "label": fact.label,
+        "value": fact.value,
+        "format": fact.format,
     }
 
 

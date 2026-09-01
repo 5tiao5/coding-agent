@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 
+from coding_agent._presentation_safety import sanitize_public_label
 from coding_agent.budget import BudgetPolicy, BudgetPurpose
 from coding_agent.completion import (
     CompletionContract,
@@ -21,6 +22,7 @@ from coding_agent.models import (
     ModelResponse,
     ToolCall,
     ToolExecution,
+    VerificationKind,
 )
 from coding_agent.run_memory import RunMemorySnapshot
 from coding_agent.tooling import ToolDispatcher
@@ -53,6 +55,28 @@ EARLY_FINAL_CORRECTION = (
 
 PRESENTATION_PREVIEW_TOOLS = frozenset({"replace_text", "undo_change", "update_plan", "write_file"})
 
+_MAX_PUBLIC_COMMAND_ARGUMENTS = 64
+_MAX_PUBLIC_COMMAND_ARGUMENT_CHARS = 16_000
+_MAX_PUBLIC_VERIFICATION_SCOPES = 16
+_EXECUTABLE_SUFFIXES = (".exe", ".com", ".cmd", ".bat")
+_SENSITIVE_ARGUMENT_MARKERS = (
+    "ACCESS_KEY",
+    "API_KEY",
+    "AUTHORIZATION",
+    "CREDENTIAL",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE_KEY",
+    "SECRET",
+    "TOKEN",
+)
+_FINAL_VERIFICATION_LABEL_FIELDS = (
+    "evidence_labels",
+    "required_labels",
+    "missing_labels",
+    "unexpected_labels",
+    "mismatched_labels",
+)
 _ALLOWED_TRANSITIONS: dict[AgentState, frozenset[AgentState]] = {
     AgentState.CREATED: frozenset({AgentState.PLANNING}),
     AgentState.PLANNING: frozenset({AgentState.ACTING}),
@@ -346,7 +370,7 @@ def final_verification_view(
     verification = ledger.report()
     if profile is None:
         verified = verification.verified
-        data = verification.event_data()
+        data = _public_final_verification_data(verification.event_data())
         evaluation_message = (
             "Current verification evidence passed"
             if verified
@@ -362,7 +386,7 @@ def final_verification_view(
     assert contract is not None
     completion = evaluate_completion(profile, contract, verification)
     verified = completion.task_validated
-    data = completion.event_data(verification)
+    data = _public_final_verification_data(completion.event_data(verification))
     evaluation_message = (
         "Task completion contract validated"
         if verified
@@ -462,6 +486,8 @@ def tool_finished_event_data(
     call: ToolCall,
     raw_execution: ToolExecution,
     execution: ToolExecution,
+    *,
+    verification_call: bool = False,
 ) -> dict[str, object]:
     """Build the public tool-finished event view without exposing private output."""
 
@@ -479,7 +505,20 @@ def tool_finished_event_data(
         != raw_execution.as_message_content(),
     }
     if raw_execution.metadata:
-        event_data["metadata"] = dict(raw_execution.metadata)
+        metadata = (
+            _public_command_metadata(raw_execution.metadata)
+            if call.name == "run_command"
+            else dict(raw_execution.metadata)
+        )
+        if metadata:
+            event_data["metadata"] = metadata
+    public_invocation = _public_invocation(
+        call,
+        raw_execution,
+        verification_call=verification_call,
+    )
+    if public_invocation is not None:
+        event_data["public_invocation"] = public_invocation
     if (
         raw_execution.ok
         and raw_execution.output is not None
@@ -489,6 +528,245 @@ def tool_finished_event_data(
         # Read/search/command output stays in the private canonical transcript.
         event_data["preview"] = raw_execution.output
     return event_data
+
+
+def verification_scope_event_data(
+    profile: VerificationProfile | None,
+    *,
+    label: str,
+    kind: object,
+) -> dict[str, object]:
+    """Return bounded scopes owned by the host profile for one exact verifier."""
+
+    scopes: tuple[str, ...] = ()
+    if profile is not None:
+        check = next(
+            (
+                candidate
+                for candidate in profile.checks
+                if candidate.label == label and candidate.kind is kind
+            ),
+            None,
+        )
+        if check is not None:
+            scopes = check.scopes
+    visible = scopes[:_MAX_PUBLIC_VERIFICATION_SCOPES]
+    return {
+        "scopes": list(visible),
+        "scopes_truncated": len(visible) < len(scopes),
+    }
+
+
+def _public_invocation(
+    call: ToolCall,
+    execution: ToolExecution,
+    *,
+    verification_call: bool,
+) -> dict[str, object] | None:
+    """Project a command call without serializing its model-authored argument vector."""
+
+    if call.name != "run_command":
+        return None
+    raw_argv = call.arguments.get("argv")
+    if not isinstance(raw_argv, list) or not 1 <= len(raw_argv) <= _MAX_PUBLIC_COMMAND_ARGUMENTS:
+        return None
+    if any(not isinstance(token, str) for token in raw_argv):
+        return None
+    argv = tuple(raw_argv)
+    if sum(len(token) for token in argv) > _MAX_PUBLIC_COMMAND_ARGUMENT_CHARS or any(
+        _contains_display_control(token) for token in argv
+    ):
+        return None
+    executable = _public_executable_name(argv[0])
+    if executable is None:
+        return None
+    public: dict[str, object] = {
+        "executable": executable,
+        "argument_count": len(argv) - 1,
+    }
+    if verification_call is True:
+        public.update(_public_verification_identity(execution))
+    return public
+
+
+def _public_verification_identity(execution: ToolExecution) -> dict[str, str]:
+    """Expose only the paired verifier identity asserted by host-owned control facts."""
+
+    label = execution.control.verification_label
+    kind = execution.control.verification_kind
+    if label is None or not isinstance(kind, VerificationKind):
+        return {}
+    normalized_label = public_verifier_label(label)
+    if normalized_label is None:
+        return {}
+    return {
+        "verification_label": normalized_label,
+        "verification_kind": kind.value,
+    }
+
+
+def public_verifier_label(value: object) -> str | None:
+    """Return one bounded verifier label only when it contains no credential shape."""
+
+    label, _ = sanitize_public_label(value)
+    return label
+
+
+def _public_final_verification_data(data: Mapping[str, object]) -> dict[str, object]:
+    """Remove private verifier labels from terminal evidence before event emission."""
+
+    public = dict(data)
+    labels_redacted = False
+    for field in _FINAL_VERIFICATION_LABEL_FIELDS:
+        if field not in public:
+            continue
+        labels, redacted = _public_label_sequence(public[field])
+        public[field] = labels
+        labels_redacted |= redacted
+
+    raw_evidence = public.get("evidence")
+    visible_evidence: list[dict[str, object]] = []
+    if isinstance(raw_evidence, Sequence) and not isinstance(raw_evidence, str | bytes):
+        for candidate in raw_evidence:
+            if not isinstance(candidate, Mapping):
+                labels_redacted = True
+                continue
+            label = public_verifier_label(candidate.get("label"))
+            if label is None:
+                labels_redacted = True
+                continue
+            visible_evidence.append(
+                {
+                    "label": label,
+                    "kind": candidate.get("kind"),
+                    "passed": candidate.get("passed"),
+                    "step": candidate.get("step"),
+                    "epoch": candidate.get("epoch"),
+                }
+            )
+    elif raw_evidence is not None:
+        labels_redacted = True
+    if "evidence" in public:
+        public["evidence"] = visible_evidence
+    if "evidence_count" in public:
+        public["evidence_count"] = len(visible_evidence)
+    if labels_redacted:
+        public["labels_redacted"] = True
+    return public
+
+
+def _public_label_sequence(value: object) -> tuple[list[str], bool]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return [], True
+    labels: list[str] = []
+    redacted = False
+    for candidate in value:
+        label = public_verifier_label(candidate)
+        if label is None:
+            redacted = True
+            continue
+        labels.append(label)
+    return labels, redacted
+
+
+def _public_executable_name(value: str) -> str | None:
+    portable = value.replace("\\", "/").rstrip("/")
+    candidate = portable.rsplit("/", maxsplit=1)[-1].strip()
+    lowered = candidate.casefold()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            candidate = candidate[: -len(suffix)]
+            lowered = lowered[: -len(suffix)]
+            break
+    if (
+        not candidate
+        or candidate in {".", ".."}
+        or len(candidate) > 120
+        or _contains_display_control(candidate)
+        or _contains_sensitive_marker(candidate)
+    ):
+        return None
+    return lowered
+
+
+def _contains_sensitive_marker(value: str) -> bool:
+    normalized = "_".join(
+        part
+        for part in "".join(
+            character if character.isalnum() else "_" for character in value.upper()
+        ).split("_")
+        if part
+    )
+    padded = f"_{normalized}_"
+    return any(f"_{marker}_" in padded for marker in _SENSITIVE_ARGUMENT_MARKERS)
+
+
+def _looks_absolute_path(value: str) -> bool:
+    return value.startswith(("/", "\\\\")) or (
+        len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
+    )
+
+
+def _contains_display_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _public_command_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
+    """Allow only stable command facts; arbitrary adapter metadata stays private."""
+
+    public: dict[str, object] = {}
+    string_values = {
+        "status": {"exited", "timed_out", "control_failed", "integrity_failed"},
+        "command_class": {"verifier", "read_only", "general"},
+        "integrity_phase": {"before", "after"},
+        "permission_mode": {"safe", "auto"},
+        "reason": {
+            "destructive_executable",
+            "destructive_git_operation",
+            "general_command",
+            "implicit_shell",
+            "user_denied",
+        },
+    }
+    for key, allowed in string_values.items():
+        value = metadata.get(key)
+        if isinstance(value, str) and value in allowed:
+            public[key] = value
+    cwd = metadata.get("cwd")
+    if isinstance(cwd, str) and _public_relative_path(cwd):
+        public["cwd"] = cwd.replace("\\", "/")
+    encoding = metadata.get("output_encoding")
+    if (
+        isinstance(encoding, str)
+        and 1 <= len(encoding) <= 40
+        and not _contains_display_control(encoding)
+    ):
+        public["output_encoding"] = encoding
+    executable = metadata.get("executable")
+    if isinstance(executable, str):
+        safe_executable = _public_executable_name(executable)
+        if safe_executable is not None:
+            public["executable"] = safe_executable
+    for key in ("exit_code", "total_output_bytes", "captured_output_bytes"):
+        value = metadata.get(key)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and -(2**31) <= value <= 2**63 - 1
+        ):
+            public[key] = value
+    for key in ("timed_out", "termination_failed", "integrity_intact"):
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            public[key] = value
+    return public
+
+
+def _public_relative_path(value: str) -> bool:
+    if not value or len(value) > 1_000 or _contains_display_control(value):
+        return False
+    portable = value.replace("\\", "/")
+    return not _looks_absolute_path(value) and ".." not in portable.split("/")
 
 
 def _tool_result_error_code(message: ChatMessage) -> str | None:

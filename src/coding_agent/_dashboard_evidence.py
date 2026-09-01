@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from coding_agent._dashboard_activity import public_verification_kind
+from coding_agent._presentation_safety import sanitize_public_label
+
 
 @dataclass(frozen=True, slots=True)
 class ChangedFile:
@@ -60,8 +63,8 @@ def verification_evidence_items(
     for candidate in value[:max_items]:
         if not isinstance(candidate, Mapping):
             continue
-        label = _mapping_string(candidate, "label", limit=100)
-        kind = _mapping_string(candidate, "kind", limit=40)
+        label, _ = sanitize_public_label(candidate.get("label"), limit=100)
+        kind = public_verification_kind(candidate.get("kind"))
         passed = _mapping_bool(candidate, "passed")
         step = _mapping_nonnegative_int(candidate, "step")
         epoch = _mapping_nonnegative_int(candidate, "epoch")

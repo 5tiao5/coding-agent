@@ -6,6 +6,7 @@ import {
   translateTimelineDetail,
   translateTimelineHeadline,
 } from "./locale-zh.js";
+import { createActivityCards } from "./_activity_cards.js";
 import { createWorkbench } from "./_workbench.js";
 import { diffPreviewView } from "./_diff_view.js";
 import { runtimeMetricView } from "./_metrics.js";
@@ -91,6 +92,7 @@ let consecutivePollFailures = 0;
 let toastTimer = null;
 let taskInputDirty = false;
 let diffBlockSequence = 0;
+const activityCards = createActivityCards();
 const expandedDiffKeys = new Set();
 
 const RUN_STATUS = {
@@ -106,18 +108,6 @@ const RUN_STATUS = {
   running: { label: "运行中", phase: "智能体正在工作", tone: "running" },
 };
 
-const CATEGORY_META = {
-  CONTEXT: { label: "上下文", symbol: "C" },
-  MODEL: { label: "决策", symbol: "M" },
-  PLAN: { label: "计划", symbol: "P" },
-  RUN: { label: "运行", symbol: "R" },
-  SAVE: { label: "存档", symbol: "S" },
-  SESSION: { label: "会话", symbol: "S" },
-  TOOL: { label: "工具", symbol: "T" },
-  VERIFY: { label: "验证", symbol: "V" },
-};
-
-const LEVELS = new Set(["info", "success", "warning", "error"]);
 const PLAN_STATES = new Set(["pending", "in_progress", "completed"]);
 const TERMINAL_STATUSES = new Set([
   "completed",
@@ -157,35 +147,12 @@ function normalizeRunStatus(value) {
   return Object.hasOwn(RUN_STATUS, value) ? value : "idle";
 }
 
-function normalizedLevel(value) {
-  return LEVELS.has(value) ? value : "info";
-}
-
 function formatPhase(snapshot, status) {
   const phase = asText(snapshot.phase).trim();
   if (status === "running" && phase) {
     return translatePhase(phase, asArray(snapshot.active_tools));
   }
   return RUN_STATUS[status].phase;
-}
-
-function formatDuration(durationMs) {
-  const value = asNumber(durationMs, -1);
-  if (value < 0) {
-    return "";
-  }
-  if (value < 1000) {
-    return `${Math.round(value)} ms`;
-  }
-  return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} s`;
-}
-
-function formatOffset(offsetSeconds) {
-  const value = asNumber(offsetSeconds, -1);
-  if (value < 0) {
-    return "";
-  }
-  return `+${value.toFixed(value < 10 ? 1 : 0)}s`;
 }
 
 function shortRunId(runId) {
@@ -384,65 +351,6 @@ function renderUserMessage(task) {
   return message.row;
 }
 
-function categoryMeta(entry) {
-  const key = asText(entry.category).toUpperCase();
-  return CATEGORY_META[key] || { label: key || "活动", symbol: "·" };
-}
-
-function renderPreview(preview) {
-  const block = createElement("div", "tool-preview");
-  for (const line of asArray(preview).slice(0, 12)) {
-    block.append(createElement("code", "preview-line", asText(line, String(line))));
-  }
-  return block;
-}
-
-function renderTimelineEntry(rawEntry) {
-  const entry = asObject(rawEntry);
-  const level = normalizedLevel(asText(entry.level));
-  const meta = categoryMeta(entry);
-  const card = createElement("article", `activity-card level-${level}`);
-
-  const rail = createElement("div", "activity-rail");
-  rail.append(createElement("span", "activity-symbol", meta.symbol));
-
-  const content = createElement("div", "activity-content");
-  const heading = createElement("div", "activity-heading");
-  const titleGroup = createElement("div", "activity-title-group");
-  titleGroup.append(
-    createElement("span", "activity-category", meta.label),
-    createElement(
-      "strong",
-      "activity-title",
-      translateTimelineHeadline(asText(entry.headline, "智能体活动")),
-    ),
-  );
-
-  const timing = createElement("div", "activity-timing");
-  const duration = formatDuration(entry.duration_ms);
-  const offset = formatOffset(entry.offset_seconds);
-  if (duration) {
-    timing.append(createElement("span", "", duration));
-  }
-  if (offset) {
-    timing.append(createElement("span", "", offset));
-  }
-  heading.append(titleGroup, timing);
-  content.append(heading);
-
-  const detail = asText(entry.detail).trim();
-  if (detail) {
-    content.append(createElement("p", "activity-detail", translateTimelineDetail(detail)));
-  }
-  const preview = asArray(entry.preview);
-  if (preview.length && asText(entry.category).toUpperCase() !== "TOOL") {
-    content.append(renderPreview(preview));
-  }
-
-  card.append(rail, content);
-  return card;
-}
-
 function renderThinkingCard(snapshot) {
   const card = createElement("div", "thinking-card");
   const dots = createElement("span", "thinking-dots");
@@ -593,6 +501,18 @@ function renderConversation(state, snapshot, status) {
 
   const wasNearBottom =
     elements.conversation.scrollHeight - elements.conversation.scrollTop - elements.conversation.clientHeight < 100;
+  const previousConversationScrollTop = elements.conversation.scrollTop;
+  const activeElement = document.activeElement;
+  const activityInteraction = activityCards.captureInteraction(
+    elements.messageList,
+    activeElement,
+  );
+  const diffInspectionActive = Boolean(
+    elements.messageList.querySelector(".diff-block.is-expanded") ||
+      activeElement?.classList?.contains("diff-toggle") ||
+      activeElement?.classList?.contains("diff-block"),
+  );
+  const inspectionActive = activityInteraction.inspectionActive || diffInspectionActive;
   const fragment = document.createDocumentFragment();
 
   if (task) {
@@ -604,9 +524,9 @@ function renderConversation(state, snapshot, status) {
     createElement("span", "message-role", status === "running" ? "进行中" : "活动"),
   );
   const activityStack = createElement("div", "activity-stack");
-  const timeline = asArray(snapshot.timeline).slice(-MAX_VISIBLE_TIMELINE);
-  for (const entry of timeline) {
-    activityStack.append(renderTimelineEntry(entry));
+  const timeline = activityCards.entries(snapshot.timeline, MAX_VISIBLE_TIMELINE);
+  for (const [index, entry] of timeline.entries()) {
+    activityStack.append(activityCards.render(entry, state.run_id, index));
   }
   if (!timeline.length && status === "running") {
     activityStack.append(renderThinkingCard(snapshot));
@@ -635,8 +555,8 @@ function renderConversation(state, snapshot, status) {
       });
     }
   }
-  const focusedDiffKey = document.activeElement?.dataset?.diffKey || "";
-  const focusedDiffTarget = document.activeElement?.classList.contains("diff-block")
+  const focusedDiffKey = activeElement?.dataset?.diffKey || "";
+  const focusedDiffTarget = activeElement?.classList.contains("diff-block")
     ? "block"
     : "toggle";
   elements.messageList.replaceChildren(fragment);
@@ -658,7 +578,10 @@ function renderConversation(state, snapshot, status) {
       }
     }
   }
-  if (wasNearBottom || status === "running") {
+  activityCards.restoreInteraction(elements.messageList, activityInteraction);
+  if (inspectionActive) {
+    elements.conversation.scrollTop = previousConversationScrollTop;
+  } else if (wasNearBottom || status === "running") {
     window.requestAnimationFrame(() => {
       elements.conversation.scrollTop = elements.conversation.scrollHeight;
     });
@@ -879,6 +802,7 @@ workbench = createWorkbench({
     lastRenderSignature = "";
     lastServerTask = "";
     taskInputDirty = false;
+    activityCards.clear();
     expandedDiffKeys.clear();
     if (!appMetadata.taskLocked) {
       elements.taskInput.value = "";

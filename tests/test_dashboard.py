@@ -175,6 +175,394 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
     assert "must remain hidden" not in str(snapshot)
 
 
+def test_projection_correlates_tool_cards_and_discloses_only_bounded_activity_facts() -> None:
+    projection = DashboardProjection(max_timeline=20)
+    invocation = {
+        "executable": "python",
+        "argument_count": 3,
+        "display_command": "python -m pytest -q",
+        "verification_label": "pytest",
+        "verification_kind": "test",
+        "private": "PRIVATE INVOCATION",
+    }
+    projection.apply(
+        _event(
+            EventKind.TOOL_STARTED,
+            step=2,
+            data={
+                "call_id": "provider-call-secret",
+                "tool_name": "run_command",
+                "public_invocation": invocation,
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=2,
+            seconds=0.5,
+            data={
+                "call_id": "provider-call-secret",
+                "tool_name": "run_command",
+                "ok": True,
+                "duration_ms": 500,
+                "output_chars": 42,
+                "truncated": False,
+                "summary": "Command exited 0 in .",
+                "public_invocation": invocation,
+                "metadata": {
+                    "command_class": "verifier",
+                    "cwd": ".",
+                    "status": "exited",
+                    "exit_code": 0,
+                    "captured_output_bytes": 21,
+                    "total_output_bytes": 21,
+                    "private": "PRIVATE COMMAND METADATA",
+                },
+                "raw_output": "PRIVATE COMMAND OUTPUT",
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=2,
+            seconds=0.6,
+            data={
+                "call_id": "provider-call-secret",
+                "label": "pytest",
+                "kind": "test",
+                "passed": True,
+                "epoch": 3,
+                "scopes": ["unit-tests", "route-cost"],
+                "private": "PRIVATE VERIFICATION",
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=3,
+            seconds=0.7,
+            data={
+                "status": "verified",
+                "verified": True,
+                "required_scopes": ["unit-tests", "route-cost"],
+                "passed_scopes": ["unit-tests", "route-cost"],
+                "missing_scopes": [],
+                "private": "PRIVATE GATE",
+            },
+        )
+    )
+
+    started, finished, recorded, gate = projection.snapshot.timeline
+    assert started.activity_state == "started"
+    assert finished.activity_state == "finished"
+    assert started.activity_id == finished.activity_id == recorded.activity_id
+    assert started.activity_id is not None
+    assert started.activity_id.startswith("act_")
+    assert "provider-call-secret" not in str(projection.snapshot)
+    assert [(fact.label, fact.value, fact.format) for fact in finished.facts] == [
+        ("Command", "python (3 argument(s) hidden by safety policy)", "code"),
+        ("Verification", "test / pytest", "text"),
+        ("Category", "verifier", "text"),
+        ("Working directory", ".", "code"),
+        ("Result", "Exited with code 0", "status"),
+        ("Output", "Captured 21 of 21 byte(s)", "text"),
+    ]
+    assert started.facts_complete is False
+    assert finished.facts_complete is False
+    assert [(fact.label, fact.value) for fact in recorded.facts] == [
+        ("Verification", "pytest"),
+        ("Kind", "test"),
+        ("Result", "Passed"),
+        ("Step", "2"),
+        ("Workspace revision", "3"),
+        ("Scopes", "unit-tests, route-cost"),
+    ]
+    assert [(fact.label, fact.value) for fact in gate.facts] == [
+        ("Gate", "verified"),
+        ("Required scopes", "unit-tests, route-cost"),
+        ("Passed scopes", "unit-tests, route-cost"),
+        ("Missing scopes", "None"),
+    ]
+    assert recorded.facts_complete is True
+    assert gate.facts_complete is True
+    assert "PRIVATE" not in str(projection.snapshot)
+
+
+def test_activity_projection_fails_closed_and_enforces_fact_bounds() -> None:
+    projection = DashboardProjection(max_timeline=5)
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "call-1",
+                "tool_name": "run_command",
+                "ok": True,
+                "public_invocation": {
+                    "executable": "python",
+                    "argument_count": 3,
+                    "display_command": "python " + ("x" * 400),
+                },
+                "metadata": {
+                    "command_class": "verifier",
+                    "cwd": "C:/Users/private/workspace",
+                    "status": "exited",
+                    "exit_code": 0,
+                    "captured_output_bytes": 10,
+                    "total_output_bytes": 20,
+                    "private": "NEVER PROJECT THIS",
+                },
+                "truncated": True,
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=1,
+            data={
+                "status": "verified",
+                "required_scopes": [f"scope-{index}" for index in range(12)],
+                "passed_scopes": ["scope-0", {"private": "SECRET"}],
+                "missing_scopes": [],
+            },
+        )
+    )
+
+    command, gate = projection.snapshot.timeline
+    assert command.facts_complete is False
+    assert gate.facts_complete is False
+    assert len(command.facts) <= 8
+    assert len(gate.facts) <= 8
+    assert all(len(fact.label) <= 32 and len(fact.value) <= 240 for fact in command.facts)
+    assert command.facts[0].value == "python (3 argument(s) hidden by safety policy)"
+    assert all(fact.label != "Working directory" for fact in command.facts)
+    serialized = str(projection.snapshot)
+    assert "C:/Users/private" not in serialized
+    assert "NEVER PROJECT THIS" not in serialized
+    assert "SECRET" not in serialized
+
+
+def test_activity_projection_never_hides_source_truncation_as_complete() -> None:
+    projection = DashboardProjection(max_timeline=4)
+    visible_cwd = "nested/" + ("a" * 193)
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "long-cwd",
+                "tool_name": "run_command",
+                "ok": True,
+                "public_invocation": {"executable": "python", "argument_count": 0},
+                "metadata": {"cwd": visible_cwd, "status": "exited", "exit_code": 0},
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "oversized-cwd",
+                "tool_name": "run_command",
+                "ok": True,
+                "public_invocation": {"executable": "python", "argument_count": 0},
+                "metadata": {"cwd": "nested/" + ("b" * 250)},
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "oversized-error",
+                "tool_name": "run_command",
+                "ok": False,
+                "error_code": "failure_" + ("c" * 90),
+                "public_invocation": {"executable": "python", "argument_count": 0},
+                "metadata": {"cwd": "."},
+            },
+        )
+    )
+
+    visible, oversized_cwd, oversized_error = projection.snapshot.timeline
+    visible_facts = {fact.label: fact.value for fact in visible.facts}
+    assert visible_facts["Working directory"] == visible_cwd
+    assert "..." not in visible_facts["Working directory"]
+    assert visible.facts_complete is True
+
+    assert all(fact.label != "Working directory" for fact in oversized_cwd.facts)
+    assert oversized_cwd.facts_complete is False
+    assert all("c" * 40 not in fact.value for fact in oversized_error.facts)
+    assert {fact.label: fact.value for fact in oversized_error.facts}["Result"] == "Failed"
+    assert oversized_error.facts_complete is False
+
+
+def test_legacy_verification_activity_without_scopes_is_explicitly_incomplete() -> None:
+    projection = DashboardProjection(max_timeline=2)
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=4,
+            data={
+                "call_id": "legacy-check",
+                "label": "pytest",
+                "kind": "test",
+                "passed": True,
+                "epoch": 2,
+            },
+        )
+    )
+
+    entry = projection.snapshot.timeline[-1]
+    assert entry.facts_complete is False
+    assert all(fact.label != "Scopes" for fact in entry.facts)
+    assert [(fact.label, fact.value) for fact in entry.facts] == [
+        ("Verification", "pytest"),
+        ("Kind", "test"),
+        ("Result", "Passed"),
+        ("Step", "4"),
+        ("Workspace revision", "2"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw_label", "visible_label"),
+    [
+        ("pytest   suite", "pytest suite"),
+        ("v" * 300, None),
+    ],
+    ids=("collapsed-whitespace", "truncated-source"),
+)
+def test_verification_fact_sanitization_never_claims_complete_source_text(
+    raw_label: str,
+    visible_label: str | None,
+) -> None:
+    projection = DashboardProjection(max_timeline=2)
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            data={
+                "label": raw_label,
+                "kind": "test",
+                "passed": True,
+                "epoch": 0,
+                "scopes": [],
+            },
+        )
+    )
+
+    entry = projection.snapshot.timeline[-1]
+    labels = {fact.label: fact.value for fact in entry.facts}
+    if visible_label is None:
+        assert "Verification" not in labels
+        assert raw_label not in str(entry)
+    else:
+        assert labels["Verification"] == visible_label
+    assert entry.facts_complete is False
+
+
+def test_tampered_history_omits_commands_credentials_and_invalid_verifier_facts() -> None:
+    projection = DashboardProjection(max_timeline=10)
+    sentinels = (
+        "sk-PROJECTOR_SENTINEL",
+        "ghp_PROJECTOR_SENTINEL",
+        "AKIA_PROJECTOR_SENTINEL",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJQUk9KRUNUT1IifQ.c2lnbmF0dXJlX3NlbnRpbmVs",
+        "password=PROJECTOR_SENTINEL",
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "tampered-command",
+                "tool_name": "run_command",
+                "ok": True,
+                "public_invocation": {
+                    "display_command": f"python --token {sentinels[0]}",
+                    "executable": "../python",
+                    "argument_count": 2,
+                    "verification_label": sentinels[1],
+                    "verification_kind": "credential_dump",
+                },
+                "metadata": {
+                    "command_class": "verifier",
+                    "cwd": ".",
+                    "status": "exited",
+                    "exit_code": 0,
+                    "captured_output_bytes": 0,
+                    "total_output_bytes": 0,
+                },
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_RECORDED,
+            step=1,
+            data={
+                "call_id": "tampered-command",
+                "label": sentinels[3],
+                "kind": "credential_dump",
+                "passed": True,
+                "epoch": 0,
+                "scopes": [],
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.VERIFICATION_EVALUATED,
+            step=2,
+            data={
+                "verified": True,
+                "status": "verified",
+                "evidence_labels": [*sentinels, "API_KEY verifier"],
+                "evidence": [
+                    {
+                        "label": sentinels[2],
+                        "kind": "test",
+                        "passed": True,
+                        "step": 1,
+                        "epoch": 0,
+                    },
+                    {
+                        "label": sentinels[4],
+                        "kind": "test",
+                        "passed": True,
+                        "step": 1,
+                        "epoch": 0,
+                    },
+                    {
+                        "label": "API_KEY verifier",
+                        "kind": "test",
+                        "passed": True,
+                        "step": 1,
+                        "epoch": 0,
+                    },
+                ],
+                "required_scopes": [],
+                "passed_scopes": [],
+                "missing_scopes": [],
+            },
+        )
+    )
+
+    command, recorded, _ = projection.snapshot.timeline
+    assert command.facts_complete is False
+    assert recorded.facts_complete is False
+    assert all(fact.label != "Command" for fact in command.facts)
+    assert all(fact.label not in {"Verification", "Kind"} for fact in recorded.facts)
+    assert projection.snapshot.verification_labels == ("API_KEY verifier",)
+    assert [item.label for item in projection.snapshot.verification_evidence] == [
+        "API_KEY verifier"
+    ]
+    serialized = repr(projection.snapshot)
+    assert "PROJECTOR_SENTINEL" not in serialized
+    assert all(sentinel not in serialized for sentinel in sentinels)
+
+
 def test_projection_covers_resume_failure_and_safe_fallbacks() -> None:
     projection = DashboardProjection(max_timeline=20)
     events = [

@@ -129,7 +129,15 @@ evidence and revision, outcome, plan lines, recent timeline, and latest Diff. Ti
 only a compact six-line mutation summary; the latest-change card may additionally carry an ordered,
 display-safe preview of at most 80 lines. Its completeness flag combines the mutation tool's own
 bounded-Diff result with the Web projection limit, so browser folding is never confused with source
-truncation. The terminal response and public error are separate result fields. Raw
+truncation. Completed command and verification entries may also carry at most eight typed
+`ActivityFact` values. The protocol boundary creates a safe `public_invocation`: ordinary commands
+retain only the executable basename and hidden argument count, while an exact host-registered
+verifier may add its sanitized host-owned identity but never reconstruct argv for display.
+`DashboardProjection`
+combines that with a strict command-metadata whitelist and typed verification scopes, hashes the
+provider call ID into a run-scoped activity ID, and marks incomplete disclosures honestly. The
+browser coalesces matching start/finish events and owns only fold state; live and trace replay pass
+through this same projection. The terminal response and public error are separate result fields. Raw
 `RunEvent` objects, event messages, canonical chat history, raw provider responses, read/search/command
 output, provider state, credentials, and server configuration never enter that projection. Only the
 explicitly allowlisted, already-bounded mutation Diff crosses as presentation data. Historical
@@ -174,7 +182,7 @@ tool calls enters the Verification Gate. The terminal checkpoint event is emitte
 | application wiring | `application.py`, `runtime.py`, `cli.py`, `local_config.py`, `demo.py`, `web/runtime.py`, `web/workbench.py` |
 | evaluation | `evaluation.py`, `evaluation_scenarios.py`, `evaluation_cli.py` |
 | persistence | `session.py`, `trace.py`, `state.py`, `projects.py`, `run_catalog.py`, `lease.py`, `run_id.py` |
-| presentation | `events.py`, `dashboard.py`, `presentation.py`, `ui.py`, `web/app.py`, `web/service.py`, `web/static/` |
+| presentation | `events.py`, `dashboard.py`, `_dashboard_activity.py`, `_dashboard_evidence.py`, `_presentation_safety.py`, `presentation.py`, `ui.py`, `web/app.py`, `web/service.py`, `web/static/` |
 
 `cli.py` performs argument handling and selects a host; its root callback loads only the
 allowlisted keys from an exact launch-directory `.env.local` before Typer parses environment-backed

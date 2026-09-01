@@ -621,9 +621,10 @@ class AgentRunner:
                         budget_usage=budget_state.usage,
                     )
                     continue
-                verification_calls = sum(
+                verification_call_flags = tuple(
                     protocol.is_verification_call(self._tools, call) for call in response.tool_calls
                 )
+                verification_calls = sum(verification_call_flags)
                 work_calls = requested_calls - verification_calls
                 batch_admission = budget_state.admit_batch(
                     work_calls=work_calls,
@@ -743,6 +744,7 @@ class AgentRunner:
                         call,
                         raw_execution,
                         execution,
+                        verification_call=verification_call_flags[call_index],
                     )
                     self._emit(
                         run_id,
@@ -942,18 +944,28 @@ class AgentRunner:
         if facts.verification is not None:
             assert facts.verification_kind is not None
             assert facts.verification_label is not None
+            public_label = protocol.public_verifier_label(facts.verification_label)
+            event_data: dict[str, object] = {
+                "call_id": execution.call_id,
+                "epoch": verification.epoch,
+                "kind": facts.verification_kind.value,
+                "passed": facts.verification.value == "passed",
+                **protocol.verification_scope_event_data(
+                    self._verification_profile,
+                    label=facts.verification_label,
+                    kind=facts.verification_kind,
+                ),
+            }
+            if public_label is None:
+                event_data["labels_redacted"] = True
+            else:
+                event_data["label"] = public_label
             self._emit(
                 run_id,
                 EventKind.VERIFICATION_RECORDED,
                 f"Recorded {facts.verification_kind.value} evidence: {facts.verification.value}",
                 step,
-                {
-                    "call_id": execution.call_id,
-                    "epoch": verification.epoch,
-                    "kind": facts.verification_kind.value,
-                    "label": facts.verification_label,
-                    "passed": facts.verification.value == "passed",
-                },
+                event_data,
             )
 
     def _transition(

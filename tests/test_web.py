@@ -250,6 +250,142 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
     assert "console.log" in client.get("/static/app.js").text
 
 
+def test_api_projects_correlated_command_and_verification_activity_facts() -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        event_sink.emit(RunEvent(run_id=run_id, kind=EventKind.RUN_STARTED, message="started"))
+        invocation = {
+            "executable": "python",
+            "argument_count": 3,
+            "display_command": "python -m pytest -q",
+            "verification_label": "pytest",
+            "verification_kind": "test",
+            "private": "PRIVATE INVOCATION",
+        }
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.TOOL_STARTED,
+                step=1,
+                message="started command",
+                data={
+                    "call_id": "provider-call-42",
+                    "tool_name": "run_command",
+                    "public_invocation": invocation,
+                },
+            )
+        )
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.TOOL_FINISHED,
+                step=1,
+                message="finished command",
+                data={
+                    "call_id": "provider-call-42",
+                    "tool_name": "run_command",
+                    "ok": True,
+                    "summary": "Command exited 0 in .",
+                    "output_chars": 10,
+                    "truncated": False,
+                    "public_invocation": invocation,
+                    "metadata": {
+                        "command_class": "verifier",
+                        "cwd": ".",
+                        "status": "exited",
+                        "exit_code": 0,
+                        "captured_output_bytes": 10,
+                        "total_output_bytes": 10,
+                        "private": "PRIVATE COMMAND METADATA",
+                    },
+                },
+            )
+        )
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.VERIFICATION_RECORDED,
+                step=1,
+                message="recorded",
+                data={
+                    "call_id": "provider-call-42",
+                    "label": "pytest",
+                    "kind": "test",
+                    "passed": True,
+                    "epoch": 0,
+                    "scopes": ["unit-tests"],
+                },
+            )
+        )
+        terminal = {
+            "verified": True,
+            "status": "verified",
+            "required_scopes": ["unit-tests"],
+            "passed_scopes": ["unit-tests"],
+            "missing_scopes": [],
+        }
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.VERIFICATION_EVALUATED,
+                step=2,
+                message="evaluated",
+                data=terminal,
+            )
+        )
+        event_sink.emit(
+            RunEvent(
+                run_id=run_id,
+                kind=EventKind.RUN_FINISHED,
+                step=2,
+                message="finished",
+                data=terminal,
+            )
+        )
+        return _completed_result(run_id, task)
+
+    service = WebRunService(runner, max_timeline=20)
+    client = _test_client(create_app(service))
+    response = client.post("/api/runs", json={"task": "Verify the project"})
+    assert response.status_code == 202
+    _wait_for(service)
+
+    state_response = client.get("/api/state")
+    assert state_response.status_code == 200
+    timeline = state_response.json()["snapshot"]["timeline"]
+    started = next(entry for entry in timeline if entry["activity_state"] == "started")
+    finished = next(entry for entry in timeline if entry["activity_state"] == "finished")
+    recorded = next(entry for entry in timeline if entry["headline"].endswith("recorded"))
+    gate = next(entry for entry in timeline if entry["headline"] == "Verification gate evaluated")
+    assert started["activity_id"] == finished["activity_id"] == recorded["activity_id"]
+    assert started["activity_id"].startswith("act_")
+    assert finished["facts"] == [
+        {
+            "label": "Command",
+            "value": "python (3 argument(s) hidden by safety policy)",
+            "format": "code",
+        },
+        {"label": "Verification", "value": "test / pytest", "format": "text"},
+        {"label": "Category", "value": "verifier", "format": "text"},
+        {"label": "Working directory", "value": ".", "format": "code"},
+        {"label": "Result", "value": "Exited with code 0", "format": "status"},
+        {"label": "Output", "value": "Captured 10 of 10 byte(s)", "format": "text"},
+    ]
+    assert finished["facts_complete"] is False
+    assert recorded["activity_state"] is None
+    assert recorded["facts"][-1] == {
+        "label": "Scopes",
+        "value": "unit-tests",
+        "format": "text",
+    }
+    assert gate["facts"][-1] == {
+        "label": "Missing scopes",
+        "value": "None",
+        "format": "text",
+    }
+    assert "provider-call-42" not in state_response.text
+    assert "PRIVATE" not in state_response.text
+
+
 def test_api_projects_a_sanitized_model_retry_while_the_run_is_active() -> None:
     retry_visible = Event()
     release = Event()
@@ -608,6 +744,8 @@ def test_app_factory_defaults_to_the_packaged_static_directory() -> None:
     ):
         assert client.get(f"/static/{stylesheet}").status_code == 200
     assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/_activity_cards.js").status_code == 200
+    assert client.get("/static/_activity_view.js").status_code == 200
     assert client.get("/static/_diff_view.js").status_code == 200
     assert client.get("/static/_metrics.js").status_code == 200
     assert client.get("/static/_workbench.js").status_code == 200

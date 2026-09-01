@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -707,6 +708,46 @@ class ControlArgs(BaseModel):
     passed: bool = True
 
 
+class CommandProbeArgs(BaseModel):
+    argv: list[str] = Field(min_length=1)
+
+
+class CommandProbeTool(BaseTool[CommandProbeArgs]):
+    name = "run_command"
+    description = "Return a safe command observation for event-boundary tests."
+    args_model = CommandProbeArgs
+
+    def __init__(self, *, verification_label: str | None = None) -> None:
+        self._verification_label = verification_label
+
+    def _is_verification(self, arguments: CommandProbeArgs) -> bool:
+        del arguments
+        return self._verification_label is not None
+
+    def run(self, arguments: CommandProbeArgs) -> ToolOutput:
+        del arguments
+        control = ToolControlFacts(invalidates_verification=True)
+        if self._verification_label is not None:
+            control = ToolControlFacts(
+                verification=VerificationSignal.PASSED,
+                verification_kind=VerificationKind.TEST,
+                verification_label=self._verification_label,
+            )
+        return ToolOutput(
+            content="command passed",
+            summary="Command exited 0 in .",
+            metadata={
+                "status": "exited",
+                "exit_code": 0,
+                "cwd": ".",
+                "command_class": (
+                    "verifier" if self._verification_label is not None else "general"
+                ),
+            },
+            control=control,
+        )
+
+
 class MutationMarkerTool(BaseTool[ControlArgs]):
     name = "mutation_marker"
     description = "Mark a trusted test mutation."
@@ -800,6 +841,105 @@ class LargeOutputTool(BaseTool[ControlArgs]):
         return ToolOutput(content="LARGE_OUTPUT_" * 1000, summary="Returned large output")
 
 
+@pytest.mark.parametrize(
+    ("verification_label", "secret"),
+    [
+        (None, "UNMARKED_ORDINARY_POSITIONAL_SECRET_7f3b2a1c"),
+        ("pytest", "UNMARKED_VERIFIER_POSITIONAL_SECRET_9d4e6c8a"),
+    ],
+)
+def test_agent_events_never_serialize_raw_command_argv(
+    verification_label: str | None,
+    secret: str,
+) -> None:
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="command-private-argv",
+                        name="run_command",
+                        arguments={"argv": ["python", "-m", "pytest", secret]},
+                    ),
+                )
+            ),
+            ModelResponse(content="Command finished."),
+        ]
+    )
+    events = MemoryEventSink()
+
+    AgentRunner(
+        model,
+        ToolRegistry([CommandProbeTool(verification_label=verification_label)]),
+        event_sink=events,
+    ).run("Run one command without publishing its argument vector")
+
+    serialized = json.dumps(
+        [event.model_dump(mode="json") for event in events.events],
+        ensure_ascii=False,
+    )
+    assert secret not in serialized
+    finished = next(event for event in events.events if event.kind is EventKind.TOOL_FINISHED)
+    assert finished.data["public_invocation"] == {
+        "executable": "python",
+        "argument_count": 3,
+        **(
+            {
+                "verification_label": verification_label,
+                "verification_kind": "test",
+            }
+            if verification_label is not None
+            else {}
+        ),
+    }
+
+
+def test_agent_redacts_credential_like_verifier_label_from_every_event() -> None:
+    private_label = "pytest token=ghp_1234567890abcdef"
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="command-private-label",
+                        name="run_command",
+                        arguments={"argv": ["python", "-m", "pytest"]},
+                    ),
+                )
+            ),
+            ModelResponse(content="Trusted check passed."),
+        ]
+    )
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([CommandProbeTool(verification_label=private_label)]),
+        event_sink=events,
+    ).run("Run a verifier whose private host label must not enter the trace")
+
+    assert result.state is AgentState.COMPLETED
+    serialized = json.dumps(
+        [event.model_dump(mode="json") for event in events.events],
+        ensure_ascii=False,
+    )
+    assert private_label not in serialized
+    assert "ghp_1234567890abcdef" not in serialized
+    recorded = next(
+        event for event in events.events if event.kind is EventKind.VERIFICATION_RECORDED
+    )
+    assert "label" not in recorded.data
+    assert recorded.data["labels_redacted"] is True
+    for kind in (
+        EventKind.VERIFICATION_EVALUATED,
+        EventKind.RUN_FINISHED,
+    ):
+        terminal = next(event for event in events.events if event.kind is kind)
+        assert terminal.data["labels_redacted"] is True
+        assert terminal.data["evidence_labels"] == []
+        assert terminal.data["evidence"] == []
+
+
 def test_current_trusted_verification_evidence_completes_the_run() -> None:
     model = ScriptedModel(
         [
@@ -829,6 +969,8 @@ def test_current_trusted_verification_evidence_completes_the_run() -> None:
         "kind": "test",
         "label": "test-suite",
         "passed": True,
+        "scopes": [],
+        "scopes_truncated": False,
     }
     assert all("verification_label" not in (message.content or "") for message in result.messages)
 
@@ -882,6 +1024,11 @@ def test_completion_contract_distinguishes_passing_checks_from_task_validation()
     assert evaluated.data["missing_scopes"] == ["types"]
     assert evaluated.data["target_runtime_id"] == "configured-python"
     assert events.events[-1].data == evaluated.data
+    recorded = next(
+        event for event in events.events if event.kind is EventKind.VERIFICATION_RECORDED
+    )
+    assert recorded.data["scopes"] == ["tests"]
+    assert recorded.data["scopes_truncated"] is False
 
 
 def test_completion_contract_validates_only_when_every_requirement_is_satisfied() -> None:
