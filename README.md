@@ -4,7 +4,7 @@
 
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
-The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's trusted trace history from a Codex-style sidebar. **M5.6** turns the timeline into a compact audit view: paired tool start/finish events collapse into one card, while safe command and verification facts can be expanded on demand. Both demos tell one complete repair story:
+The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's trusted trace history from a Codex-style sidebar. **M5.6** turns the timeline into a compact audit view: paired tool start/finish events collapse into one card, while credential-redacted command and verification facts can be expanded on demand. Both demos tell one complete repair story:
 
 `plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
 
@@ -22,6 +22,7 @@ uv run coding-agent web --demo
 uv run coding-agent evaluate --help
 uv run ruff check src tests
 uv run mypy src tests
+node --test tests/js/*.test.mjs
 uv run pytest
 ```
 
@@ -221,8 +222,11 @@ For `run` and `resume`, exit codes distinguish control outcomes:
 - A real `run` command, interactive task entry, `safe`/`auto` selection, exact-argv approval panel, and environment-only credential flow.
 - A passive Rich dashboard with plan/diff previews, tool durations, verification evidence, and an explicit `VERIFIED`/`UNVERIFIED` final card.
 - A Web activity timeline whose completed command, recorded-verification, and Verification Gate cards
-  can reveal bounded structured facts on demand. Ordinary command arguments, raw stdout/stderr,
-  environment values, arbitrary metadata, prompts, and hidden reasoning never enter that view.
+  reveal bounded structured facts on demand. Command cards show the direct argv token vector,
+  workspace-relative `cwd`, timeout, result, and bounded captured combined stdout/stderr. Recognized
+  credential values are replaced in place rather than hiding ordinary arguments or output. If the
+  aggregate observation budget further compresses what the model receives, the card identifies that
+  model-observation boundary separately.
 - Bounded per-run JSONL traces plus read-only `runs` and `inspect` commands.
 - Schema-v3 checkpoints with conservative v2 migration, opaque workspace binding, bounded RunMemory, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
 - A deployment-safe pytest capability: if Python itself lives inside the repository, its exact executable hash is bound before it may issue verification evidence.
@@ -252,15 +256,22 @@ verification evidence.
   The latest mutation card shows eight Diff lines by default and can expand to an 80-line safe
   preview in both live and historical views. A separate badge identifies previews that hit a tool or
   projection limit; the underlying file mutation is still applied atomically and completely.
-- Live and historical timelines use the same whitelist projection. Correlated tool-start/tool-finish
-  events render as one completed card; expanding it shows only host-approved facts such as a safe
-  executable basename with its argument count hidden, workspace-relative `cwd`, exit status, output
-  byte counts, and typed verification scopes. A completeness note appears whenever any fact was
-  omitted or truncated.
+- Live and historical timelines use the same versioned projection. Correlated tool-start/tool-finish
+  events render as one completed card; expanding a command shows its credential-redacted argv,
+  workspace-relative `cwd`, timeout, exit status, duration, bounded captured output, and typed
+  verification scopes. Runner capture truncation, projection truncation, credential redaction, and
+  aggregate model-observation compression are distinct labels rather than one ambiguous safety note.
+  Traces written before these audit fields existed cannot recover argv or output and are explicitly
+  labeled as legacy data that was not recorded; history never guesses from a checkpoint.
 - At most one background run is active across all projects, and project changes are locked while it
   runs. Graceful server shutdown stops accepting tasks and attempts
   a bounded drain before process exit. Browser state is a whitelist projection, not raw events,
-  canonical messages, tool output, raw provider response objects, or hidden reasoning.
+  canonical messages, arbitrary raw tool objects, raw provider response objects, or hidden reasoning;
+  the bounded credential-redacted command audit above is an explicit exception.
+- Backend API keys, environment values, provider payloads, and hidden reasoning remain outside the
+  browser projection. Credential redaction recognizes configured names and common token shapes; it is
+  not a promise to identify every arbitrary secret, so secrets must still not be placed in argv,
+  repository files, or program output.
 - This is a loopback presentation slice, not a remote or multi-user Web product, packaged desktop
   shell, Git clone/template service, browser terminal, editor, or alternate Agent implementation.
 - Transient connection, timeout, throttling, and selected server failures are retried by the

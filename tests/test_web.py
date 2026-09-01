@@ -256,7 +256,10 @@ def test_api_projects_correlated_command_and_verification_activity_facts() -> No
         invocation = {
             "executable": "python",
             "argument_count": 3,
-            "display_command": "python -m pytest -q",
+            "argv": ["python", "-m", "pytest", "-q"],
+            "credentials_redacted": False,
+            "cwd": ".",
+            "timeout_seconds": 120.0,
             "verification_label": "pytest",
             "verification_kind": "test",
             "private": "PRIVATE INVOCATION",
@@ -296,6 +299,12 @@ def test_api_projects_correlated_command_and_verification_activity_facts() -> No
                         "captured_output_bytes": 10,
                         "total_output_bytes": 10,
                         "private": "PRIVATE COMMAND METADATA",
+                    },
+                    "public_output": {
+                        "captured_text": "1 passed",
+                        "captured_projection_truncated": False,
+                        "observation_truncated": False,
+                        "credentials_redacted": False,
                     },
                 },
             )
@@ -361,16 +370,22 @@ def test_api_projects_correlated_command_and_verification_activity_facts() -> No
     assert finished["facts"] == [
         {
             "label": "Command",
-            "value": "python (3 argument(s) hidden by safety policy)",
-            "format": "code",
+            "value": "python -m pytest -q",
+            "format": "pre",
         },
+        {"label": "Working directory", "value": ".", "format": "code"},
+        {"label": "Timeout", "value": "120 second(s)", "format": "text"},
         {"label": "Verification", "value": "test / pytest", "format": "text"},
         {"label": "Category", "value": "verifier", "format": "text"},
-        {"label": "Working directory", "value": ".", "format": "code"},
         {"label": "Result", "value": "Exited with code 0", "format": "status"},
-        {"label": "Output", "value": "Captured 10 of 10 byte(s)", "format": "text"},
+        {
+            "label": "Output status",
+            "value": "Captured 10 of 10 byte(s)",
+            "format": "text",
+        },
+        {"label": "Captured output", "value": "1 passed", "format": "pre"},
     ]
-    assert finished["facts_complete"] is False
+    assert finished["facts_complete"] is True
     assert recorded["activity_state"] is None
     assert recorded["facts"][-1] == {
         "label": "Scopes",
@@ -747,6 +762,7 @@ def test_app_factory_defaults_to_the_packaged_static_directory() -> None:
     assert client.get("/static/_activity_cards.js").status_code == 200
     assert client.get("/static/_activity_view.js").status_code == 200
     assert client.get("/static/_diff_view.js").status_code == 200
+    assert client.get("/static/_final_markdown.js").status_code == 200
     assert client.get("/static/_metrics.js").status_code == 200
     assert client.get("/static/_workbench.js").status_code == 200
     assert client.get("/static/locale-zh.js").status_code == 200

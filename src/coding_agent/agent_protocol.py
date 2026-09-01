@@ -7,7 +7,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 
-from coding_agent._presentation_safety import sanitize_public_label
+from coding_agent._presentation_safety import (
+    redact_command_argv,
+    redact_command_output,
+    redact_credential_values,
+    sanitize_public_label,
+)
 from coding_agent.budget import BudgetPolicy, BudgetPurpose
 from coding_agent.completion import (
     CompletionContract,
@@ -57,6 +62,7 @@ PRESENTATION_PREVIEW_TOOLS = frozenset({"replace_text", "undo_change", "update_p
 
 _MAX_PUBLIC_COMMAND_ARGUMENTS = 64
 _MAX_PUBLIC_COMMAND_ARGUMENT_CHARS = 16_000
+_MAX_PUBLIC_COMMAND_OUTPUT_CHARS = 16_000
 _MAX_PUBLIC_VERIFICATION_SCOPES = 16
 _EXECUTABLE_SUFFIXES = (".exe", ".com", ".cmd", ".bat")
 _SENSITIVE_ARGUMENT_MARKERS = (
@@ -489,7 +495,7 @@ def tool_finished_event_data(
     *,
     verification_call: bool = False,
 ) -> dict[str, object]:
-    """Build the public tool-finished event view without exposing private output."""
+    """Build a locally auditable tool-finished event with credential redaction."""
 
     event_data: dict[str, object] = {
         "call_id": call.id,
@@ -519,6 +525,10 @@ def tool_finished_event_data(
     )
     if public_invocation is not None:
         event_data["public_invocation"] = public_invocation
+    if call.name == "run_command":
+        public_output = _public_command_output(call, raw_execution, execution)
+        if public_output is not None:
+            event_data["public_output"] = public_output
     if (
         raw_execution.ok
         and raw_execution.output is not None
@@ -528,6 +538,16 @@ def tool_finished_event_data(
         # Read/search/command output stays in the private canonical transcript.
         event_data["preview"] = raw_execution.output
     return event_data
+
+
+def tool_started_event_data(call: ToolCall) -> dict[str, object]:
+    """Build the auditable start event before a local command begins."""
+
+    data: dict[str, object] = {"call_id": call.id, "tool_name": call.name}
+    public_invocation = _public_invocation(call, None, verification_call=False)
+    if public_invocation is not None:
+        data["public_invocation"] = public_invocation
+    return data
 
 
 def verification_scope_event_data(
@@ -559,11 +579,11 @@ def verification_scope_event_data(
 
 def _public_invocation(
     call: ToolCall,
-    execution: ToolExecution,
+    execution: ToolExecution | None,
     *,
     verification_call: bool,
 ) -> dict[str, object] | None:
-    """Project a command call without serializing its model-authored argument vector."""
+    """Project an argv-preserving command view with credential values redacted."""
 
     if call.name != "run_command":
         return None
@@ -580,13 +600,89 @@ def _public_invocation(
     executable = _public_executable_name(argv[0])
     if executable is None:
         return None
+    visible_argv, credentials_redacted = redact_command_argv(argv)
+    raw_cwd = call.arguments.get("cwd", ".")
+    cwd: str | None = None
+    if (
+        isinstance(raw_cwd, str)
+        and 1 <= len(raw_cwd) <= 1_000
+        and not _contains_display_control(raw_cwd)
+    ):
+        cwd, cwd_redacted = redact_credential_values(raw_cwd)
+        credentials_redacted |= cwd_redacted
+    raw_timeout = call.arguments.get("timeout_seconds", 120.0)
+    timeout_seconds: float | None = None
+    if (
+        not isinstance(raw_timeout, bool)
+        and isinstance(raw_timeout, int | float)
+        and isfinite(raw_timeout)
+        and 1 <= raw_timeout <= 300
+    ):
+        timeout_seconds = float(raw_timeout)
     public: dict[str, object] = {
         "executable": executable,
         "argument_count": len(argv) - 1,
+        "argv": list(visible_argv),
+        "credentials_redacted": credentials_redacted,
     }
-    if verification_call is True:
+    if cwd is not None:
+        public["cwd"] = cwd
+    if timeout_seconds is not None:
+        public["timeout_seconds"] = timeout_seconds
+    if verification_call is True and execution is not None:
         public.update(_public_verification_identity(execution))
     return public
+
+
+def _public_command_output(
+    call: ToolCall,
+    raw_execution: ToolExecution,
+    observed_execution: ToolExecution,
+) -> dict[str, object] | None:
+    """Expose both tool capture and the smaller observation actually sent to the model."""
+
+    if raw_execution.output is None:
+        return None
+    captured_text, captured_redacted, captured_projection_truncated = (
+        _bounded_public_command_output(raw_execution.output, call)
+    )
+    public: dict[str, object] = {
+        "captured_text": captured_text,
+        "captured_projection_truncated": captured_projection_truncated,
+        "observation_truncated": (
+            observed_execution.as_message_content() != raw_execution.as_message_content()
+        ),
+        "credentials_redacted": captured_redacted,
+    }
+    if observed_execution.output is not None:
+        observed_text, observed_redacted, observed_projection_truncated = (
+            _bounded_public_command_output(observed_execution.output, call)
+        )
+        if observed_text != captured_text:
+            public.update(
+                {
+                    "observed_text": observed_text,
+                    "observed_projection_truncated": observed_projection_truncated,
+                }
+            )
+        public["credentials_redacted"] = captured_redacted or observed_redacted
+    return public
+
+
+def _bounded_public_command_output(value: str, call: ToolCall) -> tuple[str, bool, bool]:
+    _, separator, captured = value.partition("\nOutput:\n")
+    source = captured if separator else value
+    raw_argv = call.arguments.get("argv")
+    argv = (
+        tuple(token for token in raw_argv if isinstance(token, str))
+        if isinstance(raw_argv, list)
+        else ()
+    )
+    sanitized, credentials_redacted = redact_command_output(source, argv)
+    projection_truncated = len(sanitized) > _MAX_PUBLIC_COMMAND_OUTPUT_CHARS
+    if projection_truncated:
+        sanitized = sanitized[:_MAX_PUBLIC_COMMAND_OUTPUT_CHARS]
+    return sanitized, credentials_redacted, projection_truncated
 
 
 def _public_verification_identity(execution: ToolExecution) -> dict[str, str]:

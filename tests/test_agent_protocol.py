@@ -6,6 +6,10 @@ from typing import cast
 import pytest
 
 from coding_agent import agent_protocol as protocol
+from coding_agent._presentation_safety import (
+    redact_command_argv,
+    redact_credential_values,
+)
 from coding_agent.completion import (
     CompletionContract,
     TargetRuntime,
@@ -205,8 +209,8 @@ def test_tool_finished_view_only_previews_allowlisted_mutations() -> None:
     assert "preview" not in private_data
 
 
-def test_command_event_exposes_only_a_safe_invocation_summary() -> None:
-    secret = "TEST_PRIVATE_API_KEY_SENTINEL"
+def test_command_event_exposes_auditable_invocation_and_redacted_output() -> None:
+    secret = "sk-test12345678"
     call = ToolCall(
         id="command",
         name="run_command",
@@ -243,6 +247,21 @@ def test_command_event_exposes_only_a_safe_invocation_summary() -> None:
     assert event_data["public_invocation"] == {
         "executable": "python",
         "argument_count": 3,
+        "argv": [
+            r"C:\Python\python.exe",
+            "script.py",
+            "--api-key",
+            "[REDACTED]",
+        ],
+        "credentials_redacted": True,
+        "cwd": ".",
+        "timeout_seconds": 120.0,
+    }
+    assert event_data["public_output"] == {
+        "captured_text": "private stdout [REDACTED]",
+        "captured_projection_truncated": False,
+        "observation_truncated": False,
+        "credentials_redacted": True,
     }
     assert event_data["metadata"] == {
         "status": "exited",
@@ -254,12 +273,12 @@ def test_command_event_exposes_only_a_safe_invocation_summary() -> None:
     }
     serialized = json.dumps(event_data)
     assert secret not in serialized
-    assert "private stdout" not in serialized
+    assert "private stdout" in serialized
     assert "OPENAI_API_KEY" not in serialized
 
 
-def test_registered_verifier_exposes_identity_without_model_authored_arguments() -> None:
-    private_argument = "UNKNOWN_POSITIONAL_VERIFIER_SECRET_SENTINEL"
+def test_registered_verifier_exposes_identity_and_non_sensitive_arguments() -> None:
+    positional_argument = "route-cost-case"
     call = ToolCall(
         id="verify",
         name="run_command",
@@ -273,7 +292,7 @@ def test_registered_verifier_exposes_identity_without_model_authored_arguments()
                 "-q",
                 "-p",
                 "no:cacheprovider",
-                private_argument,
+                positional_argument,
             ]
         },
     )
@@ -300,48 +319,225 @@ def test_registered_verifier_exposes_identity_without_model_authored_arguments()
     assert event_data["public_invocation"] == {
         "executable": "python",
         "argument_count": 8,
+        "argv": [
+            r"C:\Users\student\.venv\Scripts\python.exe",
+            "-I",
+            "-B",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            positional_argument,
+        ],
+        "credentials_redacted": False,
+        "cwd": ".",
+        "timeout_seconds": 120.0,
         "verification_label": "pytest",
         "verification_kind": "test",
     }
     serialized = json.dumps(event_data)
-    assert "C:\\Users" not in serialized
-    assert private_argument not in serialized
-    assert "no:cacheprovider" not in serialized
+    assert "C:\\\\Users" in serialized
+    assert positional_argument in serialized
+    assert "no:cacheprovider" in serialized
 
 
-def test_registered_verifier_never_serializes_any_raw_argument_vector() -> None:
-    secrets = (
-        "TEST_PRIVATE_VERIFIER_TOKEN_SENTINEL",
-        "UNMARKED_POSITIONAL_SECRET_7f3b2a1c",
+def test_registered_verifier_redacts_only_credential_values_from_argv() -> None:
+    secret = "ghp_1234567890abcdef"
+    call = ToolCall(
+        id="verify-secret",
+        name="run_command",
+        arguments={
+            "argv": [
+                "python",
+                "-m",
+                "pytest",
+                "route-cost-case",
+                "--token",
+                secret,
+                "seed=42",
+                "x=1",
+            ]
+        },
     )
-    argument_sets = tuple(["python", "-m", "pytest", marker] for marker in secrets)
-    for index, argv in enumerate(argument_sets):
-        call = ToolCall(
-            id=f"verify-{index}",
-            name="run_command",
-            arguments={"argv": argv},
-        )
-        execution = ToolExecution(
-            call_id=call.id,
-            tool_name=call.name,
-            ok=True,
-            output="passed",
-            summary="Command exited 0 in .",
-        )
+    execution = ToolExecution(
+        call_id=call.id,
+        tool_name=call.name,
+        ok=True,
+        output="passed",
+        summary="Command exited 0 in .",
+    )
 
-        event_data = protocol.tool_finished_event_data(
-            call,
-            execution,
-            execution,
-            verification_call=True,
-        )
+    event_data = protocol.tool_finished_event_data(
+        call,
+        execution,
+        execution,
+        verification_call=True,
+    )
 
-        invocation = event_data["public_invocation"]
-        assert isinstance(invocation, dict)
-        assert "display_command" not in invocation
-        serialized = json.dumps(event_data)
-        assert all(secret not in serialized for secret in secrets)
-        assert "pytest" not in serialized
+    invocation = event_data["public_invocation"]
+    assert isinstance(invocation, dict)
+    assert invocation["argv"] == [
+        "python",
+        "-m",
+        "pytest",
+        "route-cost-case",
+        "--token",
+        "[REDACTED]",
+        "seed=42",
+        "x=1",
+    ]
+    serialized = json.dumps(event_data)
+    assert secret not in serialized
+    assert "route-cost-case" in serialized
+    assert "seed=42" in serialized
+    assert "x=1" in serialized
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Authorization: Bearer abcdefghijk", "Authorization: [REDACTED]"),
+        ("OPENAI_API_KEY=randomvalue", "OPENAI_API_KEY=[REDACTED]"),
+        ('{"client_secret": "randomvalue"}', '{"client_secret": "[REDACTED]"}'),
+        ("seed=42", "seed=42"),
+        ("x=1", "x=1"),
+    ],
+)
+def test_credential_redaction_is_value_scoped(source: str, expected: str) -> None:
+    redacted, changed = redact_credential_values(source)
+    assert redacted == expected
+    assert changed is (source != expected)
+
+
+def test_command_redaction_preserves_benign_flags_and_assignments() -> None:
+    argv, changed = redact_command_argv(
+        (
+            "python",
+            "--max-steps",
+            "50",
+            "--tokenizer",
+            "wordpiece",
+            "seed=42",
+            "x=1",
+            "--openai-api-key",
+            "randomvalue",
+            "--client-secret=another-random-value",
+        )
+    )
+    assert argv == (
+        "python",
+        "--max-steps",
+        "50",
+        "--tokenizer",
+        "wordpiece",
+        "seed=42",
+        "x=1",
+        "--openai-api-key",
+        "[REDACTED]",
+        "--client-secret=[REDACTED]",
+    )
+    assert changed is True
+
+
+def test_started_command_event_discloses_effective_execution_context() -> None:
+    call = ToolCall(
+        id="start-audit",
+        name="run_command",
+        arguments={
+            "argv": ["python", "-m", "pytest", "tests/unit case.py"],
+            "cwd": "packages/core",
+            "timeout_seconds": 45,
+            "environment": {"OPENAI_API_KEY": "must-not-enter-event"},
+        },
+    )
+
+    data = protocol.tool_started_event_data(call)
+
+    assert data["public_invocation"] == {
+        "executable": "python",
+        "argument_count": 3,
+        "argv": ["python", "-m", "pytest", "tests/unit case.py"],
+        "credentials_redacted": False,
+        "cwd": "packages/core",
+        "timeout_seconds": 45.0,
+    }
+    assert "must-not-enter-event" not in json.dumps(data)
+
+
+def test_command_event_distinguishes_tool_capture_from_model_observation() -> None:
+    call = ToolCall(id="bounded-output", name="run_command", arguments={"argv": ["pytest"]})
+    raw = ToolExecution(
+        call_id=call.id,
+        tool_name=call.name,
+        ok=True,
+        output="Status: exited\nOutput:\nfirst line\nsecond line",
+        summary="Command exited 0 in .",
+    )
+    observed = raw.model_copy(update={"output": "Status: exited\nOutput:\nfirst line"})
+
+    data = protocol.tool_finished_event_data(call, raw, observed)
+
+    assert data["public_output"] == {
+        "captured_text": "first line\nsecond line",
+        "captured_projection_truncated": False,
+        "observation_truncated": True,
+        "credentials_redacted": False,
+        "observed_text": "first line",
+        "observed_projection_truncated": False,
+    }
+
+
+def test_command_output_redacts_a_sensitive_argv_value_when_printed_bare() -> None:
+    secret = "randomvalue"
+    call = ToolCall(
+        id="echo-token",
+        name="run_command",
+        arguments={"argv": ["credential-check", "--token", secret]},
+    )
+    execution = ToolExecution(
+        call_id=call.id,
+        tool_name=call.name,
+        ok=True,
+        output=f"Status: exited\nOutput:\ntoken accepted: {secret}",
+        summary="Command exited 0 in .",
+    )
+
+    data = protocol.tool_finished_event_data(call, execution, execution)
+
+    assert data["public_output"] == {
+        "captured_text": "token accepted: [REDACTED]",
+        "captured_projection_truncated": False,
+        "observation_truncated": False,
+        "credentials_redacted": True,
+    }
+    assert secret not in json.dumps(data)
+
+
+def test_command_output_redacts_an_assigned_sensitive_argv_value() -> None:
+    secret = "another-random-value"
+    call = ToolCall(
+        id="echo-assigned-token",
+        name="run_command",
+        arguments={"argv": ["credential-check", f"--client-secret={secret}"]},
+    )
+    execution = ToolExecution(
+        call_id=call.id,
+        tool_name=call.name,
+        ok=True,
+        output=f"Status: exited\nOutput:\ncredential accepted: {secret}",
+        summary="Command exited 0 in .",
+    )
+
+    data = protocol.tool_finished_event_data(call, execution, execution)
+
+    assert data["public_output"] == {
+        "captured_text": "credential accepted: [REDACTED]",
+        "captured_projection_truncated": False,
+        "observation_truncated": False,
+        "credentials_redacted": True,
+    }
+    assert secret not in json.dumps(data)
 
 
 def test_unsafe_host_verifier_label_is_omitted_as_a_pair() -> None:

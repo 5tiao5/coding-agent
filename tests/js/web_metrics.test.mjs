@@ -163,12 +163,12 @@ test("activity details are available only for bounded public facts and default f
   assert.equal(empty.isExpanded, false);
 });
 
-test("activity facts cap at eight and unknown formats degrade to text", async () => {
+test("activity facts cap at twelve, preserve preformatted output, and degrade unknown formats", async () => {
   const { MAX_ACTIVITY_FACTS, activityCardView } = await importBrowserModule(
     "src/coding_agent/web/static/_activity_view.js",
   );
   const facts = Array.from({ length: MAX_ACTIVITY_FACTS + 2 }, (_, index) => ({
-    format: index === 0 ? "private-html" : "text",
+    format: index === 0 ? "private-html" : index === 1 ? "pre" : "text",
     label: `字段 ${index}`,
     value: `值 ${index}`,
   }));
@@ -176,6 +176,7 @@ test("activity facts cap at eight and unknown formats degrade to text", async ()
 
   assert.equal(view.facts.length, MAX_ACTIVITY_FACTS);
   assert.equal(view.facts[0].format, "text");
+  assert.equal(view.facts[1].format, "pre");
   assert.equal(view.factsComplete, false);
   assert.equal(view.facts.some((fact) => fact.label === `字段 ${MAX_ACTIVITY_FACTS}`), false);
 });
@@ -226,33 +227,46 @@ test("activity expansion keys are stable, run-scoped, and prefer activity ids", 
   );
 });
 
-test("activity fact labels and safe values are localized without changing commands", async () => {
+test("activity fact labels and transparent values are localized without changing commands", async () => {
   const { translateActivityFactLabel, translateActivityFactValue } =
     await importBrowserModule("src/coding_agent/web/static/locale-zh.js");
 
   assert.equal(translateActivityFactLabel("Command"), "命令");
   assert.equal(translateActivityFactLabel("Verification"), "验证项");
   assert.equal(translateActivityFactLabel("Working directory"), "工作目录");
+  assert.equal(translateActivityFactLabel("Captured output"), "捕获输出");
+  assert.equal(translateActivityFactLabel("Agent observation"), "Agent 实际观察");
+  assert.equal(translateActivityFactLabel("Output status"), "输出状态");
+  assert.equal(translateActivityFactLabel("Redaction"), "脱敏说明");
+  assert.equal(translateActivityFactLabel("Timeout"), "超时上限");
   assert.equal(translateActivityFactLabel("Workspace revision"), "工作区修订");
   assert.equal(translateActivityFactLabel("Required scopes"), "必需范围");
-  assert.equal(translateActivityFactValue("python -m pytest", "code"), "python -m pytest");
   assert.equal(
-    translateActivityFactValue(
-      "python (4 argument(s) hidden by safety policy)",
-      "code",
-    ),
-    "python（4 个参数已按安全策略隐藏）",
+    translateActivityFactValue('python -I -B -m pytest "tests/a b.py"', "pre"),
+    'python -I -B -m pytest "tests/a b.py"',
   );
+  assert.equal(translateActivityFactValue("  line 1\nline 2\n", "pre"), "  line 1\nline 2\n");
   assert.equal(translateActivityFactValue("verifier"), "可信验证命令");
   assert.equal(translateActivityFactValue("test / pytest"), "测试 / pytest");
   assert.equal(translateActivityFactValue("Exited with code 0", "status"), "已退出，退出码 0");
+  assert.equal(translateActivityFactValue("30 second(s)"), "30 秒");
+  assert.equal(
+    translateActivityFactValue("Credential-like values redacted"),
+    "检测到凭据样式内容，相关值已脱敏",
+  );
+  assert.equal(
+    translateActivityFactValue("Agent observation compacted"),
+    "Agent 实际观察因上下文预算被压缩",
+  );
   assert.equal(
     translateActivityFactValue("tests, runtime:entrypoint"),
     "测试，运行时入口",
   );
   assert.equal(
-    translateActivityFactValue("Captured 12 of 20 byte(s); output truncated"),
-    "已捕获 12 / 20 字节；输出已截断",
+    translateActivityFactValue(
+      "Captured 12 of 20 byte(s); runtime capture truncated; Agent observation compacted",
+    ),
+    "已捕获 12 / 20 字节；运行时捕获已截断；Agent 实际观察因上下文预算被压缩",
   );
 });
 

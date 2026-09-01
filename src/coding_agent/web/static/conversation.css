@@ -726,6 +726,25 @@
   white-space: pre-wrap;
 }
 
+.activity-fact-pre {
+  max-height: 15rem;
+  margin: 0;
+  overflow: auto;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid rgba(116, 139, 163, 0.24);
+  border-radius: 0.65rem;
+  background: rgba(245, 249, 253, 0.86);
+  color: var(--text);
+  font: 9px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activity-fact-pre code {
+  font: inherit;
+  white-space: inherit;
+}
+
 .activity-fact-status {
   display: inline-flex;
   min-height: 20px;
@@ -813,10 +832,18 @@
 }
 
 .answer-paragraph + .answer-paragraph,
+.answer-paragraph + .answer-list,
 .answer-list + .answer-paragraph,
+.answer-list + .answer-list,
+.answer-list + .answer-heading,
 .answer-code + .answer-paragraph,
 .answer-heading + .answer-paragraph {
   margin-top: 9px;
+}
+
+.final-answer strong {
+  color: var(--text);
+  font-weight: 700;
 }
 
 .answer-heading {
@@ -840,6 +867,16 @@
 
 .answer-list li + li {
   margin-top: 3px;
+}
+
+.answer-list-ordered {
+  padding-left: 22px;
+}
+
+.answer-list-ordered li::marker {
+  color: var(--muted-dark);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
 }
 
 .inline-code,

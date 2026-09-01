@@ -58,8 +58,8 @@ jobs:
       - name: Type-check
         run: uv run mypy src tests
 
-      - name: Test Web projections
-        run: node --test tests/js/web_metrics.test.mjs
+      - name: Test Web presentation modules
+        run: node --test tests/js/*.test.mjs
 
       - name: Test
         env:

@@ -97,6 +97,10 @@ function renderActivityFact(fact) {
   const translatedValue = translateActivityFactValue(fact.value, fact.format);
   if (fact.format === "code") {
     value.append(createElement("code", "activity-fact-code", translatedValue));
+  } else if (fact.format === "pre") {
+    const pre = createElement("pre", "activity-fact-pre");
+    pre.append(createElement("code", "", translatedValue));
+    value.append(pre);
   } else if (fact.format === "status") {
     value.append(createElement("span", "activity-fact-status", translatedValue));
   } else {
@@ -208,7 +212,7 @@ export function createActivityCards() {
           createElement(
             "p",
             "activity-facts-note",
-            "操作详情经过安全裁剪，部分信息未展示。",
+            "部分详情来自旧版记录、发生了截断，或已按上方标注脱敏。",
           ),
         );
       }

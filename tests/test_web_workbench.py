@@ -725,7 +725,10 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         invocation = {
             "executable": "python",
             "argument_count": 3,
-            "display_command": "python -m pytest -q",
+            "argv": ["python", "-m", "pytest", "-q"],
+            "credentials_redacted": False,
+            "cwd": ".",
+            "timeout_seconds": 120.0,
             "verification_label": "pytest",
             "verification_kind": "test",
             "private": "PRIVATE INVOCATION",
@@ -764,6 +767,12 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
                         "captured_output_bytes": 10,
                         "total_output_bytes": 10,
                         "private": "PRIVATE COMMAND METADATA",
+                    },
+                    "public_output": {
+                        "captured_text": "1 passed",
+                        "captured_projection_truncated": False,
+                        "observation_truncated": False,
+                        "credentials_redacted": False,
                     },
                 },
             )
@@ -900,10 +909,10 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     assert history_command_entries[0]["activity_id"].startswith("act_")
     assert history_command_entries[1]["facts"][0] == {
         "label": "Command",
-        "value": "python (3 argument(s) hidden by safety policy)",
-        "format": "code",
+        "value": "python -m pytest -q",
+        "format": "pre",
     }
-    assert history_command_entries[1]["facts_complete"] is False
+    assert history_command_entries[1]["facts_complete"] is True
     latest_change = history.json()["snapshot"]["latest_change"]
     assert len(latest_change["preview"]) == 6
     assert len(latest_change["expanded_preview"]) == 33

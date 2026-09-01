@@ -80,8 +80,8 @@ class ActivityFactResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label: str = Field(min_length=1, max_length=32)
-    value: str = Field(min_length=1, max_length=240)
-    format: Literal["text", "code", "status"]
+    value: str = Field(min_length=1, max_length=16_000)
+    format: Literal["text", "code", "pre", "status"]
 
 
 class TimelineResponse(BaseModel):
@@ -97,7 +97,7 @@ class TimelineResponse(BaseModel):
     preview: list[str]
     activity_id: str | None = Field(pattern=r"^act_[0-9a-f]{16}$")
     activity_state: Literal["started", "finished"] | None
-    facts: list[ActivityFactResponse] = Field(max_length=8)
+    facts: list[ActivityFactResponse] = Field(max_length=12)
     facts_complete: bool
 
 

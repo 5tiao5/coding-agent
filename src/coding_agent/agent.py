@@ -717,7 +717,7 @@ class AgentRunner:
                         EventKind.TOOL_STARTED,
                         f"Running tool: {call.name}",
                         step,
-                        {"call_id": call.id, "tool_name": call.name},
+                        protocol.tool_started_event_data(call),
                     )
                     try:
                         raw_execution = self._tools.execute(call)

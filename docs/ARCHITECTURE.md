@@ -129,22 +129,32 @@ evidence and revision, outcome, plan lines, recent timeline, and latest Diff. Ti
 only a compact six-line mutation summary; the latest-change card may additionally carry an ordered,
 display-safe preview of at most 80 lines. Its completeness flag combines the mutation tool's own
 bounded-Diff result with the Web projection limit, so browser folding is never confused with source
-truncation. Completed command and verification entries may also carry at most eight typed
-`ActivityFact` values. The protocol boundary creates a safe `public_invocation`: ordinary commands
-retain only the executable basename and hidden argument count, while an exact host-registered
-verifier may add its sanitized host-owned identity but never reconstruct argv for display.
-`DashboardProjection`
-combines that with a strict command-metadata whitelist and typed verification scopes, hashes the
-provider call ID into a run-scoped activity ID, and marks incomplete disclosures honestly. The
-browser coalesces matching start/finish events and owns only fold state; live and trace replay pass
-through this same projection. The terminal response and public error are separate result fields. Raw
-`RunEvent` objects, event messages, canonical chat history, raw provider responses, read/search/command
-output, provider state, credentials, and server configuration never enter that projection. Only the
-explicitly allowlisted, already-bounded mutation Diff crosses as presentation data. Historical
+truncation. Completed command and verification entries may also carry bounded typed activity facts.
+The protocol boundary creates a versioned `public_invocation` containing the direct argv token
+vector, workspace-relative `cwd`, timeout, and verifier identity where applicable. It also projects
+the command runner's already-bounded combined stdout/stderr. Recognized credential values are
+replaced in place while benign tokens and output remain visible; this pattern-based filter is not a
+general secret detector.
+
+`DashboardProjection` applies a second schema and credential check, combines the invocation with a
+strict command-metadata whitelist and typed verification scopes, hashes the provider call ID into a
+run-scoped activity ID, and reports each loss boundary independently. Capture truncation describes
+what the process runner retained, projection truncation describes the audit payload, and observation
+compression describes any smaller result actually admitted to the model's aggregate context budget.
+The browser coalesces matching start/finish events and owns only fold state; live and trace replay
+pass through this same projection. Traces created before the transparent audit schema simply report
+that argv or output was not recorded and cannot be recovered; replay never reconstructs those fields
+from the private checkpoint.
+
+The terminal response and public error are separate result fields. Raw `RunEvent` objects, canonical
+chat history, backend environment values and API keys, raw provider responses and payloads, hidden
+reasoning, arbitrary adapter metadata, provider state, and server configuration never cross the Web
+API. Bounded credential-redacted command output and the explicitly bounded mutation Diff are the
+presentation exceptions. Historical
 views read a validated trace and rebuild the same whitelist from its latest run/resume segment. A
 single history detail may additionally read its workspace-bound terminal checkpoint through a narrow
 adapter that returns only a bounded, display-safe final assistant reply; project lists never load
-checkpoint bodies, and no other canonical message or tool output crosses the API. Missing, corrupt,
+checkpoint bodies, and no checkpoint tool output crosses the API. Missing, corrupt,
 legacy, nonterminal, or workspace-mismatched checkpoints simply omit that reply without invalidating
 the trace replay. In the live Windows host, a token-protected adapter may open the native folder
 chooser; cancellation has no side effect, and a returned path still enters the ordinary

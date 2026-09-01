@@ -66,23 +66,31 @@ const RETRY_REASON_LABELS = {
 };
 
 const ACTIVITY_FACT_LABELS = {
+  "Agent observation": "Agent 实际观察",
+  "Captured output": "捕获输出",
   Category: "类别",
   Command: "命令",
   Gate: "验证门禁",
   Kind: "证据类型",
   "Missing scopes": "缺失范围",
   Output: "输出",
+  "Output status": "输出状态",
   "Passed scopes": "已通过范围",
+  Redaction: "脱敏说明",
   "Required scopes": "必需范围",
   Result: "结果",
   Scopes: "范围",
   Step: "步骤",
+  Timeout: "超时上限",
   Verification: "验证项",
   "Working directory": "工作目录",
   "Workspace revision": "工作区修订",
 };
 
 const ACTIVITY_FACT_VALUES = {
+  "Agent observation compacted": "Agent 实际观察因上下文预算被压缩",
+  "audit projection truncated": "审计展示投影已截断",
+  "Credential-like values redacted": "检测到凭据样式内容，相关值已脱敏",
   Failed: "失败",
   Passed: "通过",
   build: "构建",
@@ -96,6 +104,7 @@ const ACTIVITY_FACT_VALUES = {
   passed: "通过",
   pending: "等待验证",
   read_only: "只读命令",
+  "runtime capture truncated": "运行时捕获已截断",
   "runtime:entrypoint": "运行时入口",
   stale: "已过期",
   test: "测试",
@@ -112,6 +121,17 @@ function asText(value, fallback = "") {
 
 function mappedText(mapping, value) {
   return Object.hasOwn(mapping, value) ? mapping[value] : value;
+}
+
+function translateOutputStatusSuffixes(value) {
+  if (!value) {
+    return "";
+  }
+  return value
+    .slice(2)
+    .split("; ")
+    .map((part) => mappedText(ACTIVITY_FACT_VALUES, part))
+    .join("；");
 }
 
 export function translateMetadataLabel(value, fallback) {
@@ -158,16 +178,11 @@ export function translateActivityFactLabel(value) {
 }
 
 export function translateActivityFactValue(value, format = "text") {
-  const text = asText(value).trim();
-  if (format === "code") {
-    const hiddenArguments = text.match(
-      /^([A-Za-z0-9][A-Za-z0-9._+-]{0,119}) \((\d+) argument\(s\) hidden by safety policy\)$/,
-    );
-    if (hiddenArguments) {
-      return `${hiddenArguments[1]}（${hiddenArguments[2]} 个参数已按安全策略隐藏）`;
-    }
-    return text;
+  const rawText = asText(value);
+  if (format === "code" || format === "pre") {
+    return rawText;
   }
+  const text = rawText.trim();
   const exact = mappedText(ACTIVITY_FACT_VALUES, text);
   if (exact !== text) {
     return exact;
@@ -194,18 +209,24 @@ export function translateActivityFactValue(value, format = "text") {
   if (text === "Trusted verification rejected") {
     return "可信验证被拒绝";
   }
+  match = text.match(/^(\d+(?:\.\d+)?) second\(s\)$/);
+  if (match) {
+    return `${match[1]} 秒`;
+  }
   match = text.match(/^Failed \((.+)\)$/);
   if (match) {
     return `失败（${match[1]}）`;
   }
-  match = text.match(/^Captured (\d+) of (\d+) byte\(s\)(; output truncated)?$/);
+  match = text.match(/^Captured (\d+) of (\d+) byte\(s\)((?:; .+)*)$/);
   if (match) {
-    const suffix = match[3] ? "；输出已截断" : "";
+    const translatedSuffix = translateOutputStatusSuffixes(match[3]);
+    const suffix = translatedSuffix ? `；${translatedSuffix}` : "";
     return `已捕获 ${match[1]} / ${match[2]} 字节${suffix}`;
   }
-  match = text.match(/^(\d+) output character\(s\)(; output truncated)?$/);
+  match = text.match(/^(\d+) output character\(s\)((?:; .+)*)$/);
   if (match) {
-    const suffix = match[2] ? "；输出已截断" : "";
+    const translatedSuffix = translateOutputStatusSuffixes(match[2]);
+    const suffix = translatedSuffix ? `；${translatedSuffix}` : "";
     return `${match[1]} 个输出字符${suffix}`;
   }
 

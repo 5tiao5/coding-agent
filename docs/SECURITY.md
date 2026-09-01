@@ -116,17 +116,26 @@ instead of misreporting an already-applied change as a normal failure.
   only the bounded final Assistant reply from a validated, workspace-bound terminal checkpoint; it
   never exposes the rest of the checkpoint conversation. Missing, corrupt, nonterminal, or
   workspace-mismatched checkpoints degrade to trace-only replay. Raw event messages, other canonical
-  messages, read/search/command output, and provider state remain omitted. The only tool-output
-  exception is the mutation tool's explicit presentation-safe Diff: timeline entries keep six lines,
-  while only `latest_change` may expose at most 80 ordered lines plus an honest completeness flag.
+  messages, read/search output, arbitrary tool objects, and provider state remain omitted. Explicit
+  audit exceptions are the credential-redacted bounded command output described below and the
+  mutation tool's presentation-safe Diff: timeline entries keep six lines, while only
+  `latest_change` may expose at most 80 ordered lines plus an honest completeness flag.
   Runs created before M5.5 metadata are not automatically listed.
-- Expandable activity details are not a terminal-log escape hatch. `run_command` event metadata is
-  rebuilt from an allowlist; ordinary argv, environment data, stdout/stderr, arbitrary adapter
-  metadata, prompts, and reasoning are omitted before tracing. Even exact registered verifiers never
-  reconstruct a display string from argv: the activity view receives only a sanitized executable
-  basename, a hidden argument count, and sanitized host-owned verification identity/scopes. The
-  Dashboard applies a second bounded whitelist for live events and legacy trace replay, reports
-  incomplete disclosures, and the browser renders facts with text nodes rather than HTML.
+- Expandable activity details are an audit surface for the local workspace owner, not an opaque
+  terminal summary. A `run_command` card shows the direct argv token vector, workspace-relative
+  `cwd`, timeout, status, exit code, duration, and already-bounded combined stdout/stderr. Recognized
+  credential values are replaced in place in argv and output; ordinary values remain visible. The
+  trace records only that credential-redacted audit representation, never the command environment.
+  Capture truncation, Web projection truncation, and any aggregate-budget compression of the model's
+  actual observation are different facts and must be labeled separately.
+- The Dashboard reapplies a bounded schema and credential filter for live events and untrusted trace
+  replay, and the browser renders values with text nodes rather than HTML. Traces created before the
+  transparent activity schema did not record argv or output; the history view states that those
+  fields are unavailable and never attempts to reconstruct them from the canonical checkpoint.
+- Credential recognition is deliberately limited to configured sensitive names and common token,
+  authorization, and URL-userinfo shapes. It is defense in depth for the required backend API-key
+  flow, not general data-loss prevention and not a guarantee that every arbitrary secret embedded in
+  a positional argument, source file, or program output can be identified.
 - API credentials remain in the backend environment. A process entry point may populate that
   environment from the exact launch-directory `.env.local`; it never searches parents, loads only
   the four allowlisted model settings, disables interpolation, and preserves existing environment
@@ -188,8 +197,9 @@ A workspace-relative `cwd` only selects the starting directory. It does not rest
 network, registry, device, or process access. Test commands execute repository code, and external
 programs may invoke their own helpers. Run untrusted repositories inside a container, VM, or
 low-privilege account with separate credentials; neither `safe` nor `auto` claims malicious-code
-isolation. Do not place secrets in argv: environment filtering cannot remove secrets already present
-in command arguments or program output.
+isolation. Do not place secrets in argv or program output: the activity view exposes ordinary values,
+and neither environment filtering nor pattern-based presentation redaction can recognize every
+arbitrary secret.
 
 Windows commands are attached while suspended to a kill-on-close Job Object. POSIX currently uses a
 fresh session/process group, which is a lifecycle boundary rather than a hostile-code sandbox: a
@@ -235,8 +245,11 @@ fresh observation reduce that risk but cannot erase it.
 ## Trace and presentation boundary
 
 JSONL traces contain only validated `RunEvent` records, not provider response objects, full prompts,
-hidden reasoning, raw read/search results, or raw command output. They can contain bounded plan and
-mutation-diff previews because those are explicit presentation artifacts. Trace files are size
+backend environment values, API keys, hidden reasoning, or arbitrary raw tool objects. They can
+contain bounded plans, mutation-Diff previews, credential-redacted argv, command metadata, and
+bounded captured command output because those are explicit audit artifacts. When the model-facing
+observation is smaller than the captured result, that additional compression is recorded separately.
+Trace files are size
 bounded and reject incomplete records, invalid UTF-8/JSON, symlinks, and multiply linked files. They
 live in the private per-user state directory by default and must not be committed.
 

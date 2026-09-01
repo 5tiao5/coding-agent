@@ -31,7 +31,7 @@ class ActivityFactPayload(TypedDict):
 
     label: str
     value: str
-    format: Literal["text", "code", "status"]
+    format: Literal["text", "code", "pre", "status"]
 
 
 class TimelinePayload(TypedDict):

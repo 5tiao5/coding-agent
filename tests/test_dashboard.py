@@ -180,7 +180,10 @@ def test_projection_correlates_tool_cards_and_discloses_only_bounded_activity_fa
     invocation = {
         "executable": "python",
         "argument_count": 3,
-        "display_command": "python -m pytest -q",
+        "argv": ["python", "-m", "pytest", "-q"],
+        "credentials_redacted": False,
+        "cwd": ".",
+        "timeout_seconds": 120.0,
         "verification_label": "pytest",
         "verification_kind": "test",
         "private": "PRIVATE INVOCATION",
@@ -218,6 +221,12 @@ def test_projection_correlates_tool_cards_and_discloses_only_bounded_activity_fa
                     "captured_output_bytes": 21,
                     "total_output_bytes": 21,
                     "private": "PRIVATE COMMAND METADATA",
+                },
+                "public_output": {
+                    "captured_text": "21 passed",
+                    "captured_projection_truncated": False,
+                    "observation_truncated": False,
+                    "credentials_redacted": False,
                 },
                 "raw_output": "PRIVATE COMMAND OUTPUT",
             },
@@ -263,15 +272,17 @@ def test_projection_correlates_tool_cards_and_discloses_only_bounded_activity_fa
     assert started.activity_id.startswith("act_")
     assert "provider-call-secret" not in str(projection.snapshot)
     assert [(fact.label, fact.value, fact.format) for fact in finished.facts] == [
-        ("Command", "python (3 argument(s) hidden by safety policy)", "code"),
+        ("Command", "python -m pytest -q", "pre"),
+        ("Working directory", ".", "code"),
+        ("Timeout", "120 second(s)", "text"),
         ("Verification", "test / pytest", "text"),
         ("Category", "verifier", "text"),
-        ("Working directory", ".", "code"),
         ("Result", "Exited with code 0", "status"),
-        ("Output", "Captured 21 of 21 byte(s)", "text"),
+        ("Output status", "Captured 21 of 21 byte(s)", "text"),
+        ("Captured output", "21 passed", "pre"),
     ]
-    assert started.facts_complete is False
-    assert finished.facts_complete is False
+    assert started.facts_complete is True
+    assert finished.facts_complete is True
     assert [(fact.label, fact.value) for fact in recorded.facts] == [
         ("Verification", "pytest"),
         ("Kind", "test"),
@@ -334,10 +345,11 @@ def test_activity_projection_fails_closed_and_enforces_fact_bounds() -> None:
     command, gate = projection.snapshot.timeline
     assert command.facts_complete is False
     assert gate.facts_complete is False
-    assert len(command.facts) <= 8
-    assert len(gate.facts) <= 8
-    assert all(len(fact.label) <= 32 and len(fact.value) <= 240 for fact in command.facts)
-    assert command.facts[0].value == "python (3 argument(s) hidden by safety policy)"
+    assert len(command.facts) <= 12
+    assert len(gate.facts) <= 12
+    assert all(len(fact.label) <= 32 and len(fact.value) <= 16_000 for fact in command.facts)
+    assert command.facts[0].value == "python (3 argument(s) unavailable in old trace)"
+    assert command.facts[0].format == "pre"
     assert all(fact.label != "Working directory" for fact in command.facts)
     serialized = str(projection.snapshot)
     assert "C:/Users/private" not in serialized
@@ -345,9 +357,83 @@ def test_activity_projection_fails_closed_and_enforces_fact_bounds() -> None:
     assert "SECRET" not in serialized
 
 
+def test_command_activity_handles_missing_invocation_and_empty_output_honestly() -> None:
+    projection = DashboardProjection(max_timeline=2)
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "missing-invocation",
+                "tool_name": "run_command",
+                "ok": True,
+                "metadata": {"cwd": ".", "status": "exited", "exit_code": 0},
+                "public_output": {
+                    "captured_text": "",
+                    "captured_projection_truncated": False,
+                    "observation_truncated": False,
+                    "credentials_redacted": False,
+                },
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            data={
+                "call_id": "empty-output",
+                "tool_name": "run_command",
+                "ok": True,
+                "public_invocation": {
+                    "executable": "python",
+                    "argument_count": 3,
+                    "argv": ["python", "tests/unit case.py", "--name", "测试"],
+                    "credentials_redacted": False,
+                    "cwd": ".",
+                    "timeout_seconds": 120.0,
+                },
+                "metadata": {
+                    "cwd": ".",
+                    "status": "exited",
+                    "exit_code": 0,
+                    "captured_output_bytes": 0,
+                    "total_output_bytes": 0,
+                },
+                "public_output": {
+                    "captured_text": "",
+                    "captured_projection_truncated": False,
+                    "observation_truncated": False,
+                    "credentials_redacted": False,
+                },
+            },
+        )
+    )
+
+    missing, empty = projection.snapshot.timeline
+    assert missing.facts_complete is False
+    assert all(fact.label != "Command" for fact in missing.facts)
+    assert empty.facts_complete is True
+    empty_facts = {fact.label: fact.value for fact in empty.facts}
+    assert empty_facts["Command"] == 'python "tests/unit case.py" --name 测试'
+    assert all(fact.label != "Captured output" for fact in empty.facts)
+
+
 def test_activity_projection_never_hides_source_truncation_as_complete() -> None:
     projection = DashboardProjection(max_timeline=4)
     visible_cwd = "nested/" + ("a" * 193)
+    invocation = {
+        "executable": "python",
+        "argument_count": 0,
+        "argv": ["python"],
+        "credentials_redacted": False,
+        "cwd": ".",
+        "timeout_seconds": 120.0,
+    }
+    public_output = {
+        "captured_text": "ok",
+        "captured_projection_truncated": False,
+        "observation_truncated": False,
+        "credentials_redacted": False,
+    }
     projection.apply(
         _event(
             EventKind.TOOL_FINISHED,
@@ -355,7 +441,8 @@ def test_activity_projection_never_hides_source_truncation_as_complete() -> None
                 "call_id": "long-cwd",
                 "tool_name": "run_command",
                 "ok": True,
-                "public_invocation": {"executable": "python", "argument_count": 0},
+                "public_invocation": {**invocation, "cwd": visible_cwd},
+                "public_output": public_output,
                 "metadata": {"cwd": visible_cwd, "status": "exited", "exit_code": 0},
             },
         )
@@ -367,7 +454,8 @@ def test_activity_projection_never_hides_source_truncation_as_complete() -> None
                 "call_id": "oversized-cwd",
                 "tool_name": "run_command",
                 "ok": True,
-                "public_invocation": {"executable": "python", "argument_count": 0},
+                "public_invocation": {**invocation, "cwd": "nested/" + ("b" * 250)},
+                "public_output": public_output,
                 "metadata": {"cwd": "nested/" + ("b" * 250)},
             },
         )
@@ -380,7 +468,7 @@ def test_activity_projection_never_hides_source_truncation_as_complete() -> None
                 "tool_name": "run_command",
                 "ok": False,
                 "error_code": "failure_" + ("c" * 90),
-                "public_invocation": {"executable": "python", "argument_count": 0},
+                "public_invocation": invocation,
                 "metadata": {"cwd": "."},
             },
         )
@@ -392,7 +480,8 @@ def test_activity_projection_never_hides_source_truncation_as_complete() -> None
     assert "..." not in visible_facts["Working directory"]
     assert visible.facts_complete is True
 
-    assert all(fact.label != "Working directory" for fact in oversized_cwd.facts)
+    oversized_cwd_facts = {fact.label: fact.value for fact in oversized_cwd.facts}
+    assert len(oversized_cwd_facts["Working directory"]) == 240
     assert oversized_cwd.facts_complete is False
     assert all("c" * 40 not in fact.value for fact in oversized_error.facts)
     assert {fact.label: fact.value for fact in oversized_error.facts}["Result"] == "Failed"

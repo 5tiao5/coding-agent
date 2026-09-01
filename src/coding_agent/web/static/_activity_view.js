@@ -1,9 +1,9 @@
 "use strict";
 
-export const MAX_ACTIVITY_FACTS = 8;
+export const MAX_ACTIVITY_FACTS = 12;
 
 const ACTIVITY_STATES = new Set(["started", "finished"]);
-const FACT_FORMATS = new Set(["text", "code", "status"]);
+const FACT_FORMATS = new Set(["text", "code", "pre", "status"]);
 
 function asObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -29,13 +29,15 @@ function activityState(rawEntry) {
 function normalizedFact(rawFact) {
   const fact = asObject(rawFact);
   const label = asText(fact.label).trim();
-  const value = asText(fact.value).trim();
-  if (!label || !value) {
+  const rawFormat = asText(fact.format).trim().toLowerCase();
+  const format = FACT_FORMATS.has(rawFormat) ? rawFormat : "text";
+  const rawValue = asText(fact.value);
+  const value = format === "pre" ? rawValue : rawValue.trim();
+  if (!label || !value.trim()) {
     return null;
   }
-  const rawFormat = asText(fact.format).trim().toLowerCase();
   return {
-    format: FACT_FORMATS.has(rawFormat) ? rawFormat : "text",
+    format,
     label,
     value,
   };

@@ -9,6 +9,7 @@ import {
 import { createActivityCards } from "./_activity_cards.js";
 import { createWorkbench } from "./_workbench.js";
 import { diffPreviewView } from "./_diff_view.js";
+import { appendFinalMarkdown } from "./_final_markdown.js";
 import { runtimeMetricView } from "./_metrics.js";
 
 "use strict";
@@ -261,89 +262,6 @@ function makeMessageShell(kind, author) {
   return { body, heading, row };
 }
 
-function appendInlineText(container, text) {
-  const source = asText(text);
-  const fragments = source.split(/(`[^`\n]+`)/g);
-  for (const fragment of fragments) {
-    if (fragment.startsWith("`") && fragment.endsWith("`") && fragment.length > 2) {
-      container.append(createElement("code", "inline-code", fragment.slice(1, -1)));
-    } else if (fragment) {
-      container.append(document.createTextNode(fragment));
-    }
-  }
-}
-
-function appendRichText(container, text) {
-  const lines = asText(text).replaceAll("\r\n", "\n").split("\n");
-  let codeLines = null;
-  let list = null;
-
-  function closeList() {
-    if (list) {
-      container.append(list);
-      list = null;
-    }
-  }
-
-  function closeCode() {
-    if (codeLines) {
-      const pre = createElement("pre", "answer-code");
-      const code = createElement("code");
-      code.textContent = codeLines.join("\n");
-      pre.append(code);
-      container.append(pre);
-      codeLines = null;
-    }
-  }
-
-  for (const line of lines) {
-    if (line.trimStart().startsWith("```")) {
-      closeList();
-      if (codeLines) {
-        closeCode();
-      } else {
-        codeLines = [];
-      }
-      continue;
-    }
-    if (codeLines) {
-      codeLines.push(line);
-      continue;
-    }
-
-    const headingMatch = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
-    if (headingMatch) {
-      closeList();
-      const heading = createElement("h3", `answer-heading answer-heading-${headingMatch[1].length}`);
-      appendInlineText(heading, headingMatch[2]);
-      container.append(heading);
-      continue;
-    }
-
-    const bulletMatch = line.match(/^\s*[-*]\s+(.+)$/);
-    if (bulletMatch) {
-      if (!list) {
-        list = createElement("ul", "answer-list");
-      }
-      const item = createElement("li");
-      appendInlineText(item, bulletMatch[1]);
-      list.append(item);
-      continue;
-    }
-
-    closeList();
-    if (!line.trim()) {
-      continue;
-    }
-    const paragraph = createElement("p", "answer-paragraph");
-    appendInlineText(paragraph, line);
-    container.append(paragraph);
-  }
-
-  closeList();
-  closeCode();
-}
-
 function renderUserMessage(task) {
   const message = makeMessageShell("user", "你");
   message.heading.append(createElement("span", "message-role", "任务"));
@@ -481,10 +399,10 @@ function renderFinalMessage(finalText, status, error) {
   const answer = createElement("div", `final-answer ${failed ? "final-error" : ""}`);
   const content = asText(finalText).trim() || asText(error).trim();
   const historyFallback = workbench?.isReplaying() ? historyFinalFallback(status) : "";
-  appendRichText(answer, content || (failed ? "运行失败，但没有错误信息。" : "运行已完成。"));
+  appendFinalMarkdown(answer, content || (failed ? "运行失败，但没有错误信息。" : "运行已完成。"));
   if (!content && historyFallback) {
     answer.replaceChildren();
-    appendRichText(answer, historyFallback);
+    appendFinalMarkdown(answer, historyFallback);
   }
   message.body.append(answer);
   return message.row;

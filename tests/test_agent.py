@@ -842,15 +842,15 @@ class LargeOutputTool(BaseTool[ControlArgs]):
 
 
 @pytest.mark.parametrize(
-    ("verification_label", "secret"),
+    ("verification_label", "positional_argument"),
     [
-        (None, "UNMARKED_ORDINARY_POSITIONAL_SECRET_7f3b2a1c"),
-        ("pytest", "UNMARKED_VERIFIER_POSITIONAL_SECRET_9d4e6c8a"),
+        (None, "ordinary-case"),
+        ("pytest", "verifier-case"),
     ],
 )
-def test_agent_events_never_serialize_raw_command_argv(
+def test_agent_events_disclose_non_sensitive_command_argv(
     verification_label: str | None,
-    secret: str,
+    positional_argument: str,
 ) -> None:
     model = ScriptedModel(
         [
@@ -859,7 +859,7 @@ def test_agent_events_never_serialize_raw_command_argv(
                     ToolCall(
                         id="command-private-argv",
                         name="run_command",
-                        arguments={"argv": ["python", "-m", "pytest", secret]},
+                        arguments={"argv": ["python", "-m", "pytest", positional_argument]},
                     ),
                 )
             ),
@@ -872,17 +872,21 @@ def test_agent_events_never_serialize_raw_command_argv(
         model,
         ToolRegistry([CommandProbeTool(verification_label=verification_label)]),
         event_sink=events,
-    ).run("Run one command without publishing its argument vector")
+    ).run("Run one command and publish its auditable argument vector")
 
     serialized = json.dumps(
         [event.model_dump(mode="json") for event in events.events],
         ensure_ascii=False,
     )
-    assert secret not in serialized
+    assert positional_argument in serialized
     finished = next(event for event in events.events if event.kind is EventKind.TOOL_FINISHED)
     assert finished.data["public_invocation"] == {
         "executable": "python",
         "argument_count": 3,
+        "argv": ["python", "-m", "pytest", positional_argument],
+        "credentials_redacted": False,
+        "cwd": ".",
+        "timeout_seconds": 120.0,
         **(
             {
                 "verification_label": verification_label,
