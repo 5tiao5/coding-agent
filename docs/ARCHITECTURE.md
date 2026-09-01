@@ -129,14 +129,17 @@ evidence and revision, outcome, plan lines, recent timeline, and latest Diff. Th
 and public error are separate result fields. Raw
 `RunEvent` objects, event messages, canonical chat history, raw provider responses, read/search/command
 output, provider state, credentials, and server configuration never enter that projection. Historical
-views read a validated trace and rebuild the same whitelist from its latest run/resume segment; they
-do not read the canonical checkpoint or claim to preserve final assistant text. In the live Windows
-host, a token-protected adapter may open the native folder chooser; cancellation has no side effect,
-and a returned path still enters the ordinary project-registration boundary. A short navigation
-reservation prevents runs and project mutations from racing the open dialog. Manual absolute-path
-input is the fallback. Normal run requests contain only a bounded task and use the server-held active
-project; the browser cannot set a run root, model, base URL, state root, permission mode, verifier, or
-limits.
+views read a validated trace and rebuild the same whitelist from its latest run/resume segment. A
+single history detail may additionally read its workspace-bound terminal checkpoint through a narrow
+adapter that returns only a bounded, display-safe final assistant reply; project lists never load
+checkpoint bodies, and no other canonical message or tool output crosses the API. Missing, corrupt,
+legacy, nonterminal, or workspace-mismatched checkpoints simply omit that reply without invalidating
+the trace replay. In the live Windows host, a token-protected adapter may open the native folder
+chooser; cancellation has no side effect, and a returned path still enters the ordinary
+project-registration boundary. A short navigation reservation prevents runs and project mutations
+from racing the open dialog. Manual absolute-path input is the fallback. Normal run requests contain
+only a bounded task and use the server-held active project; the browser cannot set a run root, model,
+base URL, state root, permission mode, verifier, or limits.
 
 ## Runtime sequence
 

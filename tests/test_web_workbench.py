@@ -22,7 +22,12 @@ from coding_agent.models import (
     StopReason,
 )
 from coding_agent.run_catalog import MAX_TASK_TITLE_LENGTH, RunCatalog
-from coding_agent.session import workspace_fingerprint
+from coding_agent.session import (
+    SessionBoundary,
+    SessionCheckpoint,
+    SessionStore,
+    workspace_fingerprint,
+)
 from coding_agent.state import StatePaths
 from coding_agent.trace import TraceStore
 from coding_agent.web.app import create_app
@@ -105,6 +110,27 @@ def _completed_result(run_id: str, task: str) -> AgentResult:
             ChatMessage(role=MessageRole.USER, content=task),
             ChatMessage(role=MessageRole.ASSISTANT, content=final_text),
         ),
+    )
+
+
+def _save_terminal_checkpoint(spec: RepositoryRunSpec, result: AgentResult) -> None:
+    store = SessionStore(spec.paths.sessions, workspace_root=spec.root)
+    system_prompt = result.messages[0].content
+    assert system_prompt is not None
+    store.save(
+        SessionCheckpoint(
+            run_id=result.run_id,
+            workspace_fingerprint=store.workspace_fingerprint,
+            task=spec.task,
+            system_prompt=system_prompt,
+            messages=result.messages,
+            completed_steps=result.steps,
+            completed_tool_calls=0,
+            completed_work_tool_calls=0,
+            completed_verification_tool_calls=0,
+            stop_boundary=SessionBoundary.TERMINAL,
+            stop_reason=StopReason.FINAL_RESPONSE,
+        )
     )
 
 
@@ -713,6 +739,8 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
                 data=terminal,
             )
         )
+        result = _completed_result(spec.run_id, spec.task)
+        _save_terminal_checkpoint(spec, result)
         emit(
             RunEvent(
                 run_id=spec.run_id,
@@ -722,7 +750,7 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
                 data=terminal,
             )
         )
-        return _completed_result(spec.run_id, spec.task)
+        return result
 
     monkeypatch.setattr("coding_agent.web.workbench.execute_repository_run", fake_execute)
     workbench = _workbench(tmp_path)
@@ -780,7 +808,12 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         "max_total_tool_calls": 40,
     }
     assert "PRIVATE_RAW_TRACE" not in history.text
-    assert history.json()["run"]["final_text"] is None
+    assert history.json()["run"]["final_text"] == "Repository task complete"
+
+    restarted_history = _client(_workbench(tmp_path)).get(f"/api/history/{run_id}")
+    assert restarted_history.status_code == 200, restarted_history.text
+    assert restarted_history.json()["run"]["final_text"] == "Repository task complete"
+    assert "PRIVATE_RAW_TRACE" not in restarted_history.text
 
     selected_second = client.post(
         "/api/projects",
@@ -789,6 +822,126 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     )
     assert selected_second.status_code == 201
     assert client.get("/api/state").json()["status"] == "idle"
+
+
+def test_history_final_reply_is_bounded_and_workspace_bound(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    foreign_workspace = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign_workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    client = _client(_workbench(tmp_path))
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "bounded-final-run"
+    RunCatalog(paths.runs).create(
+        run_id=run_id,
+        project_id=project["project_id"],
+        workspace_fingerprint=workspace_fingerprint(workspace),
+        task_title="Bound final history",
+    )
+    terminal = {
+        "verified": True,
+        "status": "verified",
+        "epoch": 0,
+        "invalidation_count": 0,
+        "evidence_labels": [],
+        "evidence": [],
+    }
+    trace = TraceStore(paths.traces)
+    trace.append(RunEvent(run_id=run_id, kind=EventKind.RUN_STARTED, message="started"))
+    trace.append(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.VERIFICATION_EVALUATED,
+            message="verified",
+            step=1,
+            data=terminal,
+        )
+    )
+    trace.append(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FINISHED,
+            message="finished",
+            step=1,
+            data=terminal,
+        )
+    )
+
+    final_text = "前言\r\n\u202e" + ("中" * 20_000)
+    messages = (
+        ChatMessage(role=MessageRole.SYSTEM, content="system"),
+        ChatMessage(role=MessageRole.USER, content="Bound final history"),
+        ChatMessage(role=MessageRole.ASSISTANT, content=final_text),
+    )
+    bound_store = SessionStore(paths.sessions, workspace_root=workspace)
+    bound_store.save(
+        SessionCheckpoint(
+            run_id=run_id,
+            workspace_fingerprint=bound_store.workspace_fingerprint,
+            task="Bound final history",
+            system_prompt="system",
+            messages=messages,
+            completed_steps=1,
+            completed_tool_calls=0,
+            stop_boundary=SessionBoundary.TERMINAL,
+            stop_reason=StopReason.FINAL_RESPONSE,
+        )
+    )
+
+    history = client.get(f"/api/history/{run_id}")
+    exposed = history.json()["run"]["final_text"]
+    assert history.status_code == 200
+    assert isinstance(exposed, str)
+    assert len(exposed) <= 16_000
+    assert exposed.startswith("前言\n\N{REPLACEMENT CHARACTER}")
+    assert exposed.endswith("[最终回复过长，历史回放已截断]")
+    assert "\u202e" not in exposed
+    assert (
+        client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]["final_text"]
+        is None
+    )
+
+    bound_store.save(
+        SessionCheckpoint(
+            run_id=run_id,
+            workspace_fingerprint=bound_store.workspace_fingerprint,
+            task="Bound final history",
+            system_prompt="system",
+            messages=messages[:2],
+            completed_steps=0,
+            completed_tool_calls=0,
+            stop_boundary=SessionBoundary.READY_FOR_MODEL,
+        )
+    )
+    assert client.get(f"/api/history/{run_id}").json()["run"]["final_text"] is None
+
+    foreign_final = "FOREIGN_PRIVATE_FINAL"
+    SessionStore(paths.sessions).save(
+        SessionCheckpoint(
+            run_id=run_id,
+            workspace_fingerprint=workspace_fingerprint(foreign_workspace),
+            task="Bound final history",
+            system_prompt="system",
+            messages=(
+                *messages[:2],
+                ChatMessage(role=MessageRole.ASSISTANT, content=foreign_final),
+            ),
+            completed_steps=1,
+            completed_tool_calls=0,
+            stop_boundary=SessionBoundary.TERMINAL,
+            stop_reason=StopReason.FINAL_RESPONSE,
+        )
+    )
+    mismatched = client.get(f"/api/history/{run_id}")
+    assert mismatched.status_code == 200
+    assert mismatched.json()["run"]["final_text"] is None
+    assert foreign_final not in mismatched.text
 
 
 def test_noncurrent_nonterminal_trace_is_reported_as_interrupted(tmp_path: Path) -> None:
@@ -1016,8 +1169,23 @@ def test_project_history_distinguishes_completed_without_verification(tmp_path: 
     )
 
     runs = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"]
+    history_without_checkpoint = client.get(f"/api/history/{run_id}")
 
     assert runs[0]["status"] == "completed_unverified"
+    assert history_without_checkpoint.status_code == 200
+    assert history_without_checkpoint.json()["run"]["status"] == "completed_unverified"
+    assert history_without_checkpoint.json()["run"]["final_text"] is None
+    assert history_without_checkpoint.json()["snapshot"]["phase"] == "COMPLETED"
+
+    paths.sessions.mkdir(parents=True)
+    (paths.sessions / f"{run_id}.json").write_text(
+        '{"private":"CORRUPT_PRIVATE_CHECKPOINT"}',
+        encoding="utf-8",
+    )
+    history_with_corrupt_checkpoint = client.get(f"/api/history/{run_id}")
+    assert history_with_corrupt_checkpoint.status_code == 200
+    assert history_with_corrupt_checkpoint.json()["run"]["final_text"] is None
+    assert "CORRUPT_PRIVATE_CHECKPOINT" not in history_with_corrupt_checkpoint.text
 
 
 def test_cli_catalog_failure_warns_without_revoking_explicit_root_authority(

@@ -1,4 +1,5 @@
 import {
+  historyFinalFallback,
   translateMetadataLabel,
   translatePhase,
   translateServerDetail,
@@ -510,11 +511,7 @@ function renderFinalMessage(finalText, status, error) {
   );
   const answer = createElement("div", `final-answer ${failed ? "final-error" : ""}`);
   const content = asText(finalText).trim() || asText(error).trim();
-  const historyFallback = workbench?.isReplaying()
-    ? status === "interrupted"
-      ? "此次运行的轨迹未正常终止；这里只回放中断前经过白名单过滤的事件。"
-      : "此历史仅回放经过白名单过滤的可验证事件；最终回复未持久化。"
-    : "";
+  const historyFallback = workbench?.isReplaying() ? historyFinalFallback(status) : "";
   appendRichText(answer, content || (failed ? "运行失败，但没有错误信息。" : "运行已完成。"));
   if (!content && historyFallback) {
     answer.replaceChildren();

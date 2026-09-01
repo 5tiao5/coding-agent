@@ -29,7 +29,7 @@ from coding_agent.run_catalog import (
     RunRecord,
     normalize_task_title,
 )
-from coding_agent.session import workspace_fingerprint
+from coding_agent.session import SessionError, SessionStore, workspace_fingerprint
 from coding_agent.state import StatePaths
 from coding_agent.trace import TraceError, TraceNotFoundError, TraceRunStatus, TraceStore
 from coding_agent.web.service import (
@@ -40,6 +40,8 @@ from coding_agent.web.service import (
 )
 
 _HISTORY_TIMELINE_LIMIT = 100
+_HISTORY_FINAL_TEXT_LIMIT = 16_000
+_HISTORY_FINAL_TEXT_TRUNCATION_MARKER = "\n\n[最终回复过长，历史回放已截断]"
 
 
 class ProjectPayload(TypedDict):
@@ -62,7 +64,7 @@ class RunCatalogPayload(TypedDict):
     status: str
     created_at: str
     completed_at: str | None
-    final_text: None
+    final_text: str | None
     error: None
 
 
@@ -251,8 +253,14 @@ class WebWorkbench:
         )
         for event in segment:
             projection.apply(event)
+        run = self._run_payload(record)
+        if run["status"] in {"completed", "completed_unverified"}:
+            run["final_text"] = self._history_final_text(
+                run_id=record.run_id,
+                workspace_root=project.resolved_root,
+            )
         return {
-            "run": self._run_payload(record),
+            "run": run,
             "snapshot": _snapshot_payload(projection.snapshot),
         }
 
@@ -429,11 +437,23 @@ class WebWorkbench:
             "status": status,
             "created_at": record.created_at.isoformat(),
             "completed_at": completed_at,
-            # Canonical messages are deliberately absent from JSONL traces.  History
-            # exposes only projected audit facts, never checkpoint conversation data.
+            # Lists stay metadata-only. A single history detail may replace this with
+            # the bounded final reply from its workspace-bound terminal checkpoint.
             "final_text": None,
             "error": None,
         }
+
+    def _history_final_text(self, *, run_id: str, workspace_root: Path) -> str | None:
+        """Project one terminal reply without exposing the canonical transcript."""
+
+        try:
+            value = SessionStore(
+                self._config.paths.sessions,
+                workspace_root=workspace_root,
+            ).load_terminal_final_text(run_id)
+        except (OSError, SessionError, ValueError):
+            return None
+        return _bounded_history_final_text(value)
 
 
 def _project_context(record: ProjectRecord) -> ProjectContext:
@@ -453,6 +473,26 @@ def _project_payload(record: ProjectRecord) -> ProjectPayload:
         "created_at": record.created_at.isoformat(),
         "last_opened_at": record.last_opened_at.isoformat(),
     }
+
+
+def _bounded_history_final_text(value: str | None) -> str | None:
+    """Keep Markdown layout while removing invisible controls and bounding the response."""
+
+    if value is None:
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    display_safe = "".join(
+        character
+        if character in {"\n", "\t"} or character.isprintable()
+        else "\N{REPLACEMENT CHARACTER}"
+        for character in normalized
+    ).strip()
+    if not display_safe:
+        return None
+    if len(display_safe) <= _HISTORY_FINAL_TEXT_LIMIT:
+        return display_safe
+    retained = _HISTORY_FINAL_TEXT_LIMIT - len(_HISTORY_FINAL_TEXT_TRUNCATION_MARKER)
+    return display_safe[:retained].rstrip() + _HISTORY_FINAL_TEXT_TRUNCATION_MARKER
 
 
 def _require_context_identity(context: ProjectContext) -> None:

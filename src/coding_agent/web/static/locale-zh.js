@@ -100,6 +100,17 @@ export function translatePhase(value, activeTools) {
   return Object.hasOwn(PHASE_LABELS, normalized) ? PHASE_LABELS[normalized] : phase;
 }
 
+export function historyFinalFallback(status) {
+  const normalized = asText(status).trim();
+  if (normalized === "interrupted") {
+    return "此次运行的轨迹未正常终止；这里只回放中断前经过白名单过滤的事件。";
+  }
+  if (normalized === "failed") {
+    return "此次运行以失败结束；这里只回放经过白名单过滤的事件，错误详情未纳入历史回放。";
+  }
+  return "未能从终态检查点恢复最终回复；代码修改与验证记录仍已保留。";
+}
+
 export function translateTimelineHeadline(value) {
   const text = asText(value).trim();
   const exact = mappedText(TIMELINE_HEADLINES, text);

@@ -120,8 +120,9 @@ On Windows, “打开项目” first opens the native folder chooser; manual abs
 a fallback. “新建项目” can browse for its parent and then creates exactly one previously absent empty
 leaf directory; it does not initialize Git, add a template, or overwrite a directory. Project and
 new-run history metadata live in the private state directory, not inside the repository. The sidebar
-replays only bounded trace projections; older runs that predate M5.5 metadata are not retroactively
-catalogued.
+lists bounded metadata; opening a completed run replays its trace projection and, when a matching
+terminal checkpoint exists, its bounded final reply. Older runs that predate M5.5 metadata are not
+retroactively catalogued, and old or invalid checkpoints fall back to trace-only replay.
 
 ### Run budgets
 
@@ -240,10 +241,11 @@ verification evidence.
   validation. After selection, the server resolves and fingerprints that project; a run captures an
   immutable project context and never accepts a root from the task request.
 - A private project registry and immutable per-run catalog power the left sidebar. History is rebuilt
-  from the latest validated trace segment through the same dashboard whitelist; it is read-only and
-  does not expose canonical messages or pretend to persist the final answer. Each run is bound to the
-  directory fingerprint captured at start, so replacing a directory cannot inherit its old history;
-  an unterminated trace from an earlier process is labeled `interrupted`.
+  from the latest validated trace segment through the same dashboard whitelist and remains read-only.
+  A completed-run detail may additionally show only the bounded final Assistant reply from its
+  validated terminal checkpoint; project lists and all other canonical messages stay private. Each
+  run is bound to the directory fingerprint captured at start, so replacing a directory cannot
+  inherit its old history; an unterminated trace from an earlier process is labeled `interrupted`.
 - At most one background run is active across all projects, and project changes are locked while it
   runs. Graceful server shutdown stops accepting tasks and attempts
   a bounded drain before process exit. Browser state is a whitelist projection, not raw events,

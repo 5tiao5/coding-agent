@@ -311,6 +311,17 @@ class SessionStore:
             schema_migrated=source_version != SESSION_SCHEMA_VERSION,
         )
 
+    def load_terminal_final_text(self, run_id: str) -> str | None:
+        """Return only a validated terminal reply for passive presentation."""
+
+        checkpoint = self.load(run_id).checkpoint
+        if (
+            checkpoint.stop_boundary is not SessionBoundary.TERMINAL
+            or checkpoint.stop_reason is not StopReason.FINAL_RESPONSE
+        ):
+            return None
+        return checkpoint.messages[-1].content
+
     def _require_matching_workspace(self, checkpoint: SessionCheckpoint) -> None:
         expected = self._workspace_fingerprint
         if expected is not None and checkpoint.workspace_fingerprint != expected:

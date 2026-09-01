@@ -112,9 +112,12 @@ instead of misreporting an already-applied change as a normal failure.
   record freezes the selected directory fingerprint; a replaced directory cannot inherit or replay
   runs from the old physical identity.
 - Project history is an untrusted navigation aid, not execution authority. The API rebuilds a
-  bounded `DashboardProjection` from validated trace events and omits raw event messages, checkpoint
-  conversations, provider state, and canonical final replies. Runs created before M5.5 metadata are
-  not automatically listed.
+  bounded `DashboardProjection` from validated trace events. A single completed-run detail may add
+  only the bounded final Assistant reply from a validated, workspace-bound terminal checkpoint; it
+  never exposes the rest of the checkpoint conversation. Missing, corrupt, nonterminal, or
+  workspace-mismatched checkpoints degrade to trace-only replay. Raw event messages, other canonical
+  messages, tool output, and provider state remain omitted. Runs created before M5.5 metadata are not
+  automatically listed.
 - API credentials remain in the backend environment. A process entry point may populate that
   environment from the exact launch-directory `.env.local`; it never searches parents, loads only
   the four allowlisted model settings, disables interpolation, and preserves existing environment

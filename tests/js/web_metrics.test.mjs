@@ -101,3 +101,21 @@ test("verification closeout copy does not imply a model request failure", async 
   );
   assert.equal(translateTimelineDetail("Fresh verification is required"), "需要重新验证");
 });
+
+test("history final fallback distinguishes missing, failed, and interrupted results", async () => {
+  const { historyFinalFallback } = await importBrowserModule(
+    "src/coding_agent/web/static/locale-zh.js",
+  );
+
+  const missing = historyFinalFallback("completed");
+  assert.equal(missing, "未能从终态检查点恢复最终回复；代码修改与验证记录仍已保留。");
+  assert.doesNotMatch(missing, /未持久化/);
+  assert.equal(
+    historyFinalFallback("failed"),
+    "此次运行以失败结束；这里只回放经过白名单过滤的事件，错误详情未纳入历史回放。",
+  );
+  assert.equal(
+    historyFinalFallback("interrupted"),
+    "此次运行的轨迹未正常终止；这里只回放中断前经过白名单过滤的事件。",
+  );
+});
