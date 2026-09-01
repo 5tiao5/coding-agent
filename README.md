@@ -246,6 +246,9 @@ verification evidence.
   validated terminal checkpoint; project lists and all other canonical messages stay private. Each
   run is bound to the directory fingerprint captured at start, so replacing a directory cannot
   inherit its old history; an unterminated trace from an earlier process is labeled `interrupted`.
+  The latest mutation card shows eight Diff lines by default and can expand to an 80-line safe
+  preview in both live and historical views. A separate badge identifies previews that hit a tool or
+  projection limit; the underlying file mutation is still applied atomically and completely.
 - At most one background run is active across all projects, and project changes are locked while it
   runs. Graceful server shutdown stops accepting tasks and attempts
   a bounded drain before process exit. Browser state is a whitelist projection, not raw events,

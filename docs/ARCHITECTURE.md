@@ -125,10 +125,14 @@ model/tool boundaries and saves a resumable checkpoint. A blocking external call
 and the daemon worker remains the final process-exit bound.
 The runtime-to-browser document is an explicit read-only whitelist: task label, phase, bounded
 counters and active-tool names, sanitized file-mutation summaries, current structured verifier
-evidence and revision, outcome, plan lines, recent timeline, and latest Diff. The terminal response
-and public error are separate result fields. Raw
+evidence and revision, outcome, plan lines, recent timeline, and latest Diff. Timeline entries retain
+only a compact six-line mutation summary; the latest-change card may additionally carry an ordered,
+display-safe preview of at most 80 lines. Its completeness flag combines the mutation tool's own
+bounded-Diff result with the Web projection limit, so browser folding is never confused with source
+truncation. The terminal response and public error are separate result fields. Raw
 `RunEvent` objects, event messages, canonical chat history, raw provider responses, read/search/command
-output, provider state, credentials, and server configuration never enter that projection. Historical
+output, provider state, credentials, and server configuration never enter that projection. Only the
+explicitly allowlisted, already-bounded mutation Diff crosses as presentation data. Historical
 views read a validated trace and rebuild the same whitelist from its latest run/resume segment. A
 single history detail may additionally read its workspace-bound terminal checkpoint through a narrow
 adapter that returns only a bounded, display-safe final assistant reply; project lists never load

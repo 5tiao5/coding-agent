@@ -232,6 +232,15 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
     assert snapshot["outcome"] == "VERIFIED"
     assert snapshot["plan_lines"] == []
     assert snapshot["latest_change"]["preview"][-2:] == ["-old", "+new"]
+    assert snapshot["latest_change"]["expanded_preview"] == [
+        "--- a/src/example.py",
+        "+++ b/src/example.py",
+        "@@ -1 +1 @@",
+        "-old",
+        "+new",
+    ]
+    assert snapshot["latest_change"]["expanded_preview_complete"] is True
+    assert all("expanded_preview" not in entry for entry in snapshot["timeline"])
     serialized = state_response.text
     assert "raw event message" not in serialized
     assert "raw event data" not in serialized
@@ -599,6 +608,7 @@ def test_app_factory_defaults_to_the_packaged_static_directory() -> None:
     ):
         assert client.get(f"/static/{stylesheet}").status_code == 200
     assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/_diff_view.js").status_code == 200
     assert client.get("/static/_metrics.js").status_code == 200
     assert client.get("/static/_workbench.js").status_code == 200
     assert client.get("/static/locale-zh.js").status_code == 200

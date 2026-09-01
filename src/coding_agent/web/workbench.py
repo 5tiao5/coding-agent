@@ -17,7 +17,7 @@ from typing import TypedDict
 from coding_agent.application import RepositoryRunSpec, execute_repository_run
 from coding_agent.cancellation import CancellationSource, CancellationToken
 from coding_agent.command import CommandPermissionMode
-from coding_agent.dashboard import DashboardProjection
+from coding_agent.dashboard import MAX_EXPANDED_MUTATION_PREVIEW_LINES, DashboardProjection
 from coding_agent.events import EventKind, EventSink, RunEvent
 from coding_agent.lease import RunLease
 from coding_agent.models import AgentResult
@@ -250,6 +250,7 @@ class WebWorkbench:
         projection = DashboardProjection(
             task_label=record.task_title,
             max_timeline=_HISTORY_TIMELINE_LIMIT,
+            expanded_mutation_preview_lines=MAX_EXPANDED_MUTATION_PREVIEW_LINES,
         )
         for event in segment:
             projection.apply(event)

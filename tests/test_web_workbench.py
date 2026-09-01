@@ -722,6 +722,31 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         )
         started.set()
         assert release.wait(timeout=3)
+        expanded_diff = [
+            "--- a/src/example.py",
+            "+++ b/src/example.py",
+            "@@ -1,30 +1,30 @@",
+            *(f"+visible line {index}" for index in range(30)),
+        ]
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.TOOL_FINISHED,
+                message="PRIVATE_MUTATION_EVENT",
+                step=1,
+                data={
+                    "tool_name": "write_file",
+                    "ok": True,
+                    "summary": "Updated src/example.py",
+                    "preview": "Diff preview:\n" + "\n".join(expanded_diff),
+                    "truncated": False,
+                    "metadata": {
+                        "diff_complete": True,
+                        "private": "PRIVATE_MUTATION_METADATA",
+                    },
+                },
+            )
+        )
         terminal = {
             "verified": True,
             "status": "verified",
@@ -808,11 +833,19 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
         "max_total_tool_calls": 40,
     }
     assert "PRIVATE_RAW_TRACE" not in history.text
+    assert "PRIVATE_MUTATION" not in history.text
     assert history.json()["run"]["final_text"] == "Repository task complete"
+    latest_change = history.json()["snapshot"]["latest_change"]
+    assert len(latest_change["preview"]) == 6
+    assert len(latest_change["expanded_preview"]) == 33
+    assert latest_change["expanded_preview"][-1] == "+visible line 29"
+    assert latest_change["expanded_preview_complete"] is True
+    assert all("expanded_preview" not in entry for entry in history.json()["snapshot"]["timeline"])
 
     restarted_history = _client(_workbench(tmp_path)).get(f"/api/history/{run_id}")
     assert restarted_history.status_code == 200, restarted_history.text
     assert restarted_history.json()["run"]["final_text"] == "Repository task complete"
+    assert restarted_history.json()["snapshot"]["latest_change"] == latest_change
     assert "PRIVATE_RAW_TRACE" not in restarted_history.text
 
     selected_second = client.post(

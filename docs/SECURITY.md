@@ -116,15 +116,17 @@ instead of misreporting an already-applied change as a normal failure.
   only the bounded final Assistant reply from a validated, workspace-bound terminal checkpoint; it
   never exposes the rest of the checkpoint conversation. Missing, corrupt, nonterminal, or
   workspace-mismatched checkpoints degrade to trace-only replay. Raw event messages, other canonical
-  messages, tool output, and provider state remain omitted. Runs created before M5.5 metadata are not
-  automatically listed.
+  messages, read/search/command output, and provider state remain omitted. The only tool-output
+  exception is the mutation tool's explicit presentation-safe Diff: timeline entries keep six lines,
+  while only `latest_change` may expose at most 80 ordered lines plus an honest completeness flag.
+  Runs created before M5.5 metadata are not automatically listed.
 - API credentials remain in the backend environment. A process entry point may populate that
   environment from the exact launch-directory `.env.local`; it never searches parents, loads only
   the four allowlisted model settings, disables interpolation, and preserves existing environment
   values. The file is ignored by Git but remains plaintext local storage. Credentials are never sent to browser state, static
   assets, or storage. The browser receives only the documented snapshot whitelist and terminal
-  result, not raw events, canonical messages, raw provider responses, tool output, provider state,
-  or runtime config.
+  result, not raw events, canonical messages, raw provider responses, arbitrary tool output, provider
+  state, or runtime config.
 - Worker exceptions and failed-result details are mapped to stable public messages before entering
   browser state; raw exception text and `AgentResult.error` are not exposed by the Web API.
 - Web `safe` mode is deliberately fail-closed: there is no browser approval broker, so an ordinary

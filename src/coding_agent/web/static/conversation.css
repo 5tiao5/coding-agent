@@ -544,6 +544,23 @@
   text-transform: uppercase;
 }
 
+.change-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.change-badge.badge-warning {
+  padding: 2px 6px;
+  border: 1px solid rgba(173, 109, 0, 0.24);
+  border-radius: 999px;
+  background: #fff5dc;
+  color: #8a5900;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .change-detail {
   margin: 0;
   padding: 9px 11px;
@@ -554,11 +571,20 @@
 
 .diff-block {
   display: flex;
-  max-height: 230px;
+  max-height: 260px;
   overflow: auto;
   flex-direction: column;
   padding: 7px 0;
   background: #f5f8fa;
+}
+
+.diff-block.is-expanded {
+  max-height: min(60vh, 720px);
+}
+
+.diff-block:focus-visible {
+  outline: 2px solid rgba(47, 102, 208, 0.55);
+  outline-offset: -2px;
 }
 
 .diff-line {
@@ -567,9 +593,49 @@
   padding: 2px 11px;
   color: #405665;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 8px;
+  font-size: 9px;
   line-height: 1.65;
   white-space: pre;
+}
+
+.diff-footer {
+  display: flex;
+  min-height: 40px;
+  padding: 8px 11px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  background: #fbfcfd;
+}
+
+.diff-note {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.diff-toggle {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: 1px solid rgba(47, 102, 208, 0.24);
+  border-radius: 8px;
+  background: #eef4ff;
+  color: #2457b8;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.diff-toggle:hover {
+  border-color: rgba(47, 102, 208, 0.42);
+  background: #e4edff;
+}
+
+.diff-toggle:focus-visible {
+  outline: 2px solid rgba(47, 102, 208, 0.55);
+  outline-offset: 2px;
 }
 
 .diff-addition {
@@ -701,4 +767,15 @@
   background: var(--accent-bright);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
   animation: status-pulse 1.6s ease-out infinite;
+}
+
+@media (max-width: 720px) {
+  .diff-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .diff-toggle {
+    width: 100%;
+  }
 }

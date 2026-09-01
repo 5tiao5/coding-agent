@@ -119,3 +119,43 @@ test("history final fallback distinguishes missing, failed, and interrupted resu
     "此次运行的轨迹未正常终止；这里只回放中断前经过白名单过滤的事件。",
   );
 });
+
+test("diff view shows small previews completely and folds larger previews", async () => {
+  const { COLLAPSED_DIFF_LINES, diffPreviewView } = await importBrowserModule(
+    "src/coding_agent/web/static/_diff_view.js",
+  );
+  const smallLines = ["--- a/app.py", "+++ b/app.py", "@@ -1 +1 @@", "-old", "+new"];
+  const small = diffPreviewView({ expanded_preview: smallLines });
+  assert.equal(small.canToggle, false);
+  assert.deepEqual(small.visibleLines, smallLines);
+
+  const longLines = Array.from({ length: COLLAPSED_DIFF_LINES + 4 }, (_, index) => `+line ${index}`);
+  const folded = diffPreviewView({ expanded_preview: longLines });
+  assert.equal(folded.canToggle, true);
+  assert.equal(folded.isExpanded, false);
+  assert.equal(folded.visibleLines.length, COLLAPSED_DIFF_LINES);
+  assert.equal(folded.toggleLabel, `展开 Diff（${longLines.length} 行）`);
+
+  const expanded = diffPreviewView({ expanded_preview: longLines }, true);
+  assert.equal(expanded.isExpanded, true);
+  assert.deepEqual(expanded.visibleLines, longLines);
+  assert.equal(expanded.toggleLabel, "收起 Diff");
+});
+
+test("diff view labels bounded previews honestly and ignores malformed lines", async () => {
+  const { diffPreviewView } = await importBrowserModule(
+    "src/coding_agent/web/static/_diff_view.js",
+  );
+  const view = diffPreviewView({
+    expanded_preview: ["+safe", { private: "must-not-render" }, 3, ...Array(9).fill("+line")],
+    expanded_preview_complete: false,
+    preview: "not-an-array",
+  });
+
+  assert.equal(view.previewTruncated, true);
+  assert.equal(view.totalLines, 10);
+  assert.match(view.toggleLabel, /^展开可用预览/);
+  assert.match(view.note, /安全上限/);
+  assert.doesNotMatch(view.toggleLabel, /完整/);
+  assert.equal(view.visibleLines.includes("must-not-render"), false);
+});

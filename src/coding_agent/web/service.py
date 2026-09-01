@@ -9,7 +9,12 @@ from typing import Literal, Protocol, TypedDict, cast, overload
 from uuid import uuid4
 
 from coding_agent.cancellation import CancellationSource, CancellationToken
-from coding_agent.dashboard import DashboardProjection, DashboardSnapshot, TimelineEntry
+from coding_agent.dashboard import (
+    MAX_EXPANDED_MUTATION_PREVIEW_LINES,
+    DashboardProjection,
+    DashboardSnapshot,
+    TimelineEntry,
+)
 from coding_agent.errors import CodedError
 from coding_agent.events import EventSink, RunEvent
 from coding_agent.models import AgentResult, AgentState
@@ -31,6 +36,13 @@ class TimelinePayload(TypedDict):
     offset_seconds: float
     duration_ms: float | None
     preview: list[str]
+
+
+class LatestChangePayload(TimelinePayload):
+    """One richer, still-bounded mutation preview used only by the change card."""
+
+    expanded_preview: list[str]
+    expanded_preview_complete: bool
 
 
 class ChangedFilePayload(TypedDict):
@@ -81,7 +93,7 @@ class SnapshotPayload(TypedDict):
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelinePayload]
-    latest_change: TimelinePayload | None
+    latest_change: LatestChangePayload | None
 
 
 class WebRunStatePayload(TypedDict):
@@ -221,6 +233,7 @@ class WebRunService:
             self._projection = DashboardProjection(
                 task_label=normalized_task,
                 max_timeline=self._max_timeline,
+                expanded_mutation_preview_lines=MAX_EXPANDED_MUTATION_PREVIEW_LINES,
             )
             self._cancellation_requested = False
             worker = Thread(
@@ -396,7 +409,7 @@ def _snapshot_payload(snapshot: DashboardSnapshot) -> SnapshotPayload:
         "plan_lines": _plan_lines(snapshot),
         "timeline": [_timeline_payload(entry) for entry in snapshot.timeline],
         "latest_change": (
-            _timeline_payload(snapshot.latest_change)
+            _latest_change_payload(snapshot.latest_change)
             if snapshot.latest_change is not None
             else None
         ),
@@ -420,6 +433,14 @@ def _timeline_payload(entry: TimelineEntry) -> TimelinePayload:
         "offset_seconds": entry.offset_seconds,
         "duration_ms": entry.duration_ms,
         "preview": list(entry.preview),
+    }
+
+
+def _latest_change_payload(entry: TimelineEntry) -> LatestChangePayload:
+    return {
+        **_timeline_payload(entry),
+        "expanded_preview": list(entry.expanded_preview),
+        "expanded_preview_complete": entry.expanded_preview_complete,
     }
 
 

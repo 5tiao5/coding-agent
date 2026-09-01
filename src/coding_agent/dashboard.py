@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import TracebackType
 from typing import Literal
@@ -52,6 +52,8 @@ _NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
 _MAX_PLAN_LINES = 8
 _MAX_EVIDENCE_LABELS = 8
 _MAX_CHANGED_FILES = 12
+MAX_EXPANDED_MUTATION_PREVIEW_LINES = 80
+_MAX_EXPANDED_DIFF_LINE_CHARS = 240
 _MAX_VISIBLE_RUNTIME_LIMIT = 1_000_000
 _LEVEL_STYLE: dict[TimelineLevel, str] = {
     "info": "cyan",
@@ -79,6 +81,8 @@ class TimelineEntry:
     offset_seconds: float
     duration_ms: float | None = None
     preview: tuple[str, ...] = ()
+    expanded_preview: tuple[str, ...] = ()
+    expanded_preview_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,11 +133,23 @@ class DashboardSnapshot:
 class DashboardProjection:
     """Fold :class:`RunEvent` values into a small UI-oriented state machine."""
 
-    def __init__(self, *, task_label: str = "Coding task", max_timeline: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        task_label: str = "Coding task",
+        max_timeline: int = 10,
+        expanded_mutation_preview_lines: int = 0,
+    ) -> None:
         if max_timeline < 1:
             raise ValueError("max_timeline must be at least 1")
+        if not 0 <= expanded_mutation_preview_lines <= MAX_EXPANDED_MUTATION_PREVIEW_LINES:
+            raise ValueError(
+                "expanded_mutation_preview_lines must be between 0 and "
+                f"{MAX_EXPANDED_MUTATION_PREVIEW_LINES}"
+            )
         self._task_label = _clean_text(task_label, limit=80) or "Coding task"
         self._timeline: deque[TimelineEntry] = deque(maxlen=max_timeline)
+        self._expanded_mutation_preview_lines = expanded_mutation_preview_lines
         self._run_id: str | None = None
         self._phase = "WAITING"
         self._current_step = 0
@@ -381,6 +397,7 @@ class DashboardProjection:
             data.get("preview"),
             max_lines=_MAX_PLAN_LINES if name == "update_plan" else 6,
         )
+        successful_mutation = name in _MUTATION_TOOLS and explicit_ok is True
         entry = self._entry(
             event,
             "TOOL",
@@ -395,8 +412,21 @@ class DashboardProjection:
             # explicitly successful update replaces the previous snapshot; a missing
             # or malformed safe preview clears it rather than showing a stale plan.
             self._plan_lines = preview
-        if name in _MUTATION_TOOLS and entry.preview:
-            self._latest_change = entry
+        if successful_mutation and entry.preview:
+            latest_change = entry
+            if self._expanded_mutation_preview_lines:
+                expanded_preview, projection_complete = _expanded_mutation_preview(
+                    data.get("preview"),
+                    max_lines=self._expanded_mutation_preview_lines,
+                )
+                latest_change = replace(
+                    entry,
+                    expanded_preview=expanded_preview,
+                    expanded_preview_complete=(
+                        projection_complete and _mutation_preview_is_complete(data)
+                    ),
+                )
+            self._latest_change = latest_change
         if name in _MUTATION_TOOLS and explicit_ok is True:
             self._record_changed_file(data)
         return entry
@@ -986,6 +1016,87 @@ def _preview_lines(value: object, *, max_lines: int = 6) -> tuple[str, ...]:
 
     visit(value)
     return tuple(lines)
+
+
+def _expanded_mutation_preview(
+    value: object,
+    *,
+    max_lines: int,
+) -> tuple[tuple[str, ...], bool]:
+    """Preserve one mutation Diff's order while bounding its Web-only projection."""
+
+    raw_lines: list[str] | None = None
+    if isinstance(value, str):
+        raw_lines = value.splitlines()
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        raw_lines = []
+        for item in value:
+            if isinstance(item, str):
+                raw_lines.extend(item.splitlines() or [item])
+    if raw_lines is None:
+        fallback = _preview_lines(value, max_lines=max_lines)
+        # A structured fallback may itself have selected or shortened fields.
+        # Keep it display-safe, but never claim that it represents the full Diff.
+        return fallback, False
+
+    marker = next(
+        (
+            index
+            for index, raw_line in enumerate(raw_lines)
+            if raw_line.strip().casefold() == "diff preview:"
+        ),
+        None,
+    )
+    candidates = raw_lines[marker + 1 :] if marker is not None else raw_lines
+    complete = True
+    safe_lines: list[str] = []
+    for raw_line in candidates:
+        safe_line, line_complete = _clean_preview_line(
+            raw_line,
+            limit=_MAX_EXPANDED_DIFF_LINE_CHARS,
+        )
+        safe_lines.append(safe_line)
+        complete = complete and line_complete
+
+    if len(safe_lines) <= max_lines:
+        return tuple(safe_lines), complete
+
+    head_count = (max_lines - 1) // 2
+    tail_count = max_lines - head_count - 1
+    omitted = len(safe_lines) - head_count - tail_count
+    marker_line = f"...[{omitted} lines omitted from expanded Diff preview]..."
+    tail = safe_lines[-tail_count:] if tail_count else []
+    sampled = [
+        *safe_lines[:head_count],
+        marker_line,
+        *tail,
+    ]
+    return tuple(sampled), False
+
+
+def _mutation_preview_is_complete(data: Mapping[str, object]) -> bool:
+    if _data_bool(data, "truncated") is True:
+        return False
+    metadata = data.get("metadata")
+    if isinstance(metadata, Mapping) and _data_bool(metadata, "diff_complete") is False:
+        return False
+    preview = data.get("preview")
+    if isinstance(preview, str):
+        lowered = preview.casefold()
+        markers = (
+            "diff preview truncated",
+            "lines omitted from diff preview",
+        )
+        if any(marker in lowered for marker in markers):
+            return False
+    return True
+
+
+def _clean_preview_line(value: str, *, limit: int) -> tuple[str, bool]:
+    visible = "".join(" " if not character.isprintable() else character for character in value)
+    if len(visible) <= limit:
+        return visible, True
+    return f"{visible[: max(0, limit - 3)]}...", False
 
 
 def _clean_text(value: str, *, limit: int) -> str:

@@ -7,6 +7,7 @@ import {
   translateTimelineHeadline,
 } from "./locale-zh.js";
 import { createWorkbench } from "./_workbench.js";
+import { diffPreviewView } from "./_diff_view.js";
 import { runtimeMetricView } from "./_metrics.js";
 
 "use strict";
@@ -89,6 +90,8 @@ let pollInFlight = false;
 let consecutivePollFailures = 0;
 let toastTimer = null;
 let taskInputDirty = false;
+let diffBlockSequence = 0;
+const expandedDiffKeys = new Set();
 
 const RUN_STATUS = {
   completed: { label: "已完成", phase: "运行已完成", tone: "completed" },
@@ -463,11 +466,20 @@ function renderDiffLine(line) {
   return createElement("code", `diff-line diff-${tone}`, text || " ");
 }
 
-function renderLatestChange(rawChange) {
+function renderLatestChange(rawChange, runId) {
   const change = asObject(rawChange);
   if (!Object.keys(change).length) {
     return null;
   }
+
+  const changeKey = JSON.stringify([
+    asText(runId),
+    asNumber(change.step, -1),
+    asNumber(change.offset_seconds, -1),
+    asText(change.headline),
+    asText(change.detail),
+  ]);
+  const initialView = diffPreviewView(change, expandedDiffKeys.has(changeKey));
 
   const card = createElement("section", "change-card");
   const heading = createElement("header", "change-heading");
@@ -480,7 +492,12 @@ function renderLatestChange(rawChange) {
       translateTimelineHeadline(asText(change.headline, "最近变更")),
     ),
   );
-  heading.append(title, createElement("span", "change-badge", "工作区变更"));
+  const badges = createElement("div", "change-badges");
+  badges.append(createElement("span", "change-badge", "工作区变更"));
+  if (initialView.previewTruncated) {
+    badges.append(createElement("span", "change-badge badge-warning", "预览已截断"));
+  }
+  heading.append(title, badges);
   card.append(heading);
 
   const detail = asText(change.detail).trim();
@@ -488,13 +505,57 @@ function renderLatestChange(rawChange) {
     card.append(createElement("p", "change-detail", translateTimelineDetail(detail)));
   }
 
-  const preview = asArray(change.preview);
-  if (preview.length) {
+  if (initialView.totalLines) {
+    diffBlockSequence += 1;
+    const diffId = `latest-change-diff-${diffBlockSequence}`;
     const diff = createElement("div", "diff-block");
-    for (const line of preview.slice(0, 18)) {
-      diff.append(renderDiffLine(line));
+    diff.id = diffId;
+    diff.dataset.diffKey = changeKey;
+    diff.tabIndex = 0;
+    diff.setAttribute("role", "region");
+    diff.setAttribute("aria-label", "工作区变更 Diff 预览");
+    const footer = createElement("footer", "diff-footer");
+    const note = createElement("span", "diff-note");
+    note.setAttribute("aria-live", "polite");
+    const toggle = initialView.canToggle
+      ? createElement("button", "diff-toggle")
+      : null;
+    if (toggle) {
+      toggle.type = "button";
+      toggle.dataset.diffKey = changeKey;
+      toggle.setAttribute("aria-controls", diffId);
     }
-    card.append(diff);
+
+    function paintDiff(expanded) {
+      const view = diffPreviewView(change, expanded);
+      diff.classList.toggle("is-expanded", view.isExpanded);
+      diff.replaceChildren(...view.visibleLines.map(renderDiffLine));
+      note.textContent = view.note;
+      if (toggle) {
+        toggle.textContent = view.toggleLabel;
+        toggle.setAttribute("aria-expanded", String(view.isExpanded));
+      }
+    }
+
+    if (toggle) {
+      toggle.addEventListener("click", () => {
+        const shouldExpand = !expandedDiffKeys.has(changeKey);
+        if (shouldExpand) {
+          if (expandedDiffKeys.size >= 100) {
+            expandedDiffKeys.clear();
+          }
+          expandedDiffKeys.add(changeKey);
+        } else {
+          expandedDiffKeys.delete(changeKey);
+        }
+        paintDiff(shouldExpand);
+      });
+      footer.append(note, toggle);
+    } else {
+      footer.append(note);
+    }
+    paintDiff(initialView.isExpanded);
+    card.append(diff, footer);
   }
   return card;
 }
@@ -551,7 +612,7 @@ function renderConversation(state, snapshot, status) {
     activityStack.append(renderThinkingCard(snapshot));
   }
 
-  const latestChange = renderLatestChange(snapshot.latest_change);
+  const latestChange = renderLatestChange(snapshot.latest_change, state.run_id);
   if (latestChange) {
     activityStack.append(latestChange);
   }
@@ -564,7 +625,39 @@ function renderConversation(state, snapshot, status) {
     fragment.append(renderFinalMessage(state.final_text, status, state.error));
   }
 
+  const diffScrollPositions = new Map();
+  for (const diff of elements.messageList.querySelectorAll(".diff-block")) {
+    const key = diff.dataset.diffKey;
+    if (key) {
+      diffScrollPositions.set(key, {
+        left: diff.scrollLeft,
+        top: diff.scrollTop,
+      });
+    }
+  }
+  const focusedDiffKey = document.activeElement?.dataset?.diffKey || "";
+  const focusedDiffTarget = document.activeElement?.classList.contains("diff-block")
+    ? "block"
+    : "toggle";
   elements.messageList.replaceChildren(fragment);
+  for (const diff of elements.messageList.querySelectorAll(".diff-block")) {
+    const position = diffScrollPositions.get(diff.dataset.diffKey);
+    if (position) {
+      diff.scrollLeft = position.left;
+      diff.scrollTop = position.top;
+    }
+  }
+  if (focusedDiffKey) {
+    const candidates = elements.messageList.querySelectorAll(
+      focusedDiffTarget === "block" ? ".diff-block" : ".diff-toggle",
+    );
+    for (const candidate of candidates) {
+      if (candidate.dataset.diffKey === focusedDiffKey) {
+        candidate.focus({ preventScroll: true });
+        break;
+      }
+    }
+  }
   if (wasNearBottom || status === "running") {
     window.requestAnimationFrame(() => {
       elements.conversation.scrollTop = elements.conversation.scrollHeight;
@@ -786,6 +879,7 @@ workbench = createWorkbench({
     lastRenderSignature = "";
     lastServerTask = "";
     taskInputDirty = false;
+    expandedDiffKeys.clear();
     if (!appMetadata.taskLocked) {
       elements.taskInput.value = "";
     }

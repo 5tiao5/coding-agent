@@ -418,6 +418,9 @@ def test_projection_bounds_timeline_and_rejects_mixed_runs() -> None:
         projection.apply(_event(EventKind.RUN_STARTED, run_id="run-2"))
     with pytest.raises(ValueError, match="at least 1"):
         DashboardProjection(max_timeline=0)
+    for invalid_preview_lines in (-1, 81):
+        with pytest.raises(ValueError, match="expanded_mutation_preview_lines"):
+            DashboardProjection(expanded_mutation_preview_lines=invalid_preview_lines)
 
 
 def test_projection_handles_missing_and_unknown_verification_status() -> None:
@@ -1004,6 +1007,127 @@ def test_mutation_preview_prioritizes_the_actual_changed_lines() -> None:
         "-old total",
         "+new total",
     )
+    assert projection.snapshot.latest_change is not None
+    assert projection.snapshot.latest_change.expanded_preview == ()
+
+
+def test_web_mutation_preview_expands_safely_without_growing_the_timeline() -> None:
+    projection = DashboardProjection(
+        max_timeline=5,
+        expanded_mutation_preview_lines=80,
+    )
+    projection.apply(_event(EventKind.RUN_STARTED))
+    diff_lines = [
+        "--- a/pricing.py",
+        "+++ b/pricing.py",
+        "@@ -1,100 +1,100 @@",
+        *(f"+new line {index}" for index in range(100)),
+    ]
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "write_file",
+                "ok": True,
+                "summary": "Changed pricing.py",
+                "preview": "Change applied.\nDiff preview:\n" + "\n".join(diff_lines),
+                "truncated": False,
+                "metadata": {"diff_complete": True},
+            },
+        )
+    )
+
+    timeline_entry = projection.snapshot.timeline[-1]
+    latest_change = projection.snapshot.latest_change
+    assert timeline_entry.expanded_preview == ()
+    assert len(timeline_entry.preview) == 6
+    assert latest_change is not None
+    assert len(latest_change.expanded_preview) == 80
+    assert latest_change.expanded_preview[0] == "--- a/pricing.py"
+    assert latest_change.expanded_preview[-1] == "+new line 99"
+    assert any(
+        "omitted from expanded Diff preview" in line for line in latest_change.expanded_preview
+    )
+    assert latest_change.expanded_preview_complete is False
+
+
+def test_web_mutation_preview_honors_a_single_line_projection_limit() -> None:
+    projection = DashboardProjection(expanded_mutation_preview_lines=1)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "write_file",
+                "ok": True,
+                "summary": "Changed pricing.py",
+                "preview": "Diff preview:\n--- a/pricing.py\n+++ b/pricing.py\n+new line",
+            },
+        )
+    )
+
+    latest_change = projection.snapshot.latest_change
+    assert latest_change is not None
+    assert latest_change.expanded_preview == ("...[3 lines omitted from expanded Diff preview]...",)
+    assert latest_change.expanded_preview_complete is False
+
+
+def test_web_mutation_preview_marks_a_truncated_line_as_incomplete() -> None:
+    projection = DashboardProjection(expanded_mutation_preview_lines=80)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "replace_text",
+                "ok": True,
+                "summary": "Changed pricing.py",
+                "preview": "Diff preview:\n--- a/pricing.py\n+++ b/pricing.py\n+" + ("x" * 300),
+                "truncated": False,
+                "metadata": {"diff_complete": True},
+            },
+        )
+    )
+
+    latest_change = projection.snapshot.latest_change
+    assert latest_change is not None
+    assert latest_change.expanded_preview[-1].endswith("...")
+    assert len(latest_change.expanded_preview[-1]) == 240
+    assert latest_change.expanded_preview_complete is False
+
+
+@pytest.mark.parametrize(
+    "source_signal",
+    [
+        {"truncated": True},
+        {"metadata": {"diff_complete": False}},
+        {"preview": "Diff preview:\n...[2 lines omitted from Diff preview]..."},
+        {"preview": {"diff": "--- a/pricing.py\n+++ b/pricing.py\n+new line"}},
+    ],
+    ids=("tool-output", "diff-budget", "preview-marker", "structured-fallback"),
+)
+def test_web_mutation_preview_propagates_source_truncation(
+    source_signal: dict[str, object],
+) -> None:
+    projection = DashboardProjection(expanded_mutation_preview_lines=80)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    data: dict[str, object] = {
+        "tool_name": "replace_text",
+        "ok": True,
+        "summary": "Changed pricing.py",
+        "preview": "Diff preview:\n--- a/pricing.py\n+++ b/pricing.py\n+new line",
+        "truncated": False,
+        "metadata": {"diff_complete": True},
+    }
+    data.update(source_signal)
+    projection.apply(_event(EventKind.TOOL_FINISHED, step=1, data=data))
+
+    latest_change = projection.snapshot.latest_change
+    assert latest_change is not None
+    assert latest_change.expanded_preview_complete is False
 
 
 class FakeLive:

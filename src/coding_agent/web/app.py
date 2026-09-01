@@ -89,6 +89,11 @@ class TimelineResponse(BaseModel):
     preview: list[str]
 
 
+class LatestChangeResponse(TimelineResponse):
+    expanded_preview: list[str]
+    expanded_preview_complete: bool
+
+
 class ChangedFileResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -137,7 +142,7 @@ class SnapshotResponse(BaseModel):
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelineResponse]
-    latest_change: TimelineResponse | None
+    latest_change: LatestChangeResponse | None
 
 
 class WebRunResponse(BaseModel):
