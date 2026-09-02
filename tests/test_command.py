@@ -1176,7 +1176,7 @@ def test_cleanup_failure_outranks_keyboard_interrupt_and_is_retried(
 def test_timeout_terminates_a_spawned_descendant(repository: Path) -> None:
     sentinel = repository / "descendant-finished.txt"
     child_script = (
-        "import pathlib,time; time.sleep(1); "
+        "import pathlib,time; time.sleep(2); "
         f"pathlib.Path({str(sentinel)!r}).write_text('alive', encoding='utf-8')"
     )
     parent_script = (
@@ -1189,10 +1189,13 @@ def test_timeout_terminates_a_spawned_descendant(repository: Path) -> None:
         CommandRequest(
             argv=(sys.executable, "-c", parent_script),
             cwd=repository,
-            timeout_seconds=0.2,
+            # Creating the descendant Python process can exceed 200 ms on a loaded
+            # Windows host.  Leave enough time to prove it started while retaining a
+            # full second between the parent timeout and the sentinel write.
+            timeout_seconds=1,
         )
     )
-    time.sleep(1.2)
+    time.sleep(2.2)
 
     assert result.status is CommandStatus.TIMED_OUT
     assert b"spawned" in result.output
