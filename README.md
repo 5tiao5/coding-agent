@@ -4,7 +4,10 @@
 
 A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
 
-The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's trusted trace history from a Codex-style sidebar. **M5.6** turns the timeline into a compact audit view: paired tool start/finish events collapse into one card, while credential-redacted command and verification facts can be expanded on demand. Both demos tell one complete repair story:
+第一次阅读代码库，建议先看 [中文工作原理与源码导览](docs/HOW_IT_WORKS.md)：它用 RouteForge
+任务解释模型、工具、验证、上下文、恢复与 Web 界面之间的完整因果链。
+
+The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's validated trace projection from a Codex-style sidebar. **M5.6** turns the timeline into a compact audit view: paired tool start/finish events collapse into one card, while credential-redacted command and verification facts can be expanded on demand. **M5.7** separates same-run checkpoint recovery from completed-run follow-up: the former resumes in place, while the latter creates a child run with `parent_run_id` and bounded `ProjectMemory`. Both demos tell one complete repair story:
 
 `plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
 
@@ -73,7 +76,15 @@ uv run coding-agent web --model <model> --mode safe
 
 # Optional shortcut: register and select this directory immediately.
 uv run coding-agent web --root . --model <model> --mode safe
+
+# The ceiling also applies cumulatively when Web resumes a ready checkpoint.
+uv run coding-agent web --root . --model <model> --mode auto --max-steps 50
 ```
+
+服务器重启后重新打开同一项目，仍有 `READY_FOR_MODEL` 检查点、目录指纹一致且尚未完成
+的历史项会提供“恢复”：它沿用原 `run-id`、canonical transcript 和已消费预算，并重新
+取得同一 per-run lease；`--max-steps` 是累计上限。已完成历史项提供“继续”：用户输入后创建新 `run-id`，并以
+`parent_run_id` 记录父任务；父运行及其轨迹保持只读，新运行重新读取、修改和验证。
 
 ### Trusted project verification
 
@@ -119,11 +130,15 @@ a changed policy requires a fresh run.
 
 On Windows, “打开项目” first opens the native folder chooser; manual absolute-path input remains as
 a fallback. “新建项目” can browse for its parent and then creates exactly one previously absent empty
-leaf directory; it does not initialize Git, add a template, or overwrite a directory. Project and
-new-run history metadata live in the private state directory, not inside the repository. The sidebar
+leaf directory; it does not initialize Git, add a template, or overwrite a directory. Project,
+run-catalog, and project-memory data live in the private state directory, not inside the repository. The sidebar
 lists bounded metadata; opening a completed run replays its trace projection and, when a matching
 terminal checkpoint exists, its bounded final reply. Older runs that predate M5.5 metadata are not
 retroactively catalogued, and old or invalid checkpoints fall back to trace-only replay.
+
+“移除” only hides a project from Relay's sidebar. It never deletes the workspace or private run
+history; opening the same directory again restores its stable project identity, history, and project
+memory. Removal is rejected while a task is running.
 
 ### Run budgets
 
@@ -135,7 +150,7 @@ one honest final response.
 | Host | Model-turn budget | Tool-call budget |
 |---|---|---|
 | `run` / live `web` | 20 by default; `--max-steps` accepts 1–100 | 8 per turn; `max(8, 2 × turns)` cumulative |
-| `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | same formula, including restored calls |
+| CLI / Web `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | same formula, including restored calls |
 | live `evaluate` | 12 per case by default; `--max-steps` accepts 1–20 | 8 per turn; 24 cumulative by default |
 | deterministic CLI/Web demo | 13 turns | 8 per turn; 26 cumulative |
 
@@ -182,7 +197,9 @@ The browser can select a locally registered project, submit one task, and observ
 file-change-to-verifier evidence chain, and final response. In this first slice, Web `safe` mode has no browser approval broker:
 registered verification commands may run, while ordinary commands fail closed. Select `--mode auto`
 only when that broader local command authority is intentional; it remains subject to the command
-deny rules and is not an OS sandbox.
+deny rules and is not an OS sandbox. “使用项目记忆”默认开启；关闭它会禁止普通新任务的
+环境式历史选择，但显式“继续”仍需要父摘要。该开关不会阻止任务结束后以 best-effort
+方式保存经脱敏、白名单化的结构化摘要。
 
 Empty projects are supported without weakening `write_file`: the Agent must call
 `create_directory` once for each missing directory level, then write files beneath those explicit
@@ -253,9 +270,10 @@ verification evidence.
   validated terminal checkpoint; project lists and all other canonical messages stay private. Each
   run is bound to the directory fingerprint captured at start, so replacing a directory cannot
   inherit its old history; an unterminated trace from an earlier process is labeled `interrupted`.
-  The latest mutation card shows eight Diff lines by default and can expand to an 80-line safe
-  preview in both live and historical views. A separate badge identifies previews that hit a tool or
-  projection limit; the underlying file mutation is still applied atomically and completely.
+  Ordinary status/timeline cards describe the latest run/resume segment, while the file-change ledger
+  scans every segment of that immutable `run-id`. It keeps the newest 100 mutations and reports the
+  exact number of older entries omitted. Each Diff shows eight lines by default and can expand to an
+  80-line safe preview; completeness and preview truncation are reported separately.
 - Live and historical timelines use the same versioned projection. Correlated tool-start/tool-finish
   events render as one completed card; expanding a command shows its credential-redacted argv,
   workspace-relative `cwd`, timeout, exit status, duration, bounded captured output, and typed
@@ -277,6 +295,25 @@ verification evidence.
 - Transient connection, timeout, throttling, and selected server failures are retried by the
   project-owned loop, not invisibly by the SDK. Retry scheduling is visible in both event projections
   without exposing provider exception text.
+
+## M5.7 Web 任务连续性与 ProjectMemory
+
+- **恢复中断任务**沿用同一运行：Web 只接受仍处于 `READY_FOR_MODEL` 边界的检查点，校验
+  当前项目、工作区指纹、运行目录、trace 终态与独占 lease 后，使用原 `run-id` 继续。
+  canonical transcript、`RunMemory` 和预算来自检查点，但验证证据不会恢复，Agent 必须
+  重新执行当前修订上的检查。
+- **继续已完成任务**会派生新运行：父运行不可变，子运行获得新 `run-id`，在 immutable
+  catalog 中保存 `parent_run_id`，并强制把父任务摘要作为显式上下文来源。它不会向旧
+  transcript 追加消息，也不会继承旧预算、lease 或验证证据。
+- 普通新任务默认从 `ProjectMemory` 按相关性与时间挑选少量历史摘要；关闭“使用项目记忆”
+  会禁用这种环境式选择。但显式点击“继续”时，父摘要是必需依赖，即使关闭该开关也会
+  注入；父摘要不可用时请求会失败，而不是静默退化为无关的新任务。
+- `ProjectMemory` 是工作区外的版本化有界 JSON，并同时绑定项目 ID 与物理目录指纹。它只
+  保存任务目标、终态、自然语言总结、文件变更统计、历史验证结果和未解决项；不保存
+  transcript、源码/Diff、命令输出、provider payload 或隐式推理。任务结束后的摘要保存是
+  best-effort，失败不会改变 Agent 结果；开关只控制下一轮上下文注入。
+- 历史文本一律作为不可信参考。Agent 仍需重新读取当前文件并执行新验证；历史中的
+  `passed` 只能说明过去发生过什么，绝不能满足当前 `Verification Gate`。
 
 ## M5 reliability and evaluation slice
 
@@ -309,6 +346,10 @@ verification evidence.
 - Resume restores the canonical transcript plus bounded RunMemory such as the structured plan,
   change summaries, and failure facts. It does not restore the in-memory undo journal, approval
   decisions, provider-private state, or fresh verification evidence; every resume must verify again.
+- `ProjectMemory` is not a larger checkpoint. It connects separate tasks with a small historical
+  summary, is bound to one registered project/workspace identity, and never authorizes tools,
+  checkpoint resume, or verification. Continuing a completed task creates a new catalog record with
+  `parent_run_id`; the parent record and trace remain immutable.
 - Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
 - A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
 - The local Web view is not authenticated for hostile same-machine users. It binds to loopback,
@@ -328,6 +369,8 @@ Generic libraries handle HTTP transport, validation, terminal rendering, input e
 CLI ───────────────────────────────────────────────┐
 loopback Web ─ WebWorkbench                        │
                  ├─ ProjectRegistry + RunCatalog   │
+                 ├─ ProjectMemoryCoordinator       │
+                 │    └─ ProjectMemoryStore        │
                  └─ one WebRunService ─────────────┤
                                                    ▼
                                   Repository application service
@@ -344,4 +387,4 @@ evaluate CLI
      └─ allowlisted source copy → sibling regression oracle
 ```
 
-The runtime result, resumable checkpoint, audit trace, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), and [docs/REFERENCES.md](docs/REFERENCES.md).
+The runtime result, resumable checkpoint, audit trace, project memory, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), and [docs/REFERENCES.md](docs/REFERENCES.md).

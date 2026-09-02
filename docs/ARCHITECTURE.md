@@ -1,13 +1,18 @@
 # Architecture
 
+For a teaching-first Chinese walkthrough of one complete task, read
+[HOW_IT_WORKS.md](HOW_IT_WORKS.md) before this reference.
+
 ## One control loop, separated projections of truth
 
 ```text
 CLI host ────────────────────────────────────────┐
 loopback Web host ── WebWorkbench                │
-                         ├── ProjectRegistry     │
-                         ├── RunCatalog          │
-                         └── one WebRunService ──┤
+                          ├── ProjectRegistry     │
+                          ├── RunCatalog          │
+                          ├── ProjectMemoryCoordinator
+                          │      └── ProjectMemoryStore
+                          └── one WebRunService ──┤
                                                 ▼
                                Repository application service
                                                 │
@@ -56,7 +61,8 @@ The important separation is semantic, not cosmetic:
 | `DashboardEventSink` | human-readable projection | influence runtime control flow |
 | `WebRunService` | one worker and whitelisted browser snapshots | expose raw events/messages or execute tools itself |
 | `WebWorkbench` | active project, global run admission, catalog navigation | become a second Agent loop or change roots mid-run |
-| `ProjectRegistry` / `RunCatalog` | bounded navigation metadata | authorize tools, verification, or transcript resume |
+| `ProjectRegistry` / `RunCatalog` | bounded navigation metadata and immutable `parent_run_id` lineage | authorize tools, verification, or transcript resume |
+| `ProjectMemoryStore` | bounded cross-run summaries bound to one project/workspace identity | act as a checkpoint, restore evidence, or authorize tools |
 | `ResolvedProjectPolicy` / integrity guard | typed verifier capabilities, target runtime identity, protected manifest | accept arbitrary commands or trust exit zero after policy drift |
 
 This prevents a pretty UI, stale trace, or loaded JSON file from becoming an accidental authority.
@@ -70,6 +76,8 @@ This prevents a pretty UI, stale trace, or loaded JSON file from becoming an acc
   `check_integrity()` guards the inputs around each configured verifier.
 - `EventSink.emit()` separates runtime facts from storage and presentation.
 - `execute_repository_run()` owns shared repository-run composition for both CLI and Web hosts.
+- `ProjectMemoryCoordinator` prepares one immutable historical view before a new Web run and saves
+  allowlisted terminal summaries without changing the run outcome.
 - `evaluate_case()` owns fixture isolation and independent regression judgement while reusing
   `execute_repository_run()` for the candidate repair.
 
@@ -101,6 +109,17 @@ persists this snapshot and classified budget usage; v2 checkpoints migrate conse
 restored verifier fact is marked stale. The fresh `VerificationLedger` remains the sole completion
 authority.
 
+`ProjectMemory` solves a different problem. It links separate tasks, not turns of one task: a strict,
+versioned store outside the editable workspace keeps a bounded set of terminal summaries keyed by
+project ID and workspace fingerprint. A new task selects a small relevant/recent subset once, records
+the contributing run IDs in immutable catalog metadata, and injects the rendered text as explicitly
+untrusted historical host data. It does not contain canonical messages, source/Diff content, command
+output, provider state, reasoning, budget state, or current verification evidence. The default-on Web
+switch controls ambient relevant/recent selection. An explicit completed-run follow-up always requires
+its parent summary, even when ambient memory is off; inability to load that parent fails closed.
+Terminal runs still save an allowlisted summary best-effort. Store failure never changes
+`AgentResult`.
+
 ## CLI and loopback Web hosts
 
 The CLI and live Web host both build a `RepositoryRunSpec` and call the same application service.
@@ -118,6 +137,17 @@ while a run is active. Every run record also freezes that fingerprint: replacing
 its previous physical identity's runs and rejects stale direct-history URLs rather than reattributing
 them. A nonterminal trace from a previous process is reported as interrupted, not still running.
 
+Web resume is same-run recovery, not a follow-up chat. The workbench accepts it only when the selected
+project and frozen workspace fingerprint match the catalog, the checkpoint stops at
+`READY_FOR_MODEL`, the trace has no completed terminal segment, and the run lease can be acquired.
+It then calls the same application service with the loaded checkpoint and original `run-id`; restored
+turn/tool usage counts toward the new cumulative ceiling. The UI labels this action **恢复**.
+
+A completed run is deliberately refused by resume. Its **继续** action creates a fresh `run-id`, stores
+the immutable parent's ID as `parent_run_id`, and requires that parent's `ProjectMemory` entry as an
+auditable source. The parent catalog record, trace, and transcript are never mutated or appended.
+The child has fresh budgets, lease, transcript, and `VerificationLedger`, so it must verify again.
+
 `WebRunService` adds only a one-worker lifecycle and folds live events through `DashboardProjection`.
 The FastAPI lifespan first closes admission and gives the current run a finite drain window. If the
 run remains active, a host token requests cooperative cancellation; the Agent observes it at safe
@@ -125,11 +155,13 @@ model/tool boundaries and saves a resumable checkpoint. A blocking external call
 and the daemon worker remains the final process-exit bound.
 The runtime-to-browser document is an explicit read-only whitelist: task label, phase, bounded
 counters and active-tool names, sanitized file-mutation summaries, current structured verifier
-evidence and revision, outcome, plan lines, recent timeline, and latest Diff. Timeline entries retain
-only a compact six-line mutation summary; the latest-change card may additionally carry an ordered,
-display-safe preview of at most 80 lines. Its completeness flag combines the mutation tool's own
-bounded-Diff result with the Web projection limit, so browser folding is never confused with source
-truncation. Completed command and verification entries may also carry bounded typed activity facts.
+evidence and revision, outcome, plan lines, recent timeline, a workspace-change ledger, and its legacy
+latest-change alias. Timeline entries retain only a compact six-line mutation summary; each ledger card
+may additionally carry an ordered, display-safe preview of at most 80 lines. Its completeness flag
+combines the mutation tool's own bounded-Diff result with the Web projection limit, so browser folding
+is never confused with source truncation. The ledger retains at most the newest 100 mutation entries plus a
+`workspace_changes_complete` flag and exact `omitted_change_count`. Completed command and verification
+entries may also carry bounded typed activity facts.
 The protocol boundary creates a versioned `public_invocation` containing the direct argv token
 vector, workspace-relative `cwd`, timeout, and verifier identity where applicable. It also projects
 the command runner's already-bounded combined stdout/stderr. Recognized credential values are
@@ -151,12 +183,15 @@ chat history, backend environment values and API keys, raw provider responses an
 reasoning, arbitrary adapter metadata, provider state, and server configuration never cross the Web
 API. Bounded credential-redacted command output and the explicitly bounded mutation Diff are the
 presentation exceptions. Historical
-views read a validated trace and rebuild the same whitelist from its latest run/resume segment. A
+views read a validated trace: status and the ordinary timeline use the latest run/resume segment,
+while the workspace-change ledger scans every segment sharing the immutable `run-id`. A
 single history detail may additionally read its workspace-bound terminal checkpoint through a narrow
 adapter that returns only a bounded, display-safe final assistant reply; project lists never load
 checkpoint bodies, and no checkpoint tool output crosses the API. Missing, corrupt,
 legacy, nonterminal, or workspace-mismatched checkpoints simply omit that reply without invalidating
-the trace replay. In the live Windows host, a token-protected adapter may open the native folder
+the trace replay. Project-memory provenance adds only bounded source run IDs, task labels, timestamps,
+and requested/applied/error state; the rendered memory body never crosses the API. In the live Windows
+host, a token-protected adapter may open the native folder
 chooser; cancellation has no side effect, and a returned path still enters the ordinary
 project-registration boundary. A short navigation reservation prevents runs and project mutations
 from racing the open dialog. Manual absolute-path input is the fallback. Normal run requests contain
@@ -171,6 +206,12 @@ CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
                                       ├→ COMPLETED_UNVERIFIED
                                       └→ FAILED
 ```
+
+A normal or completed-run follow-up enters at `CREATED` with a new identity; a follow-up additionally
+records `parent_run_id` and includes the required parent summary. Resume enters only after loading a
+`READY_FOR_MODEL` snapshot between complete turns; loading is passive and never replays the last tool
+call. Project-memory context is selected only for a new run and is not reselected or reinjected during
+resume because the checkpoint already contains that run's original system prompt.
 
 For each turn, the runner prepares a bounded model view and requests one response. Explicitly
 classified transport failures receive bounded exponential backoff inside the runner. A malformed
@@ -189,9 +230,9 @@ tool calls enters the Verification Gate. The terminal checkpoint event is emitte
 | orchestration | `agent.py`, `agent_protocol.py`, `cancellation.py`, `budget.py`, `completion.py`, `run_memory.py`, `models.py`, `context.py`, `stopping.py`, `verification.py` |
 | provider boundary | `model.py`, `openai_model.py` |
 | tools and policy | `tools/`, `workspace.py`, `mutation.py`, `command.py`, `command_verification.py`, `project_config.py`, `integrity.py`, `approval.py` |
-| application wiring | `application.py`, `runtime.py`, `cli.py`, `local_config.py`, `demo.py`, `web/runtime.py`, `web/workbench.py` |
+| application wiring | `application.py`, `runtime.py`, `cli.py`, `local_config.py`, `demo.py`, `web/runtime.py`, `web/workbench.py`, `web/project_memory.py` |
 | evaluation | `evaluation.py`, `evaluation_scenarios.py`, `evaluation_cli.py` |
-| persistence | `session.py`, `trace.py`, `state.py`, `projects.py`, `run_catalog.py`, `lease.py`, `run_id.py` |
+| persistence | `session.py`, `trace.py`, `project_memory.py`, `state.py`, `projects.py`, `run_catalog.py`, `lease.py`, `run_id.py` |
 | presentation | `events.py`, `dashboard.py`, `_dashboard_activity.py`, `_dashboard_evidence.py`, `_presentation_safety.py`, `presentation.py`, `ui.py`, `web/app.py`, `web/service.py`, `web/static/` |
 
 `cli.py` performs argument handling and selects a host; its root callback loads only the

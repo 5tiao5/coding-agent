@@ -111,6 +111,14 @@ instead of misreporting an already-applied change as a normal failure.
   never overwrites an existing directory, and rolls back that leaf if registration fails. Each run
   record freezes the selected directory fingerprint; a replaced directory cannot inherit or replay
   runs from the old physical identity.
+- `ProjectMemory` is a separate strict, bounded, versioned store in that private state directory. Each
+  document is bound to both the registered project ID and current workspace fingerprint. It retains
+  only allowlisted task/status/summary, file-change metadata, historical verifier outcomes, and
+  unresolved issues; canonical messages, source/Diff content, command output, provider payloads,
+  reasoning, and credentials have no schema field and fail closed.
+- Project-memory replacement is atomic but not a cross-process transaction. The supported Web host
+  uses one worker and should be the only process writing a given state directory; concurrent Web
+  instances can lose one summary without corrupting the JSON file.
 - Project history is an untrusted navigation aid, not execution authority. The API rebuilds a
   bounded `DashboardProjection` from validated trace events. A single completed-run detail may add
   only the bounded final Assistant reply from a validated, workspace-bound terminal checkpoint; it
@@ -118,9 +126,29 @@ instead of misreporting an already-applied change as a normal failure.
   workspace-mismatched checkpoints degrade to trace-only replay. Raw event messages, other canonical
   messages, read/search output, arbitrary tool objects, and provider state remain omitted. Explicit
   audit exceptions are the credential-redacted bounded command output described below and the
-  mutation tool's presentation-safe Diff: timeline entries keep six lines, while only
-  `latest_change` may expose at most 80 ordered lines plus an honest completeness flag.
-  Runs created before M5.5 metadata are not automatically listed.
+  mutation tool's presentation-safe Diff: timeline entries keep six lines, while each bounded
+  `workspace_changes` ledger entry (and the legacy `latest_change` alias) may expose at most 80
+  ordered lines plus an honest completeness flag. Historical
+  status/timeline uses the latest resume segment, but its file-change ledger scans the complete
+  validated trace for that immutable `run-id`, retains the newest 100 mutations, and returns an exact
+  omitted count when older entries exceed the display bound. Runs created before M5.5 metadata are
+  not automatically listed.
+- Project-memory provenance in live/history state is limited to requested/applied/error state plus
+  bounded source run IDs, task labels, and timestamps. The rendered memory body is model-only host
+  context and never crosses the browser API. The default-on Web switch controls ambient project-memory
+  selection. An explicit completed-run follow-up always includes its named parent summary, even when
+  ambient memory is off, and fails closed if that dependency is unavailable. Terminal runs still save
+  an allowlisted, credential-redacted summary best-effort. Persistence failure cannot change the Agent
+  outcome.
+- Remembered text is explicitly untrusted historical data. Credential-like values and a forged
+  verification-policy marker are neutralized before injection, but pattern redaction is only defense
+  in depth. Historical `passed` facts never enter `VerificationLedger`, never authorize a command or
+  resume, and cannot satisfy the current run's Verification Gate; the Agent must reread current files
+  and run fresh registered verification.
+- The textual memory delimiter is not a security boundary: adversarial historical prose may still
+  influence a model. Hard command policy, workspace containment, revision checks and the fresh
+  Verification Gate therefore remain the enforcement layer. A future lower-role context channel can
+  reduce this residual indirect-prompt-injection surface without changing those hard controls.
 - Expandable activity details are an audit surface for the local workspace owner, not an opaque
   terminal summary. A `run_command` card shows the direct argv token vector, workspace-relative
   `cwd`, timeout, status, exit code, duration, and already-bounded combined stdout/stderr. Recognized
@@ -154,6 +182,15 @@ instead of misreporting an already-applied change as a normal failure.
   between tool calls; it saves a ready checkpoint rather than accepting late work. The host never
   force-kills a model or command call already in progress, and a forced kill, crash, or power loss can
   still interrupt persistence. The Web host does not claim crash-safe execution.
+- Web resume is a token/Origin-protected mutation with no browser-supplied root or runtime settings.
+  It requires the selected project and frozen workspace fingerprint to match, a
+  `READY_FOR_MODEL` checkpoint, a trace without a completed terminal segment, and the same per-run
+  lease used by the original worker. It keeps the original `run-id`; the UI calls this **恢复**.
+- A completed run can only be **继续** as a new run. The server validates the same project/workspace,
+  allocates a new `run-id`, stores the immutable parent's ID as `parent_run_id`, and never changes the
+  parent catalog record, trace, checkpoint, or transcript. Parent memory is untrusted orientation;
+  the child receives a fresh lease, transcript, budgets, and `VerificationLedger` and must verify its
+  own final revision.
 
 Loopback binding and request headers do not protect against an already-hostile process or user on
 the same machine. Do not port-forward, reverse-proxy, or otherwise expose this local session view.
@@ -229,9 +266,9 @@ directory must therefore be private and outside the workspace.
 
 Schema-v3 checkpoints carry an opaque digest of the resolved workspace path and filesystem identity,
 plus bounded RunMemory; schema-v2 payloads migrate conservatively on load.
-The CLI requires an explicit repository for resume and rejects a mismatch before constructing a
-model client. It also refuses a ready checkpoint when the latest trace says the run already
-completed. A new run preallocates its ID and holds a non-blocking OS file lease before constructing
+The CLI requires an explicit repository for resume; Web uses its server-held active project. Both
+reject a workspace mismatch before constructing a model client and refuse a ready checkpoint when
+the latest trace says the run already completed. A new run preallocates its ID and holds a non-blocking OS file lease before constructing
 the runtime; resume takes that same per-run lease. The original process and a same-ID resume therefore
 cannot execute concurrently.
 
@@ -241,6 +278,11 @@ decisions, provider-private state, and fresh verification evidence are not resto
 Resume is not an exactly-once transaction: if a process dies after a tool changes disk but before the
 ready checkpoint is replaced, the workspace may be newer than the transcript. Revision checks and
 fresh observation reduce that risk but cannot erase it.
+
+Resume and project memory are not interchangeable. **恢复** continues one nonterminal canonical
+transcript from a `READY_FOR_MODEL` boundary. **继续** creates a distinct child run with
+`parent_run_id`; the required parent `ProjectMemory` summary carries no transcript, budget, lease, or
+verification authority into that child, and the parent remains immutable.
 
 ## Trace and presentation boundary
 
