@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from coding_agent.run_catalog import (
+    MAX_MEMORY_SOURCE_RUNS,
     MAX_TASK_TITLE_LENGTH,
     RunCatalog,
     RunCatalogError,
@@ -52,6 +53,21 @@ def test_run_record_is_strict_bounded_single_line_and_timezone_aware() -> None:
         {"task_title": "line one\nline two"},
         {"task_title": "x" * 241},
         {"created_at": _NOW.replace(tzinfo=None)},
+        {"memory_source_run_ids": ("run-2",)},
+        {"memory_requested": True, "memory_source_run_ids": ("run-1",)},
+        {"memory_requested": True, "memory_source_run_ids": ("run-2", "run-2")},
+        {"parent_run_id": "run-1", "memory_source_run_ids": ("run-1",)},
+        {"parent_run_id": "run-2"},
+        {
+            "parent_run_id": "run-2",
+            "memory_source_run_ids": ("run-2", "run-3"),
+        },
+        {
+            "memory_requested": True,
+            "memory_source_run_ids": tuple(
+                f"source-{index}" for index in range(MAX_MEMORY_SOURCE_RUNS + 1)
+            ),
+        },
         {"surprise": True},
     ):
         with pytest.raises((ValidationError, ValueError)):
@@ -111,6 +127,66 @@ def test_create_get_list_and_project_filter_are_durable_and_sorted(tmp_path: Pat
     assert payload["run"]["workspace_fingerprint"] == _FP_ONE
     assert second.created_at > first.created_at
     assert third.created_at > second.created_at
+
+
+def test_run_catalog_persists_project_memory_provenance(tmp_path: Path) -> None:
+    catalog = RunCatalog(tmp_path / "runs", clock=lambda: _NOW)
+
+    record = catalog.create(
+        run_id="run-3",
+        project_id="p-one",
+        workspace_fingerprint=_FP_ONE,
+        task_title="继续完善项目",
+        memory_requested=True,
+        memory_source_run_ids=("run-1", "run-2"),
+    )
+
+    assert record.memory_requested is True
+    assert record.memory_source_run_ids == ("run-1", "run-2")
+    assert catalog.get(record.run_id) == record
+
+
+def test_run_catalog_persists_an_immutable_parent_as_a_required_memory_source(
+    tmp_path: Path,
+) -> None:
+    catalog = RunCatalog(tmp_path / "runs", clock=lambda: _NOW)
+
+    follow_up = catalog.create(
+        run_id="run-follow-up",
+        project_id="p-one",
+        workspace_fingerprint=_FP_ONE,
+        task_title="继续完善上次任务",
+        memory_requested=False,
+        parent_run_id="run-parent",
+        memory_source_run_ids=("run-parent",),
+    )
+
+    assert follow_up.parent_run_id == "run-parent"
+    assert follow_up.memory_requested is False
+    assert follow_up.memory_source_run_ids == ("run-parent",)
+    assert catalog.get(follow_up.run_id) == follow_up
+    with pytest.raises(RunCatalogError) as conflict:
+        catalog.save(
+            follow_up.model_copy(
+                update={
+                    "parent_run_id": "other-parent",
+                    "memory_source_run_ids": ("other-parent",),
+                }
+            )
+        )
+    assert conflict.value.code == "run_conflict"
+
+
+def test_requested_project_memory_may_follow_a_parent_and_add_other_sources() -> None:
+    record = _record(
+        run_id="follow-up",
+        memory_requested=True,
+        parent_run_id="parent",
+        memory_source_run_ids=("parent", "related"),
+    )
+
+    assert record.parent_run_id == "parent"
+    assert record.memory_source_run_ids == ("parent", "related")
 
 
 def test_create_normalizes_schema_failures_to_a_stable_catalog_error(tmp_path: Path) -> None:

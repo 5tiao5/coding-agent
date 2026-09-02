@@ -2,13 +2,18 @@ import {
   historyFinalFallback,
   translateMetadataLabel,
   translatePhase,
+  translateResumeReason,
   translateServerDetail,
   translateTimelineDetail,
   translateTimelineHeadline,
 } from "./locale-zh.js";
 import { createActivityCards } from "./_activity_cards.js";
-import { createWorkbench } from "./_workbench.js";
-import { diffPreviewView } from "./_diff_view.js";
+import { createWorkbench, projectMemoryContextView } from "./_workbench.js";
+import {
+  diffPreviewView,
+  workspaceChangeKey,
+  workspaceChangeLedgerView,
+} from "./_diff_view.js";
 import { appendFinalMarkdown } from "./_final_markdown.js";
 import { runtimeMetricView } from "./_metrics.js";
 
@@ -16,6 +21,7 @@ import { runtimeMetricView } from "./_metrics.js";
 
 const POLL_INTERVAL_MS = 250;
 const MAX_VISIBLE_TIMELINE = 12;
+const DEFAULT_TASK_PLACEHOLDER = "先选择项目，再描述一个明确的编程任务…";
 
 const elements = {
   activeToolList: document.querySelector("#active-tool-list"),
@@ -28,12 +34,17 @@ const elements = {
   evidenceList: document.querySelector("#evidence-list"),
   footerLabel: document.querySelector("#footer-label"),
   footerPulse: document.querySelector("#footer-pulse"),
+  followUpCancel: document.querySelector("#follow-up-cancel"),
+  followUpContext: document.querySelector("#follow-up-context"),
+  followUpRunLabel: document.querySelector("#follow-up-run-label"),
   form: document.querySelector("#run-form"),
   formMessage: document.querySelector("#form-message"),
   historyBadge: document.querySelector("#history-badge"),
   historyReturn: document.querySelector("#history-return"),
   historyTitle: document.querySelector("#history-title"),
   messageList: document.querySelector("#message-list"),
+  memoryOption: document.querySelector("#memory-option"),
+  memoryOptionDetail: document.querySelector("#memory-option-detail"),
   metricFailed: document.querySelector("#metric-failed"),
   metricBudget: document.querySelector("#metric-budget"),
   metricStep: document.querySelector("#metric-step"),
@@ -57,6 +68,14 @@ const elements = {
   projectList: document.querySelector("#project-list"),
   projectNameField: document.querySelector("#project-name-field"),
   projectNameInput: document.querySelector("#project-name-input"),
+  projectRemoveCancel: document.querySelector("#project-remove-cancel"),
+  projectRemoveClose: document.querySelector("#project-remove-close"),
+  projectRemoveDialog: document.querySelector("#project-remove-dialog"),
+  projectRemoveForm: document.querySelector("#project-remove-form"),
+  projectRemoveMessage: document.querySelector("#project-remove-message"),
+  projectRemoveName: document.querySelector("#project-remove-name"),
+  projectRemoveRoot: document.querySelector("#project-remove-root"),
+  projectRemoveSubmit: document.querySelector("#project-remove-submit"),
   projectRootBrowse: document.querySelector("#project-root-browse"),
   projectRootInput: document.querySelector("#project-root-input"),
   projectRootLabel: document.querySelector("#project-root-label"),
@@ -69,8 +88,10 @@ const elements = {
   runtimeLabel: document.querySelector("#runtime-label"),
   sessionHeading: document.querySelector("#session-heading"),
   taskInput: document.querySelector("#task-input"),
+  taskInputLabel: document.querySelector("#task-input-label"),
   toast: document.querySelector("#toast"),
   toastText: document.querySelector("#toast-text"),
+  useProjectMemory: document.querySelector("#use-project-memory"),
   verificationOrb: document.querySelector("#verification-orb"),
   verificationOutcome: document.querySelector("#verification-outcome"),
   verificationStatus: document.querySelector("#verification-status"),
@@ -179,18 +200,38 @@ function setConnection(connected) {
 
 function setFormState(status) {
   const running = status === "running";
+  const followUp = workbench?.followUpContext();
   const hasProject = appMetadata.controlToken
     ? workbench?.hasSelectedProject() === true
     : true;
   elements.taskInput.disabled = running || appMetadata.taskLocked || !hasProject;
+  elements.useProjectMemory.disabled = running || appMetadata.taskLocked || !hasProject;
   elements.runButton.disabled = running || !hasProject;
   elements.runButton.classList.toggle("is-running", running);
   elements.runButtonLabel.textContent = running
     ? "智能体运行中"
     : hasProject
-      ? "启动智能体"
+      ? followUp
+        ? "发送继续任务"
+        : "启动智能体"
       : "请先选择项目";
   workbench?.updateControls(status);
+}
+
+function renderFollowUpContext(context) {
+  const active = asObject(context);
+  const runId = asText(active.runId).trim();
+  const isActive = Boolean(runId);
+  elements.followUpContext.hidden = !isActive;
+  elements.followUpRunLabel.textContent = isActive ? `#${shortRunId(runId)}` : "";
+  elements.taskInputLabel.textContent = isActive ? "继续任务" : "新任务";
+  elements.taskInput.placeholder = isActive
+    ? "描述基于父任务的下一步要求；提交后会创建新的运行…"
+    : DEFAULT_TASK_PLACEHOLDER;
+  elements.memoryOptionDetail.textContent = isActive
+    ? "此开关控制其他相关历史；显式父任务摘要始终保留，测试与验证仍会重跑"
+    : "控制本轮读取；摘要仅存本机，测试与验证仍会重跑";
+  setFormState(normalizeRunStatus(asText(currentState?.status)));
 }
 
 function renderMetadata(rawMetadata) {
@@ -202,6 +243,7 @@ function renderMetadata(rawMetadata) {
     taskLocked: metadata.task_locked === true,
   };
   elements.projectBrowser.hidden = !appMetadata.controlToken;
+  elements.memoryOption.hidden = !appMetadata.controlToken;
   const project = workbench?.projectSummary();
   elements.workspaceName.textContent = project
     ? project.name
@@ -262,10 +304,89 @@ function makeMessageShell(kind, author) {
   return { body, heading, row };
 }
 
-function renderUserMessage(task) {
+function formatMemorySourceTime(value) {
+  const source = asText(value).trim();
+  if (!source) {
+    return "";
+  }
+  const date = new Date(source);
+  if (Number.isNaN(date.getTime())) {
+    return source;
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "2-digit",
+  }).format(date);
+}
+
+function renderMemoryContext(rawContext, status) {
+  const context = projectMemoryContextView(rawContext);
+  if (!context.visible) {
+    return null;
+  }
+  const card = createElement("details", "memory-context-card");
+  const count = context.sources.length;
+  const summaryText = context.parentOnly
+    ? `本轮继承了 ${count} 条父任务摘要`
+    : context.applied && count
+      ? `本轮引用了 ${count} 条项目记忆`
+      : context.error
+        ? "项目记忆本轮不可用"
+        : "本轮没有可引用的项目记忆";
+  card.append(createElement("summary", "", summaryText));
+  if (context.error) {
+    card.append(createElement("p", "memory-context-error", context.error));
+  }
+  if (!count) {
+    card.append(
+      createElement(
+        "p",
+        "memory-context-empty",
+        context.error
+          ? "本轮已安全降级为无历史上下文；Agent 任务本身仍可继续。"
+          : "未向模型注入其他任务内容；测试与验证始终以当前工作区为准。",
+      ),
+    );
+    return card;
+  }
+  const list = createElement("ul", "memory-source-list");
+  for (const source of context.sources) {
+    const item = createElement("li");
+    const button = createElement("button", "memory-source-button");
+    button.type = "button";
+    button.disabled = status === "running";
+    button.title = status === "running" ? "任务运行结束后可打开来源历史" : "打开来源任务的历史回放";
+    button.append(
+      createElement("span", "memory-source-copy", source.task || `历史任务 #${shortRunId(source.runId)}`),
+      createElement(
+        "span",
+        "memory-source-meta",
+        [formatMemorySourceTime(source.completedAt), `#${shortRunId(source.runId)}`]
+          .filter(Boolean)
+          .join(" · "),
+      ),
+    );
+    button.addEventListener("click", () => workbench?.showHistory(source.runId));
+    item.append(button);
+    list.append(item);
+  }
+  card.append(list);
+  return card;
+}
+
+function renderUserMessage(task, state, snapshot, status) {
   const message = makeMessageShell("user", "你");
   message.heading.append(createElement("span", "message-role", "任务"));
   message.body.append(createElement("p", "user-task", task));
+  const memoryContext = renderMemoryContext(
+    state.memory_context || state.project_memory || snapshot.memory_context || snapshot.project_memory,
+    status,
+  );
+  if (memoryContext) {
+    message.body.append(memoryContext);
+  }
   return message.row;
 }
 
@@ -298,13 +419,7 @@ function renderLatestChange(rawChange, runId) {
     return null;
   }
 
-  const changeKey = JSON.stringify([
-    asText(runId),
-    asNumber(change.step, -1),
-    asNumber(change.offset_seconds, -1),
-    asText(change.headline),
-    asText(change.detail),
-  ]);
+  const changeKey = workspaceChangeKey(change, runId);
   const initialView = diffPreviewView(change, expandedDiffKeys.has(changeKey));
 
   const card = createElement("section", "change-card");
@@ -315,7 +430,7 @@ function renderLatestChange(rawChange, runId) {
     createElement(
       "strong",
       "",
-      translateTimelineHeadline(asText(change.headline, "最近变更")),
+      translateTimelineHeadline(asText(change.headline, "工作区变更")),
     ),
   );
   const badges = createElement("div", "change-badges");
@@ -434,7 +549,7 @@ function renderConversation(state, snapshot, status) {
   const fragment = document.createDocumentFragment();
 
   if (task) {
-    fragment.append(renderUserMessage(task));
+    fragment.append(renderUserMessage(task, state, snapshot, status));
   }
 
   const agentMessage = makeMessageShell("agent", "Relay");
@@ -450,9 +565,17 @@ function renderConversation(state, snapshot, status) {
     activityStack.append(renderThinkingCard(snapshot));
   }
 
-  const latestChange = renderLatestChange(snapshot.latest_change, state.run_id);
-  if (latestChange) {
-    activityStack.append(latestChange);
+  const changeLedger = workspaceChangeLedgerView(snapshot);
+  for (const change of changeLedger.changes) {
+    const changeCard = renderLatestChange(change, state.run_id);
+    if (changeCard) {
+      activityStack.append(changeCard);
+    }
+  }
+  if (changeLedger.note) {
+    activityStack.append(
+      createElement("p", "change-ledger-note", changeLedger.note),
+    );
   }
   if (activityStack.childElementCount) {
     agentMessage.body.append(activityStack);
@@ -708,6 +831,7 @@ function showToast(message, tone = "error") {
 
 workbench = createWorkbench({
   elements,
+  formatResumeReason: translateResumeReason,
   formatServerDetail: translateServerDetail,
   getControlToken: () => appMetadata.controlToken,
   getNativeFolderPickerAvailable: () => appMetadata.nativeFolderPickerAvailable,
@@ -722,9 +846,22 @@ workbench = createWorkbench({
     taskInputDirty = false;
     activityCards.clear();
     expandedDiffKeys.clear();
+    elements.useProjectMemory.checked = true;
     if (!appMetadata.taskLocked) {
       elements.taskInput.value = "";
     }
+    renderFollowUpContext(null);
+  },
+  onFollowUpCleared() {
+    renderFollowUpContext(null);
+  },
+  onFollowUpPrepared(context) {
+    taskInputDirty = false;
+    if (!appMetadata.taskLocked) {
+      elements.taskInput.value = "";
+    }
+    renderFollowUpContext(context);
+    elements.taskInput.focus();
   },
   onHistoryState(state) {
     lastRenderSignature = "";
@@ -736,6 +873,17 @@ workbench = createWorkbench({
   },
   onReturnLive(state) {
     lastRenderSignature = "";
+    renderState(state);
+  },
+  onRunAccepted(state) {
+    liveState = state;
+    lastRenderSignature = "";
+    lastServerTask = "";
+    taskInputDirty = false;
+    if (!appMetadata.taskLocked) {
+      elements.taskInput.value = asText(state.task);
+    }
+    renderFollowUpContext(null);
     renderState(state);
   },
   showToast,
@@ -816,8 +964,16 @@ async function submitRun(event) {
   }
 
   try {
+    const payload = { task };
+    const followUp = workbench.followUpContext();
+    if (appMetadata.controlToken) {
+      payload.use_project_memory = elements.useProjectMemory.checked;
+      if (followUp?.runId) {
+        payload.parent_run_id = followUp.runId;
+      }
+    }
     const response = await fetch("/api/runs", {
-      body: JSON.stringify({ task }),
+      body: JSON.stringify(payload),
       headers: mutationHeaders(),
       method: "POST",
     });
@@ -856,6 +1012,10 @@ elements.form.addEventListener("submit", submitRun);
 elements.taskInput.addEventListener("input", () => {
   taskInputDirty = true;
   elements.formMessage.textContent = "";
+});
+elements.followUpCancel.addEventListener("click", () => {
+  workbench.cancelFollowUp();
+  elements.taskInput.focus();
 });
 elements.taskInput.addEventListener("keydown", (event) => {
   const modifier = event.metaKey || event.ctrlKey;

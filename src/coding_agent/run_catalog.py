@@ -10,7 +10,14 @@ from threading import Lock
 from typing import Literal
 from unicodedata import category
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from coding_agent.errors import CodedError
 from coding_agent.run_id import require_run_id
@@ -26,6 +33,7 @@ RUN_RECORD_SCHEMA_VERSION = 1
 DEFAULT_MAX_RUN_RECORD_BYTES = 32 * 1024
 DEFAULT_MAX_RUN_RECORDS = 10_000
 MAX_TASK_TITLE_LENGTH = 240
+MAX_MEMORY_SOURCE_RUNS = 6
 _MIN_DIRECTORY_SCAN_LIMIT = 1_000
 _CATALOG_WRITE_LOCK = Lock()
 
@@ -44,6 +52,12 @@ class RunRecord(BaseModel):
     workspace_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_title: str = Field(min_length=1, max_length=MAX_TASK_TITLE_LENGTH)
     created_at: datetime
+    memory_requested: bool = False
+    parent_run_id: str | None = Field(default=None, min_length=1, max_length=64)
+    memory_source_run_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_MEMORY_SOURCE_RUNS,
+    )
 
     @field_validator("run_id", "project_id")
     @classmethod
@@ -66,6 +80,39 @@ class RunRecord(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
         return value.astimezone(UTC)
+
+    @field_validator("parent_run_id")
+    @classmethod
+    def validate_parent_run_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            require_run_id(value)
+        return value
+
+    @field_validator("memory_source_run_ids")
+    @classmethod
+    def validate_memory_source_run_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for run_id in value:
+            require_run_id(run_id)
+        if len(set(value)) != len(value):
+            raise ValueError("memory source run IDs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_memory_provenance(self) -> RunRecord:
+        if self.run_id in self.memory_source_run_ids:
+            raise ValueError("a run cannot use itself as a project-memory source")
+        if self.parent_run_id == self.run_id:
+            raise ValueError("a run cannot be its own parent")
+        if self.parent_run_id is not None and self.parent_run_id not in self.memory_source_run_ids:
+            raise ValueError("a parent run must be recorded as a project-memory source")
+        if self.memory_source_run_ids and not self.memory_requested:
+            expected = (self.parent_run_id,) if self.parent_run_id is not None else ()
+            if self.memory_source_run_ids != expected:
+                raise ValueError(
+                    "memory sources require an explicit memory request unless they contain "
+                    "only the parent run"
+                )
+        return self
 
 
 class _RunRecordDocument(BaseModel):
@@ -114,6 +161,9 @@ class RunCatalog:
         project_id: str,
         workspace_fingerprint: str,
         task_title: str,
+        memory_requested: bool = False,
+        parent_run_id: str | None = None,
+        memory_source_run_ids: tuple[str, ...] = (),
     ) -> RunRecord:
         """Construct and save one record using the catalog's timezone-aware clock."""
 
@@ -124,6 +174,9 @@ class RunCatalog:
                 workspace_fingerprint=workspace_fingerprint,
                 task_title=task_title,
                 created_at=_require_aware_timestamp(self._clock()),
+                memory_requested=memory_requested,
+                parent_run_id=parent_run_id,
+                memory_source_run_ids=memory_source_run_ids,
             )
         except (ValidationError, TypeError, ValueError) as exc:
             raise RunCatalogError(

@@ -53,6 +53,7 @@ class ProjectRecord(BaseModel):
     workspace_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: datetime
     last_opened_at: datetime
+    removed_at: datetime | None = None
 
     @field_validator("project_id")
     @classmethod
@@ -79,10 +80,21 @@ class ProjectRecord(BaseModel):
             raise ValueError("project timestamps must be timezone-aware")
         return value.astimezone(UTC)
 
+    @field_validator("removed_at")
+    @classmethod
+    def validate_optional_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("project timestamps must be timezone-aware")
+        return value.astimezone(UTC)
+
     @model_validator(mode="after")
     def validate_timestamp_order(self) -> Self:
         if self.last_opened_at < self.created_at:
             raise ValueError("last_opened_at cannot precede created_at")
+        if self.removed_at is not None and self.removed_at < self.last_opened_at:
+            raise ValueError("removed_at cannot precede last_opened_at")
         return self
 
 
@@ -140,6 +152,7 @@ class ProjectRegistry:
                 workspace_fingerprint=fingerprint,
                 created_at=existing.created_at,
                 last_opened_at=max(existing.last_opened_at, now),
+                removed_at=None,
             )
             projects[existing_index] = reopened
             self._save_projects(projects)
@@ -211,7 +224,7 @@ class ProjectRegistry:
 
         _require_project_id(project_id)
         for project in self._load_document().projects:
-            if project.project_id == project_id:
+            if project.project_id == project_id and project.removed_at is None:
                 return project
         raise ProjectRegistryError("project_not_found", "project is not registered")
 
@@ -219,11 +232,11 @@ class ProjectRegistry:
         """Refresh one project's recency while preserving its stable identity."""
 
         _require_project_id(project_id)
-        now = _require_aware_timestamp(self._clock())
         projects = list(self._load_document().projects)
         for index, project in enumerate(projects):
-            if project.project_id != project_id:
+            if project.project_id != project_id or project.removed_at is not None:
                 continue
+            now = _require_aware_timestamp(self._clock())
             reopened = ProjectRecord(
                 project_id=project.project_id,
                 display_name=project.display_name,
@@ -231,18 +244,46 @@ class ProjectRegistry:
                 workspace_fingerprint=project.workspace_fingerprint,
                 created_at=project.created_at,
                 last_opened_at=max(project.last_opened_at, now),
+                removed_at=None,
             )
             projects[index] = reopened
             self._save_projects(projects)
             return reopened
         raise ProjectRegistryError("project_not_found", "project is not registered")
 
+    def remove(self, project_id: str) -> ProjectRecord:
+        """Hide one project registration without deleting its workspace or history."""
+
+        _require_project_id(project_id)
+        projects = list(self._load_document().projects)
+        for index, project in enumerate(projects):
+            if project.project_id != project_id or project.removed_at is not None:
+                continue
+            now = _require_aware_timestamp(self._clock())
+            removed = ProjectRecord(
+                project_id=project.project_id,
+                display_name=project.display_name,
+                resolved_root=project.resolved_root,
+                workspace_fingerprint=project.workspace_fingerprint,
+                created_at=project.created_at,
+                last_opened_at=project.last_opened_at,
+                removed_at=max(project.last_opened_at, now),
+            )
+            projects[index] = removed
+            self._save_projects(projects)
+            return removed
+        raise ProjectRegistryError("project_not_found", "project is not registered")
+
     def list(self) -> tuple[ProjectRecord, ...]:
-        """List projects in most-recently-opened order."""
+        """List visible projects in most-recently-opened order."""
 
         return tuple(
             sorted(
-                self._load_document().projects,
+                (
+                    project
+                    for project in self._load_document().projects
+                    if project.removed_at is None
+                ),
                 key=lambda project: (project.last_opened_at, project.project_id),
                 reverse=True,
             )

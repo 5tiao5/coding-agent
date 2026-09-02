@@ -594,6 +594,17 @@
   text-transform: uppercase;
 }
 
+.change-ledger-note {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(180, 120, 12, 0.24);
+  border-radius: 10px;
+  background: rgba(255, 248, 230, 0.88);
+  color: #8a5b08;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .change-badges {
   display: flex;
   flex-wrap: wrap;
@@ -724,6 +735,99 @@
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 9px;
   white-space: pre-wrap;
+}
+
+.memory-context-card {
+  margin-top: 8px;
+  border: 1px solid rgba(8, 127, 156, 0.2);
+  border-radius: 10px;
+  background: rgba(236, 249, 251, 0.72);
+  color: var(--text-soft);
+}
+
+.memory-context-card > summary {
+  display: flex;
+  min-height: 34px;
+  padding: 0 11px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.memory-context-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.memory-context-card > summary::after {
+  color: var(--cyan);
+  content: "展开";
+  font-size: 8px;
+  font-weight: 650;
+}
+
+.memory-context-card[open] > summary::after {
+  content: "收起";
+}
+
+.memory-context-empty {
+  margin: 0;
+  padding: 0 11px 10px;
+  color: var(--muted-dark);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.memory-source-list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0 8px 8px;
+  list-style: none;
+}
+
+.memory-source-button {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid rgba(8, 127, 156, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.memory-source-button:hover:not(:disabled) {
+  border-color: rgba(8, 127, 156, 0.34);
+  background: #ffffff;
+}
+
+.memory-source-button:disabled {
+  cursor: default;
+}
+
+.memory-source-copy,
+.memory-source-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-source-copy {
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.memory-source-meta {
+  color: var(--muted-dark);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 8px;
 }
 
 .activity-fact-pre {

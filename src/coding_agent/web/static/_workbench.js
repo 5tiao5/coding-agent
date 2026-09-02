@@ -35,6 +35,93 @@ function createElement(tagName, className, text) {
   return element;
 }
 
+function boundedText(value, limit) {
+  return asText(value).trim().slice(0, limit);
+}
+
+export function resumeControlView(rawRun) {
+  const run = asObject(rawRun);
+  const known = typeof run.resume_available === "boolean";
+  return {
+    available: known && run.resume_available === true,
+    known,
+    reason: boundedText(run.resume_reason, 240),
+  };
+}
+
+export function continuationControlView(rawRun) {
+  const run = asObject(rawRun);
+  const continuation = asObject(run.continuation);
+  const kind = boundedText(continuation.kind, 20);
+  if (["resume", "follow_up", "none"].includes(kind)) {
+    return {
+      available: continuation.available === true,
+      kind,
+      known: typeof continuation.available === "boolean",
+      reason: boundedText(continuation.reason, 240),
+    };
+  }
+  const legacy = resumeControlView(run);
+  return {
+    available: legacy.available,
+    kind: legacy.available ? "resume" : "none",
+    known: legacy.known,
+    reason: legacy.reason,
+  };
+}
+
+export function normalizeProjectMemoryContext(rawContext) {
+  const context = asObject(rawContext);
+  const known = Object.keys(context).length > 0;
+  const sourceById = new Map();
+  const rawSources = asArray(context.sources);
+  for (const rawSource of rawSources.slice(0, 8)) {
+    const source = asObject(rawSource);
+    const runId = boundedText(source.run_id || source.source_run_id, 64);
+    if (!runId || sourceById.has(runId)) {
+      continue;
+    }
+    sourceById.set(runId, {
+      completedAt: boundedText(source.completed_at || source.created_at, 80),
+      runId,
+      task: boundedText(source.task || source.task_goal || source.title, 180),
+    });
+  }
+  for (const rawRunId of asArray(context.source_run_ids).slice(0, 8)) {
+    const runId = boundedText(rawRunId, 64);
+    if (runId && !sourceById.has(runId)) {
+      sourceById.set(runId, { completedAt: "", runId, task: "" });
+    }
+  }
+  const sources = [...sourceById.values()].slice(0, 8);
+  const requested =
+    context.requested === true ||
+    context.enabled === true ||
+    (known && context.requested !== false && context.enabled !== false);
+  const applied = context.applied === true || context.used === true || sources.length > 0;
+  const contextChars = Number.isInteger(context.context_chars)
+    ? Math.max(0, context.context_chars)
+    : null;
+  const error = boundedText(context.error, 240);
+  return { applied, contextChars, error, known, requested, sources };
+}
+
+export function projectMemoryContextView(rawContext) {
+  const context = normalizeProjectMemoryContext(rawContext);
+  const parentOnly =
+    context.known &&
+    context.requested === false &&
+    context.applied === true &&
+    context.sources.length > 0;
+  return {
+    ...context,
+    parentOnly,
+    visible:
+      context.known &&
+      (context.requested || context.applied || context.sources.length > 0 || Boolean(context.error)),
+  };
+}
+
 function normalizeStatus(value) {
   return Object.hasOwn(RUN_LABELS, value) ? value : "idle";
 }
@@ -103,14 +190,18 @@ function joinProjectRoot(parent, name) {
 
 export function createWorkbench({
   elements,
+  formatResumeReason,
   formatServerDetail,
   getControlToken,
   getNativeFolderPickerAvailable,
   onBeforeProjectChanged,
   onBusyStateChanged,
+  onFollowUpCleared,
+  onFollowUpPrepared,
   onHistoryState,
   onProjectChanged,
   onReturnLive,
+  onRunAccepted,
   showToast,
 }) {
   let projects = [];
@@ -118,12 +209,17 @@ export function createWorkbench({
   let selectedProjectId = "";
   let projectRunActive = false;
   let viewingHistoryRunId = "";
+  let pendingFollowUp = null;
   let dialogMode = "open";
   let dialogReturnFocus = null;
   let dialogSubmissionActive = false;
   let liveState = null;
   let nativeFolderPickerDisabled = false;
   let nativePickerActive = false;
+  let pendingProjectRemoval = null;
+  let projectRemovalReturnFocus = null;
+  let restoreProjectRemovalTriggerFocus = true;
+  let projectRemovalSubmitting = false;
 
   function selectedProject() {
     return projects.find((project) => itemProjectId(project) === selectedProjectId) || null;
@@ -193,6 +289,35 @@ export function createWorkbench({
     return response.status === 204 ? {} : asObject(await response.json());
   }
 
+  async function deleteJson(url) {
+    const response = await fetch(url, {
+      headers: mutationHeaders(),
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(await responseDetail(response, `移除请求失败（HTTP ${response.status}）`));
+    }
+    return response.status === 204 ? {} : asObject(await response.json());
+  }
+
+  async function projectListingState(projectId) {
+    try {
+      const response = await fetch("/api/projects", {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const body = asObject(await response.json());
+      return asArray(body.projects).some(
+        (project) => itemProjectId(asObject(project)) === projectId,
+      );
+    } catch {
+      return null;
+    }
+  }
+
   async function requestNativeFolder() {
     if (!nativeFolderPickerAvailable()) {
       throw pickerError("系统文件夹选择器当前不可用。");
@@ -232,7 +357,9 @@ export function createWorkbench({
   function updateControls(status = normalizeStatus(asText(liveState?.status))) {
     const running = normalizeStatus(status) === "running" || projectRunActive;
     const dialogBusy = nativePickerActive || dialogSubmissionActive;
-    const navigationLocked = running || dialogBusy;
+    const removalDialogOpen = elements.projectRemoveDialog.open;
+    const navigationLocked =
+      running || dialogBusy || projectRemovalSubmitting || removalDialogOpen;
     elements.openProjectButton.disabled = navigationLocked;
     elements.newProjectButton.disabled = navigationLocked;
     elements.projectRootBrowse.disabled = navigationLocked;
@@ -242,20 +369,45 @@ export function createWorkbench({
     elements.projectDialogSubmit.disabled = running || dialogBusy;
     elements.projectDialog.setAttribute("aria-busy", String(dialogBusy));
     elements.projectDialogForm.setAttribute("aria-busy", String(dialogBusy));
-    elements.projectBrowser.setAttribute("aria-busy", String(dialogBusy));
+    elements.projectRemoveCancel.disabled = projectRemovalSubmitting;
+    elements.projectRemoveClose.disabled = projectRemovalSubmitting;
+    elements.projectRemoveSubmit.disabled = projectRemovalSubmitting;
+    elements.projectRemoveDialog.setAttribute(
+      "aria-busy",
+      String(projectRemovalSubmitting),
+    );
+    elements.projectRemoveForm.setAttribute(
+      "aria-busy",
+      String(projectRemovalSubmitting),
+    );
+    elements.projectBrowser.setAttribute(
+      "aria-busy",
+      String(dialogBusy || projectRemovalSubmitting),
+    );
     elements.openProjectButton.setAttribute("aria-busy", String(dialogBusy));
-    if (dialogBusy) {
+    if (dialogBusy || projectRemovalSubmitting || removalDialogOpen) {
       elements.taskInput.disabled = true;
       elements.runButton.disabled = true;
+      if (elements.useProjectMemory) {
+        elements.useProjectMemory.disabled = true;
+      }
     }
-    for (const button of document.querySelectorAll(".project-item, .history-item")) {
-      button.disabled = navigationLocked;
+    for (const button of document.querySelectorAll(
+      ".project-item, .project-remove, .history-item-main, .history-resume",
+    )) {
+      const permanentlyDisabled = button.dataset.continuationAvailable === "false";
+      button.disabled = navigationLocked || permanentlyDisabled;
     }
   }
 
   function refreshBusyState() {
     updateControls();
-    onBusyStateChanged?.(nativePickerActive || dialogSubmissionActive);
+    onBusyStateChanged?.(
+      nativePickerActive ||
+        dialogSubmissionActive ||
+        projectRemovalSubmitting ||
+        elements.projectRemoveDialog.open,
+    );
   }
 
   function setNativePickerActive(active) {
@@ -268,6 +420,11 @@ export function createWorkbench({
     refreshBusyState();
   }
 
+  function setProjectRemovalSubmitting(active) {
+    projectRemovalSubmitting = active;
+    refreshBusyState();
+  }
+
   function focusAfterDialogClose() {
     const target = dialogReturnFocus;
     dialogReturnFocus = null;
@@ -276,6 +433,35 @@ export function createWorkbench({
     }
     window.requestAnimationFrame(() => {
       if (target.isConnected && !target.disabled && !target.hidden) {
+        target.focus();
+      }
+    });
+  }
+
+  function focusAfterProjectRemovalClose() {
+    const target = restoreProjectRemovalTriggerFocus ? projectRemovalReturnFocus : null;
+    projectRemovalReturnFocus = null;
+    restoreProjectRemovalTriggerFocus = true;
+    pendingProjectRemoval = null;
+    elements.projectRemoveMessage.textContent = "";
+    refreshBusyState();
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      if (target.isConnected && !target.disabled && !target.hidden) {
+        target.focus();
+      }
+    });
+  }
+
+  function focusProjectNavigation() {
+    window.requestAnimationFrame(() => {
+      const selectedButton = Array.from(document.querySelectorAll(".project-item")).find(
+        (button) => button.dataset.projectId === selectedProjectId,
+      );
+      const target = selectedButton || elements.openProjectButton;
+      if (target instanceof HTMLElement && target.isConnected && !target.disabled) {
         target.focus();
       }
     });
@@ -293,9 +479,14 @@ export function createWorkbench({
         if (!id) {
           continue;
         }
+        const row = createElement("div", "project-item-row");
         const button = createElement("button", "project-item");
         button.type = "button";
+        button.dataset.projectId = id;
         button.classList.toggle("is-selected", id === selectedProjectId);
+        if (id === selectedProjectId) {
+          button.setAttribute("aria-current", "true");
+        }
         button.disabled = projectRunActive;
         const glyph = createElement("span", "project-item-glyph");
         glyph.setAttribute("aria-hidden", "true");
@@ -306,7 +497,16 @@ export function createWorkbench({
         );
         button.append(glyph, copy);
         button.addEventListener("click", () => selectProjectById(id));
-        fragment.append(button);
+        const removeButton = createElement("button", "project-remove", "移除");
+        removeButton.type = "button";
+        removeButton.disabled = projectRunActive;
+        removeButton.title = `从 Relay 列表移除 ${itemProjectName(project)}`;
+        removeButton.setAttribute("aria-label", removeButton.title);
+        removeButton.addEventListener("click", () =>
+          openProjectRemovalDialog(project, removeButton),
+        );
+        row.append(button, removeButton);
+        fragment.append(row);
       }
       elements.projectList.replaceChildren(
         fragment.childNodes.length
@@ -343,10 +543,12 @@ export function createWorkbench({
         continue;
       }
       const status = normalizeStatus(asText(run.status));
-      const button = createElement("button", "history-item");
+      const item = createElement("div", "history-item");
+      item.classList.toggle("is-selected", id === viewingHistoryRunId);
+      const button = createElement("button", "history-item-main");
       button.type = "button";
-      button.classList.toggle("is-selected", id === viewingHistoryRunId);
       button.disabled = projectRunActive;
+      button.setAttribute("aria-label", `回放任务：${asText(run.task).trim() || shortRunId(id)}`);
       const dot = createElement("span", `history-status-dot status-${status}`);
       dot.setAttribute("aria-hidden", "true");
       const copy = createElement("span", "history-item-copy");
@@ -364,7 +566,38 @@ export function createWorkbench({
       );
       button.append(dot, copy);
       button.addEventListener("click", () => showHistory(id));
-      fragment.append(button);
+      item.append(button);
+
+      const continuation = continuationControlView(run);
+      if (continuation.known) {
+        const actionLabel = continuation.kind === "resume" ? "恢复" : "继续";
+        const resumeButton = createElement("button", "history-resume", actionLabel);
+        resumeButton.type = "button";
+        resumeButton.dataset.continuationAvailable = String(continuation.available);
+        resumeButton.disabled = projectRunActive || !continuation.available;
+        resumeButton.setAttribute(
+          "aria-label",
+          continuation.available
+            ? `${actionLabel}任务：${asText(run.task).trim() || shortRunId(id)}`
+            : "该任务不可继续",
+        );
+        resumeButton.title = continuation.available
+          ? continuation.kind === "resume"
+            ? "从已保存的检查点恢复；已完成的工具不会重放"
+            : "输入新的要求后创建一轮任务；父任务摘要会作为历史上下文"
+          : formatResumeReason?.(continuation.reason) ||
+            continuation.reason ||
+            "该任务当前不能继续";
+        resumeButton.addEventListener("click", () => {
+          if (continuation.kind === "resume") {
+            void resumeRun(id);
+          } else if (continuation.kind === "follow_up") {
+            prepareFollowUp(id);
+          }
+        });
+        item.append(resumeButton);
+      }
+      fragment.append(item);
     }
     elements.runHistoryList.replaceChildren(
       fragment.childNodes.length
@@ -420,6 +653,7 @@ export function createWorkbench({
       if (loadRuns) {
         await fetchProjectRuns();
       }
+      return true;
     } catch (error) {
       projects = [];
       selectedProjectId = "";
@@ -427,6 +661,7 @@ export function createWorkbench({
       renderProjects();
       renderRunHistory();
       showToast(error instanceof Error ? error.message : "无法加载本地项目。");
+      return false;
     }
   }
 
@@ -439,6 +674,7 @@ export function createWorkbench({
       return;
     }
     if (id === selectedProjectId) {
+      clearFollowUp();
       returnToCurrent();
       return;
     }
@@ -447,6 +683,7 @@ export function createWorkbench({
       await postJson(`/api/projects/${encodeURIComponent(id)}/select`, {});
       selectedProjectId = id;
       viewingHistoryRunId = "";
+      clearFollowUp();
       liveState = null;
       onBeforeProjectChanged();
       await fetchProjects();
@@ -457,11 +694,101 @@ export function createWorkbench({
     }
   }
 
+  function openProjectRemovalDialog(project, returnFocus) {
+    if (projectChangeBlocked()) {
+      showToast("任务运行期间不能移除项目。", "warning");
+      return;
+    }
+    const id = itemProjectId(project);
+    if (!id || elements.projectRemoveDialog.open) {
+      return;
+    }
+    pendingProjectRemoval = {
+      id,
+      name: itemProjectName(project),
+      root: itemProjectRoot(project),
+    };
+    projectRemovalReturnFocus = returnFocus;
+    restoreProjectRemovalTriggerFocus = true;
+    elements.projectRemoveName.textContent = pendingProjectRemoval.name;
+    elements.projectRemoveRoot.textContent = pendingProjectRemoval.root || "本地目录";
+    elements.projectRemoveMessage.textContent = "";
+    elements.projectRemoveDialog.showModal();
+    refreshBusyState();
+    window.requestAnimationFrame(() => elements.projectRemoveCancel.focus());
+  }
+
+  async function submitProjectRemoval(event) {
+    event.preventDefault();
+    if (projectRemovalSubmitting || pendingProjectRemoval === null) {
+      return;
+    }
+    const target = { ...pendingProjectRemoval };
+    const removingSelectedProject = target.id === selectedProjectId;
+    let removalCommitted = false;
+    elements.projectRemoveMessage.textContent = "";
+    setProjectRemovalSubmitting(true);
+    try {
+      let result;
+      try {
+        result = await deleteJson(`/api/projects/${encodeURIComponent(target.id)}`);
+      } catch (error) {
+        const stillListed = await projectListingState(target.id);
+        if (stillListed !== false) {
+          throw error;
+        }
+        result = { workspace_deleted: false };
+      }
+      if (result.workspace_deleted !== false) {
+        throw new Error("服务端没有确认本地目录保持不变，界面拒绝静默完成。");
+      }
+      removalCommitted = true;
+      restoreProjectRemovalTriggerFocus = false;
+      elements.projectRemoveDialog.close();
+      if (removingSelectedProject) {
+        selectedProjectId = "";
+        projectRuns = [];
+        viewingHistoryRunId = "";
+        clearFollowUp();
+        liveState = null;
+        renderHistoryMode();
+        onBeforeProjectChanged();
+      }
+      const refreshed = await fetchProjects();
+      if (removingSelectedProject) {
+        await onProjectChanged();
+      }
+      showToast(
+        refreshed
+          ? `已从列表移除 ${target.name}；本地目录未删除。`
+          : `已移除 ${target.name}，但项目列表刷新失败；本地目录未删除。`,
+        refreshed ? "success" : "warning",
+      );
+    } catch (error) {
+      if (removalCommitted) {
+        showToast(
+          `已移除 ${target.name}，但部分界面未刷新；请重新加载页面。本地目录未删除。`,
+          "warning",
+        );
+      } else {
+        const message = error instanceof Error ? error.message : "无法移除这个项目。";
+        elements.projectRemoveMessage.textContent = message;
+        showToast(message, "warning");
+      }
+    } finally {
+      setProjectRemovalSubmitting(false);
+      if (removalCommitted) {
+        focusProjectNavigation();
+      }
+    }
+  }
+
   async function showHistory(id) {
     if (!id || projectRunActive) {
       return;
     }
     try {
+      clearFollowUp();
       const response = await fetch(`/api/history/${encodeURIComponent(id)}`, {
         cache: "no-store",
         headers: { Accept: "application/json" },
@@ -472,7 +799,13 @@ export function createWorkbench({
       const body = asObject(await response.json());
       const run = asObject(body.run);
       const historyState = Object.keys(run).length
-        ? { ...run, run_id: itemRunId(run) || id, snapshot: asObject(body.snapshot) }
+        ? {
+            ...run,
+            memory_context: body.memory_context || run.memory_context,
+            project_memory: body.project_memory || run.project_memory,
+            run_id: itemRunId(run) || id,
+            snapshot: asObject(body.snapshot),
+          }
         : body;
       viewingHistoryRunId = id;
       renderHistoryMode();
@@ -481,6 +814,62 @@ export function createWorkbench({
     } catch (error) {
       showToast(error instanceof Error ? error.message : "无法回放这次运行。");
     }
+  }
+
+  async function resumeRun(id) {
+    if (!id || projectRunActive || normalizeStatus(asText(liveState?.status)) === "running") {
+      showToast("已有任务正在运行，暂时不能继续历史任务。", "warning");
+      return;
+    }
+    try {
+      const acceptedState = await postJson(
+        `/api/runs/${encodeURIComponent(id)}/resume`,
+        {},
+        [202],
+      );
+      viewingHistoryRunId = "";
+      liveState = acceptedState;
+      projectRunActive = true;
+      renderHistoryMode();
+      renderRunHistory();
+      updateControls("running");
+      onRunAccepted?.(acceptedState);
+      showToast("已从检查点继续；Relay 会重新验证当前工作区。", "success");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "无法继续这次任务。");
+      await fetchProjectRuns();
+    }
+  }
+
+  function prepareFollowUp(id) {
+    if (!id || projectRunActive || normalizeStatus(asText(liveState?.status)) === "running") {
+      showToast("已有任务正在运行，暂时不能继续历史任务。", "warning");
+      return;
+    }
+    const run = projectRuns.find((candidate) => itemRunId(candidate) === id);
+    const continuation = continuationControlView(run);
+    if (!run || continuation.kind !== "follow_up" || !continuation.available) {
+      showToast(continuation.reason || "该历史任务当前不能继续。", "warning");
+      return;
+    }
+    pendingFollowUp = {
+      runId: id,
+      task: boundedText(run.task || run.title, 240),
+    };
+    viewingHistoryRunId = "";
+    renderHistoryMode();
+    renderRunHistory();
+    onReturnLive(liveState || {});
+    onFollowUpPrepared?.({ ...pendingFollowUp });
+    updateControls();
+  }
+
+  function clearFollowUp() {
+    if (pendingFollowUp === null) {
+      return;
+    }
+    pendingFollowUp = null;
+    onFollowUpCleared?.();
   }
 
   function returnToCurrent() {
@@ -512,6 +901,7 @@ export function createWorkbench({
       await selectProjectById(itemProjectId(registered));
     } else {
       if (selectedProjectId !== previousProjectId) {
+        clearFollowUp();
         liveState = null;
         onBeforeProjectChanged();
       }
@@ -692,6 +1082,7 @@ export function createWorkbench({
   elements.projectRootBrowse.addEventListener("click", browseProjectParent);
   elements.historyReturn.addEventListener("click", returnToCurrent);
   elements.projectDialogForm.addEventListener("submit", submitProjectDialog);
+  elements.projectRemoveForm.addEventListener("submit", submitProjectRemoval);
   elements.projectDialogCancel.addEventListener("click", () => {
     if (!nativePickerActive && !dialogSubmissionActive) {
       elements.projectDialog.close();
@@ -708,6 +1099,22 @@ export function createWorkbench({
     }
   });
   elements.projectDialog.addEventListener("close", focusAfterDialogClose);
+  elements.projectRemoveCancel.addEventListener("click", () => {
+    if (!projectRemovalSubmitting) {
+      elements.projectRemoveDialog.close();
+    }
+  });
+  elements.projectRemoveClose.addEventListener("click", () => {
+    if (!projectRemovalSubmitting) {
+      elements.projectRemoveDialog.close();
+    }
+  });
+  elements.projectRemoveDialog.addEventListener("cancel", (event) => {
+    if (projectRemovalSubmitting) {
+      event.preventDefault();
+    }
+  });
+  elements.projectRemoveDialog.addEventListener("close", focusAfterProjectRemovalClose);
 
   renderHistoryMode();
 
@@ -716,6 +1123,7 @@ export function createWorkbench({
       liveState = asObject(state);
       projectRunActive = true;
       viewingHistoryRunId = "";
+      clearFollowUp();
       renderHistoryMode();
       updateControls("running");
     },
@@ -726,7 +1134,12 @@ export function createWorkbench({
     isReplaying() {
       return Boolean(viewingHistoryRunId);
     },
+    cancelFollowUp: clearFollowUp,
+    followUpContext() {
+      return pendingFollowUp === null ? null : { ...pendingFollowUp };
+    },
     projectSummary,
+    showHistory,
     returnToCurrent,
     syncLiveState(state) {
       const previousStatus = normalizeStatus(asText(liveState?.status));

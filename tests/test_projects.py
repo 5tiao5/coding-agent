@@ -43,6 +43,8 @@ def test_project_record_is_strict_bounded_and_timezone_aware(tmp_path: Path) -> 
         {"workspace_fingerprint": "short"},
         {"created_at": _NOW.replace(tzinfo=None)},
         {"last_opened_at": _NOW - timedelta(seconds=1)},
+        {"removed_at": _NOW.replace(tzinfo=None)},
+        {"removed_at": _NOW - timedelta(seconds=1)},
     ):
         with pytest.raises((ValidationError, ValueError)):
             ProjectRecord.model_validate({**valid, **changes})
@@ -78,6 +80,23 @@ def test_register_round_trips_deduplicates_and_orders_by_recency(tmp_path: Path)
     assert len(payload["projects"]) == 2
 
 
+def test_registry_loads_legacy_v1_records_without_removal_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    projects_file = tmp_path / "state" / "projects.json"
+    registry = ProjectRegistry(projects_file, clock=lambda: _NOW)
+    original = registry.register(root)
+    payload = json.loads(projects_file.read_text(encoding="utf-8"))
+    payload["projects"][0].pop("removed_at")
+    projects_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = registry.list()
+
+    assert len(loaded) == 1
+    assert loaded[0].project_id == original.project_id
+    assert loaded[0].removed_at is None
+
+
 def test_mark_opened_updates_only_recency_and_rejects_unknown_ids(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -97,6 +116,48 @@ def test_mark_opened_updates_only_recency_and_rejects_unknown_ids(tmp_path: Path
     with pytest.raises(ProjectRegistryError) as invalid:
         registry.mark_opened("../bad")
     assert invalid.value.code == "invalid_project_id"
+
+
+def test_remove_hides_project_without_deleting_workspace_and_reopen_restores_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    sentinel = root / "keep.txt"
+    sentinel.write_text("workspace data", encoding="utf-8")
+    registry = ProjectRegistry(
+        tmp_path / "state" / "projects.json",
+        clock=_clock(
+            _NOW,
+            _NOW + timedelta(minutes=1),
+            _NOW + timedelta(minutes=2),
+        ),
+    )
+    original = registry.register(root, "保留名称")
+
+    removed = registry.remove(original.project_id)
+
+    assert removed.removed_at == _NOW + timedelta(minutes=1)
+    assert registry.list() == ()
+    assert sentinel.read_text(encoding="utf-8") == "workspace data"
+    with pytest.raises(ProjectRegistryError) as hidden:
+        registry.get(original.project_id)
+    assert hidden.value.code == "project_not_found"
+    with pytest.raises(ProjectRegistryError) as hidden_open:
+        registry.mark_opened(original.project_id)
+    assert hidden_open.value.code == "project_not_found"
+    with pytest.raises(ProjectRegistryError) as already_removed:
+        registry.remove(original.project_id)
+    assert already_removed.value.code == "project_not_found"
+
+    reopened = registry.register(root, "不会覆盖已有名称")
+
+    assert reopened.project_id == original.project_id
+    assert reopened.display_name == "保留名称"
+    assert reopened.created_at == original.created_at
+    assert reopened.last_opened_at == _NOW + timedelta(minutes=2)
+    assert reopened.removed_at is None
+    assert registry.list() == (reopened,)
 
 
 def test_create_adds_only_one_new_leaf_and_never_overwrites(tmp_path: Path) -> None:

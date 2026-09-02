@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from coding_agent.dashboard import MAX_WORKSPACE_CHANGES
 from coding_agent.web.native_picker import (
     NativeFolderPicker,
     NativeFolderPickerBusyError,
@@ -25,6 +26,7 @@ from coding_agent.web.native_picker import (
 )
 from coding_agent.web.service import (
     RunAlreadyActiveError,
+    WebResumeUnsupportedError,
     WebRunStartError,
     WebRunStatePayload,
     WebServiceClosedError,
@@ -34,12 +36,15 @@ from coding_agent.web.workbench import (
     NoActiveProjectError,
     ProjectListPayload,
     ProjectPayload,
+    ProjectRemovalPayload,
     ProjectRunsPayload,
     WebWorkbench,
     WorkbenchBusyError,
     WorkbenchError,
+    WorkbenchFollowUpError,
     WorkbenchInputError,
     WorkbenchNotFoundError,
+    WorkbenchResumeError,
 )
 
 DEFAULT_SHUTDOWN_DRAIN_SECONDS = 5.0
@@ -61,6 +66,13 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task: str = Field(min_length=1, max_length=20_000)
+    use_project_memory: bool = True
+    parent_run_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$",
+    )
 
     @field_validator("task")
     @classmethod
@@ -154,7 +166,28 @@ class SnapshotResponse(BaseModel):
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelineResponse]
+    workspace_changes: list[LatestChangeResponse] = Field(max_length=MAX_WORKSPACE_CHANGES)
+    workspace_changes_complete: bool
+    omitted_change_count: int = Field(ge=0)
     latest_change: LatestChangeResponse | None
+
+
+class ProjectMemorySourceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    task: str
+    completed_at: str | None
+
+
+class ProjectMemoryContextResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested: bool
+    applied: bool
+    source_run_ids: list[str] = Field(max_length=6)
+    sources: list[ProjectMemorySourceResponse] = Field(max_length=6)
+    error: str | None
 
 
 class WebRunResponse(BaseModel):
@@ -166,6 +199,7 @@ class WebRunResponse(BaseModel):
     final_text: str | None
     error: str | None
     snapshot: SnapshotResponse | None
+    memory_context: ProjectMemoryContextResponse | None
 
 
 class WebMetadataResponse(BaseModel):
@@ -205,6 +239,12 @@ class SelectProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ResumeRunRequest(BaseModel):
+    """Strict empty body for continuing one server-selected checkpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class PickFolderRequest(BaseModel):
     """Strict empty body for the native local-control operation."""
 
@@ -235,10 +275,28 @@ class ProjectListResponse(BaseModel):
     projects: list[ProjectResponse]
 
 
+class ProjectRemovalResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    removed_from_sidebar: Literal[True]
+    workspace_deleted: Literal[False]
+    history_preserved: Literal[True]
+
+
+class RunContinuationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["resume", "follow_up", "none"]
+    available: bool
+    reason: str | None = None
+
+
 class RunCatalogResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str
+    parent_run_id: str | None = None
     project_id: str
     task: str
     status: str
@@ -246,6 +304,10 @@ class RunCatalogResponse(BaseModel):
     completed_at: str | None
     final_text: str | None = None
     error: str | None = None
+    resume_available: bool
+    resume_reason: str | None = None
+    continuation: RunContinuationResponse
+    memory_context: ProjectMemoryContextResponse
 
 
 class ProjectRunsResponse(BaseModel):
@@ -357,14 +419,35 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="此本地界面已锁定为预设演示任务",
             )
+        if workbench is None and request.parent_run_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="当前固定工作区界面不支持继续历史任务",
+            )
         try:
+            if workbench is not None:
+                return workbench.start(
+                    request.task,
+                    use_project_memory=request.use_project_memory,
+                    parent_run_id=request.parent_run_id,
+                )
             return service.start(request.task)
         except RunAlreadyActiveError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(exc),
             ) from None
-        except (NoActiveProjectError, WorkbenchBusyError, WorkbenchInputError) as exc:
+        except WorkbenchNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from None
+        except (
+            NoActiveProjectError,
+            WorkbenchBusyError,
+            WorkbenchFollowUpError,
+            WorkbenchInputError,
+        ) as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(exc),
@@ -461,6 +544,20 @@ def create_app(
             except Exception as exc:
                 raise _workbench_http_error(exc) from None
 
+        @app.delete(
+            "/api/projects/{project_id}",
+            response_model=ProjectRemovalResponse,
+        )
+        def remove_project(
+            project_id: str,
+            raw_request: Request,
+        ) -> ProjectRemovalPayload:
+            _authorize_mutation(raw_request, control_token)
+            try:
+                return workbench.remove_project(project_id)
+            except Exception as exc:
+                raise _workbench_http_error(exc) from None
+
         @app.get(
             "/api/projects/{project_id}/runs",
             response_model=ProjectRunsResponse,
@@ -475,6 +572,33 @@ def create_app(
         def get_history(run_id: str) -> HistoryPayload:
             try:
                 return workbench.history(run_id)
+            except Exception as exc:
+                raise _workbench_http_error(exc) from None
+
+        @app.post(
+            "/api/runs/{run_id}/resume",
+            response_model=WebRunResponse,
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+        def resume_run(
+            run_id: str,
+            request: ResumeRunRequest,
+            raw_request: Request,
+        ) -> WebRunStatePayload:
+            del request
+            _authorize_mutation(raw_request, control_token)
+            try:
+                return workbench.resume(run_id)
+            except RunAlreadyActiveError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(exc),
+                ) from None
+            except (WebRunStartError, WebServiceClosedError, WebResumeUnsupportedError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc),
+                ) from None
             except Exception as exc:
                 raise _workbench_http_error(exc) from None
 
@@ -534,6 +658,8 @@ def _workbench_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, WorkbenchNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, WorkbenchResumeError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, (WorkbenchInputError, ValueError)):
         return HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

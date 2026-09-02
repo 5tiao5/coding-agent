@@ -111,6 +111,43 @@ def _emit_completed_story(run_id: str, sink: EventSink) -> None:
     sink.emit(
         RunEvent(
             run_id=run_id,
+            kind=EventKind.TOOL_STARTED,
+            message="second tool start",
+            step=1,
+            data={"call_id": "edit-2", "tool_name": "write_file"},
+        )
+    )
+    sink.emit(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.TOOL_FINISHED,
+            message="second tool finish",
+            step=1,
+            data={
+                "call_id": "edit-2",
+                "tool_name": "write_file",
+                "ok": True,
+                "summary": "Created src/secondary.py (+1/-0)",
+                "duration_ms": 8.0,
+                "preview": (
+                    "Diff preview:\n--- /dev/null\n+++ b/src/secondary.py\n"
+                    "@@ -0,0 +1 @@\n+secondary = True"
+                ),
+                "metadata": {
+                    "path": "src/secondary.py",
+                    "changed": True,
+                    "added_lines": 1,
+                    "removed_lines": 0,
+                    "mutation_revision": 2,
+                    "change_kind": "create",
+                    "private_sha256": "second-must-not-leak",
+                },
+            },
+        )
+    )
+    sink.emit(
+        RunEvent(
+            run_id=run_id,
             kind=EventKind.VERIFICATION_RECORDED,
             message="verification",
             step=2,
@@ -158,6 +195,27 @@ def _wait_for(service: WebRunService) -> None:
     assert service.wait(timeout=2), "Web runner did not finish"
 
 
+def test_service_serializes_the_ordered_workspace_change_ledger() -> None:
+    def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
+        _emit_completed_story(run_id, event_sink)
+        return _completed_result(run_id, task)
+
+    service = WebRunService(runner, max_timeline=1)
+    service.start("Repair the example")
+    _wait_for(service)
+
+    snapshot = service.state()["snapshot"]
+    assert snapshot is not None
+    assert len(snapshot["timeline"]) == 1
+    assert [change["detail"] for change in snapshot["workspace_changes"]] == [
+        "Updated src/example.py (+1/-1)",
+        "Created src/secondary.py (+1/-0)",
+    ]
+    assert snapshot["workspace_changes_complete"] is True
+    assert snapshot["omitted_change_count"] == 0
+    assert snapshot["latest_change"] == snapshot["workspace_changes"][-1]
+
+
 def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -> None:
     def runner(run_id: str, task: str, event_sink: EventSink) -> AgentResult:
         _emit_completed_story(run_id, event_sink)
@@ -177,7 +235,16 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
 
     assert state_response.status_code == 200
     state = state_response.json()
-    assert set(state) == {"status", "run_id", "task", "final_text", "error", "snapshot"}
+    assert set(state) == {
+        "status",
+        "run_id",
+        "task",
+        "final_text",
+        "error",
+        "snapshot",
+        "memory_context",
+    }
+    assert state["memory_context"] is None
     assert state["status"] == "completed"
     assert state["task"] == "Repair the example"
     assert state["final_text"] == "Repair complete"
@@ -201,6 +268,9 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
         "outcome",
         "plan_lines",
         "timeline",
+        "workspace_changes",
+        "workspace_changes_complete",
+        "omitted_change_count",
         "latest_change",
     }
     assert snapshot["task_label"] == "Repair the example"
@@ -211,8 +281,8 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
         "max_calls_per_turn": 8,
         "max_total_tool_calls": 40,
     }
-    assert snapshot["tools_started"] == 1
-    assert snapshot["tools_finished"] == 1
+    assert snapshot["tools_started"] == 2
+    assert snapshot["tools_finished"] == 2
     assert snapshot["verification_status"] == "verified"
     assert snapshot["verification_labels"] == ["pytest"]
     assert snapshot["verification_evidence"] == [
@@ -227,25 +297,52 @@ def test_api_returns_only_the_whitelisted_dashboard_projection(tmp_path: Path) -
             "removed_lines": 1,
             "revision": 1,
             "change_kind": "update",
-        }
+        },
+        {
+            "path": "src/secondary.py",
+            "added_lines": 1,
+            "removed_lines": 0,
+            "revision": 2,
+            "change_kind": "create",
+        },
     ]
     assert snapshot["outcome"] == "VERIFIED"
     assert snapshot["plan_lines"] == []
-    assert snapshot["latest_change"]["preview"][-2:] == ["-old", "+new"]
-    assert snapshot["latest_change"]["expanded_preview"] == [
+    assert [change["detail"] for change in snapshot["workspace_changes"]] == [
+        "Updated src/example.py (+1/-1)",
+        "Created src/secondary.py (+1/-0)",
+    ]
+    assert snapshot["workspace_changes"][0]["expanded_preview"] == [
         "--- a/src/example.py",
         "+++ b/src/example.py",
         "@@ -1 +1 @@",
         "-old",
         "+new",
     ]
+    assert snapshot["workspace_changes"][1]["expanded_preview"] == [
+        "--- /dev/null",
+        "+++ b/src/secondary.py",
+        "@@ -0,0 +1 @@",
+        "+secondary = True",
+    ]
+    assert snapshot["workspace_changes_complete"] is True
+    assert snapshot["omitted_change_count"] == 0
+    assert snapshot["latest_change"]["preview"][-1] == "+secondary = True"
+    assert snapshot["latest_change"]["expanded_preview"] == [
+        "--- /dev/null",
+        "+++ b/src/secondary.py",
+        "@@ -0,0 +1 @@",
+        "+secondary = True",
+    ]
     assert snapshot["latest_change"]["expanded_preview_complete"] is True
+    assert snapshot["latest_change"] == snapshot["workspace_changes"][-1]
     assert all("expanded_preview" not in entry for entry in snapshot["timeline"])
     serialized = state_response.text
     assert "raw event message" not in serialized
     assert "raw event data" not in serialized
     assert "private_sha256" not in serialized
     assert "must-not-leak" not in serialized
+    assert "second-must-not-leak" not in serialized
     assert client.get("/").text == "<h1>Local agent</h1>"
     assert "console.log" in client.get("/static/app.js").text
 
@@ -784,6 +881,12 @@ def test_api_rejects_blank_or_unexpected_run_fields() -> None:
         ).status_code
         == 422
     )
+    unsupported_follow_up = client.post(
+        "/api/runs",
+        json={"task": "continue", "parent_run_id": "completed-run"},
+    )
+    assert unsupported_follow_up.status_code == 422
+    assert unsupported_follow_up.json()["detail"] == "当前固定工作区界面不支持继续历史任务"
 
 
 def test_local_app_rejects_untrusted_hosts_and_sets_browser_security_headers() -> None:

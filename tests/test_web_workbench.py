@@ -9,11 +9,13 @@ from threading import Event, Thread
 import pytest
 from fastapi.testclient import TestClient
 
+from coding_agent.agent_protocol import EARLY_FINAL_CORRECTION
 from coding_agent.application import RepositoryRunSpec
 from coding_agent.cancellation import CancellationToken
 from coding_agent.cli import _ensure_run_catalog_entry
 from coding_agent.command import CommandPermissionMode
 from coding_agent.events import EventKind, EventSink, RunEvent
+from coding_agent.lease import RunLease
 from coding_agent.models import (
     AgentResult,
     AgentState,
@@ -21,8 +23,11 @@ from coding_agent.models import (
     MessageRole,
     StopReason,
 )
+from coding_agent.project_memory import ProjectMemoryStore
 from coding_agent.run_catalog import MAX_TASK_TITLE_LENGTH, RunCatalog
+from coding_agent.run_memory import RunMemorySnapshot
 from coding_agent.session import (
+    LoadedSession,
     SessionBoundary,
     SessionCheckpoint,
     SessionStore,
@@ -145,6 +150,75 @@ def _interrupted_result(run_id: str, task: str) -> AgentResult:
             ChatMessage(role=MessageRole.SYSTEM, content="system"),
             ChatMessage(role=MessageRole.USER, content=task),
         ),
+    )
+
+
+def _save_ready_checkpoint(
+    *,
+    paths: StatePaths,
+    workspace: Path,
+    run_id: str,
+    task: str,
+    completed_steps: int = 0,
+) -> None:
+    store = SessionStore(paths.sessions, workspace_root=workspace)
+    messages = [
+        ChatMessage(role=MessageRole.SYSTEM, content="system"),
+        ChatMessage(role=MessageRole.USER, content=task),
+    ]
+    for step in range(completed_steps):
+        messages.extend(
+            (
+                ChatMessage(role=MessageRole.ASSISTANT, content=f"premature final {step}"),
+                ChatMessage(role=MessageRole.USER, content=EARLY_FINAL_CORRECTION),
+            )
+        )
+    store.save(
+        SessionCheckpoint(
+            run_id=run_id,
+            workspace_fingerprint=store.workspace_fingerprint,
+            task=task,
+            system_prompt="system",
+            messages=tuple(messages),
+            completed_steps=completed_steps,
+            completed_tool_calls=0,
+            stop_boundary=SessionBoundary.READY_FOR_MODEL,
+        )
+    )
+
+
+def _save_interrupted_run(
+    *,
+    paths: StatePaths,
+    workspace: Path,
+    project_id: str,
+    run_id: str,
+    task: str,
+    completed_steps: int = 0,
+) -> None:
+    RunCatalog(paths.runs).create(
+        run_id=run_id,
+        project_id=project_id,
+        workspace_fingerprint=workspace_fingerprint(workspace),
+        task_title=task,
+    )
+    _save_ready_checkpoint(
+        paths=paths,
+        workspace=workspace,
+        run_id=run_id,
+        task=task,
+        completed_steps=completed_steps,
+    )
+    trace = TraceStore(paths.traces)
+    trace.append(RunEvent(run_id=run_id, kind=EventKind.RUN_STARTED, message="started"))
+    trace.append(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FAILED,
+            message="interrupted before completion",
+            step=1,
+            data={"stop_reason": StopReason.USER_INTERRUPTED.value},
+        )
     )
 
 
@@ -527,6 +601,140 @@ def test_project_registration_creation_selection_and_control_token(tmp_path: Pat
     )
 
 
+def test_project_removal_hides_sidebar_entry_preserves_disk_and_restores_history(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    sentinel = first / "keep.txt"
+    sentinel.write_text("do not delete", encoding="utf-8")
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    first_record = client.post(
+        "/api/projects",
+        json={"root": str(first), "display_name": "待移除项目"},
+        headers=_headers(token),
+    ).json()
+    RunCatalog(paths.runs).create(
+        run_id="retained-run",
+        project_id=first_record["project_id"],
+        workspace_fingerprint=workspace_fingerprint(first),
+        task_title="保留的历史任务",
+    )
+    second_record = client.post(
+        "/api/projects",
+        json={"root": str(second)},
+        headers=_headers(token),
+    ).json()
+
+    endpoint = f"/api/projects/{first_record['project_id']}"
+    assert client.delete(endpoint).status_code == 403
+    assert (
+        client.delete(
+            endpoint,
+            headers=_headers(token, origin="https://attacker.example"),
+        ).status_code
+        == 403
+    )
+    removed = client.delete(endpoint, headers=_headers(token))
+
+    assert removed.status_code == 200
+    assert removed.json() == {
+        "project_id": first_record["project_id"],
+        "removed_from_sidebar": True,
+        "workspace_deleted": False,
+        "history_preserved": True,
+    }
+    listed = client.get("/api/projects").json()
+    assert listed["active_project_id"] == second_record["project_id"]
+    assert [project["project_id"] for project in listed["projects"]] == [
+        second_record["project_id"]
+    ]
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+    assert client.get(f"{endpoint}/runs").status_code == 404
+    assert client.delete(endpoint, headers=_headers(token)).status_code == 404
+
+    reopened = client.post(
+        "/api/projects",
+        json={"root": str(first)},
+        headers=_headers(token),
+    ).json()
+
+    assert reopened["project_id"] == first_record["project_id"]
+    runs = client.get(f"{endpoint}/runs").json()["runs"]
+    assert [run["run_id"] for run in runs] == ["retained-run"]
+    assert runs[0]["task"] == "保留的历史任务"
+
+    removed_active = client.delete(endpoint, headers=_headers(token))
+
+    assert removed_active.status_code == 200
+    assert client.get("/api/projects").json()["active_project_id"] is None
+    assert client.get("/api/meta").json()["workspace"] == "请选择项目"
+    assert client.get("/api/state").json()["status"] == "idle"
+    refused = client.post(
+        "/api/runs",
+        json={"task": "must choose a project"},
+        headers=_headers(token),
+    )
+    assert refused.status_code == 409
+    assert refused.json() == {"detail": "请先选择一个项目"}
+
+
+def test_project_removal_is_rejected_while_a_run_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    started = Event()
+    release = Event()
+
+    def fake_execute(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink,
+        approver: object,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del event_sink, approver, cancellation_token
+        started.set()
+        assert release.wait(timeout=2)
+        return _completed_result(spec.run_id, spec.task)
+
+    monkeypatch.setattr("coding_agent.web.workbench.execute_repository_run", fake_execute)
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    assert (
+        client.post(
+            "/api/runs",
+            json={"task": "hold the project open"},
+            headers=_headers(token),
+        ).status_code
+        == 202
+    )
+    assert started.wait(timeout=1)
+
+    blocked = client.delete(
+        f"/api/projects/{project['project_id']}",
+        headers=_headers(token),
+    )
+
+    assert blocked.status_code == 409
+    assert client.get("/api/projects").json()["active_project_id"] == project["project_id"]
+    release.set()
+    assert workbench.wait(timeout=2)
+
+
 def test_run_requires_an_active_project_and_never_accepts_a_raw_root(tmp_path: Path) -> None:
     client = _client(_workbench(tmp_path))
     token = _token(client)
@@ -869,6 +1077,7 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     assert runs_response.json()["runs"] == [
         {
             "run_id": run_id,
+            "parent_run_id": None,
             "project_id": first_record["project_id"],
             "task": "Repair this project",
             "status": "completed",
@@ -876,6 +1085,20 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
             "completed_at": runs_response.json()["runs"][0]["completed_at"],
             "final_text": None,
             "error": None,
+            "resume_available": False,
+            "resume_reason": "任务已经完成",
+            "continuation": {
+                "kind": "follow_up",
+                "available": True,
+                "reason": None,
+            },
+            "memory_context": {
+                "requested": True,
+                "applied": False,
+                "source_run_ids": [],
+                "sources": [],
+                "error": None,
+            },
         }
     ]
 
@@ -941,6 +1164,131 @@ def test_run_context_is_immutable_and_history_is_a_whitelisted_replay(
     )
     assert selected_second.status_code == 201
     assert client.get("/api/state").json()["status"] == "idle"
+
+
+def test_history_replays_workspace_changes_across_all_resume_segments(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "multi-segment-change-ledger"
+    RunCatalog(paths.runs).create(
+        run_id=run_id,
+        project_id=project["project_id"],
+        workspace_fingerprint=workspace_fingerprint(workspace),
+        task_title="Preserve every mutation across resume segments",
+    )
+    trace = TraceStore(paths.traces)
+    events = (
+        RunEvent(run_id=run_id, kind=EventKind.RUN_STARTED, message="started"),
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.TOOL_FINISHED,
+            message="first mutation",
+            step=1,
+            data={
+                "tool_name": "replace_text",
+                "ok": True,
+                "summary": "Updated routeforge/domain.py (+2/-1)",
+                "preview": (
+                    "Diff preview:\n--- a/routeforge/domain.py\n"
+                    "+++ b/routeforge/domain.py\n-old\n+new"
+                ),
+                "metadata": {
+                    "path": "routeforge/domain.py",
+                    "changed": True,
+                    "added_lines": 2,
+                    "removed_lines": 1,
+                    "mutation_revision": 1,
+                    "change_kind": "update",
+                    "diff_complete": True,
+                },
+            },
+        ),
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FAILED,
+            message="paused",
+            step=1,
+            data={"stop_reason": StopReason.USER_INTERRUPTED.value},
+        ),
+        RunEvent(run_id=run_id, kind=EventKind.RUN_RESUMED, message="resumed", step=1),
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.TOOL_FINISHED,
+            message="second mutation",
+            step=2,
+            data={
+                "tool_name": "write_file",
+                "ok": True,
+                "summary": "Created routeforge/search.py (+3/-0)",
+                "preview": (
+                    "Diff preview:\n--- /dev/null\n+++ b/routeforge/search.py\n"
+                    "+def search():\n+    return []"
+                ),
+                "metadata": {
+                    "path": "routeforge/search.py",
+                    "changed": True,
+                    "added_lines": 3,
+                    "removed_lines": 0,
+                    "mutation_revision": 2,
+                    "change_kind": "create",
+                    "diff_complete": True,
+                },
+            },
+        ),
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FINISHED,
+            message="finished",
+            step=2,
+            data={"verified": True, "status": "verified"},
+        ),
+    )
+    for event in events:
+        trace.append(event)
+
+    history = client.get(f"/api/history/{run_id}")
+    assert history.status_code == 200, history.text
+    snapshot = history.json()["snapshot"]
+    assert [change["detail"] for change in snapshot["workspace_changes"]] == [
+        "Updated routeforge/domain.py (+2/-1)",
+        "Created routeforge/search.py (+3/-0)",
+    ]
+    assert snapshot["workspace_changes_complete"] is True
+    assert snapshot["omitted_change_count"] == 0
+    assert snapshot["latest_change"] == snapshot["workspace_changes"][-1]
+    assert snapshot["changed_files"] == [
+        {
+            "path": "routeforge/domain.py",
+            "added_lines": 2,
+            "removed_lines": 1,
+            "revision": 1,
+            "change_kind": "update",
+        },
+        {
+            "path": "routeforge/search.py",
+            "added_lines": 3,
+            "removed_lines": 0,
+            "revision": 2,
+            "change_kind": "create",
+        },
+    ]
+    assert all(
+        "routeforge/domain.py" not in "\n".join(entry["preview"]) for entry in snapshot["timeline"]
+    )
+
+    restarted = _client(_workbench(tmp_path)).get(f"/api/history/{run_id}")
+    assert restarted.status_code == 200
+    assert restarted.json()["snapshot"]["workspace_changes"] == snapshot["workspace_changes"]
+    assert restarted.json()["snapshot"]["changed_files"] == snapshot["changed_files"]
 
 
 def test_history_final_reply_is_bounded_and_workspace_bound(tmp_path: Path) -> None:
@@ -1094,6 +1442,401 @@ def test_noncurrent_nonterminal_trace_is_reported_as_interrupted(tmp_path: Path)
 
     assert runs.status_code == 200, runs.text
     assert runs.json()["runs"][0]["status"] == "interrupted"
+
+
+def test_web_resume_reuses_run_identity_checkpoint_and_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "resume-web-run"
+    task = "Continue the interrupted repository task"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=workspace,
+        project_id=project["project_id"],
+        run_id=run_id,
+        task=task,
+    )
+
+    before = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]
+    assert before["status"] == "interrupted"
+    assert before["completed_at"] is None
+    assert before["resume_available"] is True
+    assert before["resume_reason"] is None
+
+    started = Event()
+    release = Event()
+    received: list[tuple[RepositoryRunSpec, LoadedSession, SessionStore]] = []
+
+    def fake_resume(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink,
+        approver: object,
+        session_store: SessionStore,
+        loaded: LoadedSession,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del approver, cancellation_token
+        received.append((spec, loaded, session_store))
+        trace = TraceStore(spec.paths.traces)
+
+        def emit(event: RunEvent) -> None:
+            trace.append(event)
+            event_sink.emit(event)
+
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.RUN_RESUMED,
+                message="resumed",
+                step=loaded.checkpoint.completed_steps,
+            )
+        )
+        started.set()
+        assert release.wait(timeout=3)
+        result = _completed_result(spec.run_id, spec.task)
+        _save_terminal_checkpoint(spec, result)
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.VERIFICATION_EVALUATED,
+                message="verified",
+                step=result.steps,
+                data={"verified": True, "status": "verified"},
+            )
+        )
+        emit(
+            RunEvent(
+                run_id=spec.run_id,
+                kind=EventKind.RUN_FINISHED,
+                message="finished",
+                step=result.steps,
+                data={"verified": True, "status": "verified"},
+            )
+        )
+        return result
+
+    monkeypatch.setattr("coding_agent.web.workbench.execute_repository_run", fake_resume)
+
+    forbidden = client.post(f"/api/runs/{run_id}/resume", json={})
+    assert forbidden.status_code == 403
+    resumed = client.post(
+        f"/api/runs/{run_id}/resume",
+        json={},
+        headers=_headers(token),
+    )
+
+    assert resumed.status_code == 202, resumed.text
+    assert resumed.json()["run_id"] == run_id
+    assert resumed.json()["task"] == task
+    assert started.wait(timeout=3)
+    during = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]
+    assert during["status"] == "running"
+    assert during["resume_available"] is False
+    assert during["resume_reason"] == "已有任务正在运行"
+
+    release.set()
+    assert workbench.wait(timeout=3)
+    assert len(received) == 1
+    spec, loaded, store = received[0]
+    assert spec.run_id == run_id
+    assert spec.task == task
+    assert loaded.checkpoint.run_id == run_id
+    assert loaded.checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert store.workspace_fingerprint == workspace_fingerprint(workspace)
+    assert [record.run_id for record in RunCatalog(paths.runs).list()] == [run_id]
+    assert [event.kind for event in TraceStore(paths.traces).read(run_id)] == [
+        EventKind.RUN_STARTED,
+        EventKind.RUN_FAILED,
+        EventKind.RUN_RESUMED,
+        EventKind.VERIFICATION_EVALUATED,
+        EventKind.RUN_FINISHED,
+    ]
+    after = client.get(f"/api/history/{run_id}").json()["run"]
+    assert after["status"] == "completed"
+    assert after["resume_available"] is False
+    assert after["resume_reason"] == "任务已经完成"
+
+
+def test_web_resume_requires_a_larger_model_turn_ceiling_after_budget_exhaustion(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "exhausted-web-run"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=workspace,
+        project_id=project["project_id"],
+        run_id=run_id,
+        task="Continue with a larger cumulative model-turn budget",
+        completed_steps=8,
+    )
+
+    run = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]
+    assert run["resume_available"] is False
+    assert "--max-steps" in run["resume_reason"]
+
+    refused = client.post(
+        f"/api/runs/{run_id}/resume",
+        json={},
+        headers=_headers(token),
+    )
+    assert refused.status_code == 409
+    assert "--max-steps" in refused.json()["detail"]
+
+
+def test_web_resume_refuses_completed_terminal_and_foreign_project_runs(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    first_project = client.post(
+        "/api/projects",
+        json={"root": str(first)},
+        headers=_headers(token),
+    ).json()
+    run_id = "completed-ready-run"
+    task = "A stale ready checkpoint must not replay"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=first,
+        project_id=first_project["project_id"],
+        run_id=run_id,
+        task=task,
+    )
+    TraceStore(paths.traces).append(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FINISHED,
+            message="already completed",
+            step=1,
+            data={"verified": False, "status": "missing"},
+        )
+    )
+
+    completed = client.get(f"/api/projects/{first_project['project_id']}/runs").json()["runs"][0]
+    assert completed["resume_available"] is False
+    assert completed["resume_reason"] == "任务已经完成"
+    assert completed["continuation"] == {
+        "kind": "none",
+        "available": False,
+        "reason": "该历史没有可用的项目记忆摘要",
+    }
+    refused = client.post(
+        f"/api/runs/{run_id}/resume",
+        json={},
+        headers=_headers(token),
+    )
+    assert refused.status_code == 409
+    assert "已经完成" in refused.json()["detail"]
+    follow_up_refused = client.post(
+        "/api/runs",
+        json={"task": "Continue safely", "parent_run_id": run_id},
+        headers=_headers(token),
+    )
+    assert follow_up_refused.status_code == 409
+    assert "项目记忆摘要不可用" in follow_up_refused.json()["detail"]
+
+    terminal_run_id = "terminal-checkpoint-run"
+    terminal_task = "A terminal checkpoint cannot resume"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=first,
+        project_id=first_project["project_id"],
+        run_id=terminal_run_id,
+        task=terminal_task,
+    )
+    terminal_store = SessionStore(paths.sessions, workspace_root=first)
+    terminal_store.save(
+        SessionCheckpoint(
+            run_id=terminal_run_id,
+            workspace_fingerprint=terminal_store.workspace_fingerprint,
+            task=terminal_task,
+            system_prompt="system",
+            messages=(
+                ChatMessage(role=MessageRole.SYSTEM, content="system"),
+                ChatMessage(role=MessageRole.USER, content=terminal_task),
+                ChatMessage(role=MessageRole.ASSISTANT, content="done"),
+            ),
+            completed_steps=1,
+            completed_tool_calls=0,
+            stop_boundary=SessionBoundary.TERMINAL,
+            stop_reason=StopReason.FINAL_RESPONSE,
+        )
+    )
+    records = client.get(f"/api/projects/{first_project['project_id']}/runs").json()["runs"]
+    terminal_record = next(item for item in records if item["run_id"] == terminal_run_id)
+    assert terminal_record["resume_available"] is False
+    assert terminal_record["resume_reason"] == "任务已经结束"
+    terminal_refused = client.post(
+        f"/api/runs/{terminal_run_id}/resume",
+        json={},
+        headers=_headers(token),
+    )
+    assert terminal_refused.status_code == 409
+    assert "已经结束" in terminal_refused.json()["detail"]
+
+    foreign_run_id = "foreign-project-run"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=first,
+        project_id=first_project["project_id"],
+        run_id=foreign_run_id,
+        task="Continue only from the original project",
+    )
+    client.post(
+        "/api/projects",
+        json={"root": str(second)},
+        headers=_headers(token),
+    )
+    foreign = client.post(
+        f"/api/runs/{foreign_run_id}/resume",
+        json={},
+        headers=_headers(token),
+    )
+    assert foreign.status_code == 404
+    assert "不属于当前项目" in foreign.json()["detail"]
+
+
+def test_web_follow_up_rejects_a_stale_noncompleted_parent_memory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "stale-memory-parent"
+    task = "A stale failed memory must not seed a follow-up"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=workspace,
+        project_id=project["project_id"],
+        run_id=run_id,
+        task=task,
+    )
+    TraceStore(paths.traces).append(
+        RunEvent(
+            run_id=run_id,
+            kind=EventKind.RUN_FINISHED,
+            message="later marked complete",
+            step=1,
+            data={"verified": True},
+        )
+    )
+    memory = ProjectMemoryStore(
+        paths.project_memories,
+        project_id=project["project_id"],
+        workspace_root=workspace,
+        workspace_fingerprint_value=workspace_fingerprint(workspace),
+    )
+    memory.remember_run(
+        run_id=run_id,
+        task_goal=task,
+        final_status="failed",
+        final_summary="旧的失败摘要",
+        run_memory=RunMemorySnapshot(revision=0),
+    )
+
+    listed = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]
+    assert listed["continuation"] == {
+        "kind": "none",
+        "available": False,
+        "reason": "该历史的项目记忆摘要记录为失败，不能继续对话",
+    }
+    refused = client.post(
+        "/api/runs",
+        json={"task": "Continue only with a completed parent", "parent_run_id": run_id},
+        headers=_headers(token),
+    )
+    assert refused.status_code == 409
+    assert "项目记忆摘要记录为失败" in refused.json()["detail"]
+
+    memory.remember_run(
+        run_id=run_id,
+        task_goal=task,
+        final_status="completed_unverified",
+        final_summary="任务已结束，但仍需要补充验证。",
+        run_memory=RunMemorySnapshot(revision=0),
+    )
+    upgraded = client.get(f"/api/projects/{project['project_id']}/runs").json()["runs"][0]
+    assert upgraded["continuation"] == {
+        "kind": "follow_up",
+        "available": True,
+        "reason": None,
+    }
+
+
+def test_web_resume_honors_existing_run_lease_without_mutating_trace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+    run_id = "leased-resume-run"
+    _save_interrupted_run(
+        paths=paths,
+        workspace=workspace,
+        project_id=project["project_id"],
+        run_id=run_id,
+        task="Do not race another process",
+    )
+    before = TraceStore(paths.traces).read(run_id)
+
+    with RunLease(paths.root / "leases", run_id):
+        response = client.post(
+            f"/api/runs/{run_id}/resume",
+            json={},
+            headers=_headers(token),
+        )
+        assert response.status_code == 202
+        assert workbench.wait(timeout=3)
+
+    state = client.get("/api/state")
+    assert state.json()["status"] == "failed"
+    assert state.json()["error"].endswith("[run_already_active]")
+    assert str(paths.root) not in state.text
+    assert TraceStore(paths.traces).read(run_id) == before
 
 
 def test_pretrace_host_failure_is_safely_persisted_and_projected(
@@ -1331,3 +2074,158 @@ def test_cli_catalog_failure_warns_without_revoking_explicit_root_authority(
     warning = capsys.readouterr().err
     assert "Agent run will continue" in warning
     assert "PRIVATE_PATH_OR_OS_DETAIL" not in warning
+
+
+def test_project_memory_is_injected_with_persisted_sources_and_can_be_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    paths = StatePaths((tmp_path / "state").resolve())
+    captured: list[RepositoryRunSpec] = []
+
+    def fake_execute(
+        spec: RepositoryRunSpec,
+        *,
+        event_sink: EventSink,
+        approver: object,
+        cancellation_token: CancellationToken,
+    ) -> AgentResult:
+        del approver, cancellation_token
+        captured.append(spec)
+        trace = TraceStore(spec.paths.traces)
+        started = RunEvent(
+            run_id=spec.run_id,
+            kind=EventKind.RUN_STARTED,
+            message="started",
+        )
+        trace.append(started)
+        event_sink.emit(started)
+        result = _completed_result(spec.run_id, spec.task)
+        _save_terminal_checkpoint(spec, result)
+        finished = RunEvent(
+            run_id=spec.run_id,
+            kind=EventKind.RUN_FINISHED,
+            message="finished",
+            step=1,
+            data={"verified": True},
+        )
+        trace.append(finished)
+        event_sink.emit(finished)
+        return result
+
+    monkeypatch.setattr("coding_agent.web.workbench.execute_repository_run", fake_execute)
+    workbench = _workbench(tmp_path)
+    client = _client(workbench)
+    token = _token(client)
+    project = client.post(
+        "/api/projects",
+        json={"root": str(workspace)},
+        headers=_headers(token),
+    ).json()
+
+    first = client.post(
+        "/api/runs",
+        json={"task": "Implement the route-cost calculation", "use_project_memory": True},
+        headers=_headers(token),
+    )
+    assert first.status_code == 202, first.text
+    assert first.json()["memory_context"] == {
+        "requested": True,
+        "applied": False,
+        "source_run_ids": [],
+        "sources": [],
+        "error": None,
+    }
+    first_run_id = first.json()["run_id"]
+    assert workbench.wait(timeout=3)
+
+    second = client.post(
+        "/api/runs",
+        json={"task": "Extend the route display", "use_project_memory": True},
+        headers=_headers(token),
+    )
+    assert second.status_code == 202, second.text
+    second_context = second.json()["memory_context"]
+    assert second_context["requested"] is True
+    assert second_context["applied"] is True
+    assert second_context["source_run_ids"] == [first_run_id]
+    assert second_context["sources"][0]["task"] == "Implement the route-cost calculation"
+    second_run_id = second.json()["run_id"]
+    assert workbench.wait(timeout=3)
+
+    assert captured[0].project_memory_context is None
+    assert captured[1].project_memory_context is not None
+    assert "Implement the route-cost calculation" in captured[1].project_memory_context
+    second_record = RunCatalog(paths.runs).get(second_run_id)
+    assert second_record.memory_requested is True
+    assert second_record.memory_source_run_ids == (first_run_id,)
+
+    history = client.get(f"/api/history/{second_run_id}")
+    assert history.status_code == 200
+    assert history.json()["run"]["memory_context"] == second_context
+
+    disabled = client.post(
+        "/api/runs",
+        json={"task": "Run without historical context", "use_project_memory": False},
+        headers=_headers(token),
+    )
+    assert disabled.status_code == 202, disabled.text
+    assert disabled.json()["memory_context"]["requested"] is False
+    disabled_run_id = disabled.json()["run_id"]
+    assert workbench.wait(timeout=3)
+    assert captured[2].project_memory_context is None
+    assert RunCatalog(paths.runs).get(disabled_run_id).memory_source_run_ids == ()
+
+    follow_up = client.post(
+        "/api/runs",
+        json={
+            "task": "Continue by explaining and refining the route display",
+            "use_project_memory": False,
+            "parent_run_id": first_run_id,
+        },
+        headers=_headers(token),
+    )
+    assert follow_up.status_code == 202, follow_up.text
+    follow_up_run_id = follow_up.json()["run_id"]
+    assert follow_up_run_id != first_run_id
+    assert follow_up.json()["memory_context"] == {
+        "requested": False,
+        "applied": True,
+        "source_run_ids": [first_run_id],
+        "sources": [
+            {
+                "run_id": first_run_id,
+                "task": "Implement the route-cost calculation",
+                "completed_at": follow_up.json()["memory_context"]["sources"][0]["completed_at"],
+            }
+        ],
+        "error": None,
+    }
+    assert workbench.wait(timeout=3)
+    assert captured[3].project_memory_context is not None
+    assert "Implement the route-cost calculation" in captured[3].project_memory_context
+    follow_up_record = RunCatalog(paths.runs).get(follow_up_run_id)
+    assert follow_up_record.parent_run_id == first_run_id
+    assert follow_up_record.memory_requested is False
+    assert follow_up_record.memory_source_run_ids == (first_run_id,)
+
+    original_history = client.get(f"/api/history/{first_run_id}")
+    assert original_history.status_code == 200
+    assert original_history.json()["run"]["parent_run_id"] is None
+    assert original_history.json()["run"]["status"] == "completed_unverified"
+
+    restarted = _client(_workbench(tmp_path))
+    restarted_token = _token(restarted)
+    assert (
+        restarted.post(
+            f"/api/projects/{project['project_id']}/select",
+            json={},
+            headers=_headers(restarted_token),
+        ).status_code
+        == 200
+    )
+    replay = restarted.get(f"/api/history/{second_run_id}")
+    assert replay.status_code == 200
+    assert replay.json()["run"]["memory_context"] == second_context

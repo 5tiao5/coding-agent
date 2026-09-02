@@ -309,3 +309,27 @@ test("diff view labels bounded previews honestly and ignores malformed lines", a
   assert.doesNotMatch(view.toggleLabel, /完整/);
   assert.equal(view.visibleLines.includes("must-not-render"), false);
 });
+
+test("workspace change ledger preserves every change and falls back for older responses", async () => {
+  const { workspaceChangeKey, workspaceChangeLedgerView } = await importBrowserModule(
+    "src/coding_agent/web/static/_diff_view.js",
+  );
+  const first = { activity_id: "act_1111111111111111", headline: "domain first", step: 7 };
+  const second = { activity_id: "act_2222222222222222", headline: "domain second", step: 8 };
+  const current = workspaceChangeLedgerView({
+    latest_change: second,
+    omitted_change_count: 3,
+    workspace_changes: [first, second],
+    workspace_changes_complete: false,
+  });
+
+  assert.deepEqual(current.changes, [first, second]);
+  assert.equal(current.changes.length, 2, "latest_change must not be rendered twice");
+  assert.equal(current.omittedCount, 3);
+  assert.match(current.note, /较早的 3 次/);
+  assert.match(current.note, /最近 2 次/);
+
+  assert.deepEqual(workspaceChangeLedgerView({ latest_change: first }).changes, [first]);
+  assert.deepEqual(workspaceChangeLedgerView({}).changes, []);
+  assert.notEqual(workspaceChangeKey(first, "run-1"), workspaceChangeKey(second, "run-1"));
+});

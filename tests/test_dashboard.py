@@ -160,6 +160,9 @@ def test_projection_folds_a_verified_run_without_agent_internals() -> None:
         "[COMPLETED] Inspect failure",
         "[IN PROGRESS] Apply repair",
     )
+    assert snapshot.workspace_changes == ()
+    assert snapshot.workspace_changes_complete is True
+    assert snapshot.omitted_change_count == 0
     assert snapshot.latest_change is None
     tool_result = next(
         item
@@ -1488,6 +1491,115 @@ def test_mutation_preview_prioritizes_the_actual_changed_lines() -> None:
     assert projection.snapshot.latest_change.expanded_preview == ()
 
 
+def test_workspace_change_ledger_retains_order_after_timeline_eviction() -> None:
+    projection = DashboardProjection(
+        max_timeline=1,
+        expanded_mutation_preview_lines=80,
+    )
+    projection.apply(_event(EventKind.RUN_STARTED))
+    for step, path in ((1, "pricing.py"), (2, "checkout.py")):
+        projection.apply(
+            _event(
+                EventKind.TOOL_FINISHED,
+                step=step,
+                seconds=step,
+                data={
+                    "call_id": f"change-{step}",
+                    "tool_name": "replace_text",
+                    "ok": True,
+                    "summary": f"Changed {path}",
+                    "preview": (
+                        f"Diff preview:\n--- a/{path}\n+++ b/{path}\n"
+                        f"@@ -1 +1 @@\n-old {step}\n+new {step}"
+                    ),
+                    "truncated": False,
+                    "metadata": {"diff_complete": True},
+                },
+            )
+        )
+    projection.apply(_event(EventKind.MODEL_REQUESTED, step=3, seconds=3))
+
+    snapshot = projection.snapshot
+    assert len(snapshot.timeline) == 1
+    assert snapshot.timeline[0].category == "MODEL"
+    assert [change.detail for change in snapshot.workspace_changes] == [
+        "Changed pricing.py",
+        "Changed checkout.py",
+    ]
+    assert [change.expanded_preview[-1] for change in snapshot.workspace_changes] == [
+        "+new 1",
+        "+new 2",
+    ]
+    assert snapshot.workspace_changes_complete is True
+    assert snapshot.omitted_change_count == 0
+    assert snapshot.latest_change == snapshot.workspace_changes[-1]
+
+
+def test_workspace_change_ledger_ignores_failed_or_unsafe_mutation_previews() -> None:
+    projection = DashboardProjection(expanded_mutation_preview_lines=80)
+    projection.apply(_event(EventKind.RUN_STARTED))
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=1,
+            data={
+                "tool_name": "replace_text",
+                "ok": False,
+                "summary": "Edit failed",
+                "preview": "Diff preview:\n--- a/file.py\n+++ b/file.py\n+unsafe",
+            },
+        )
+    )
+    projection.apply(
+        _event(
+            EventKind.TOOL_FINISHED,
+            step=2,
+            data={
+                "tool_name": "write_file",
+                "ok": True,
+                "summary": "No public preview",
+                "preview": {"private": "must-not-render"},
+            },
+        )
+    )
+
+    snapshot = projection.snapshot
+    assert snapshot.workspace_changes == ()
+    assert snapshot.workspace_changes_complete is True
+    assert snapshot.omitted_change_count == 0
+    assert snapshot.latest_change is None
+
+
+def test_workspace_change_ledger_is_bounded_and_reports_omissions() -> None:
+    projection = DashboardProjection(
+        max_timeline=1,
+        expanded_mutation_preview_lines=1,
+    )
+    projection.apply(_event(EventKind.RUN_STARTED))
+    total_changes = dashboard_module.MAX_WORKSPACE_CHANGES + 2
+    for step in range(1, total_changes + 1):
+        projection.apply(
+            _event(
+                EventKind.TOOL_FINISHED,
+                step=step,
+                data={
+                    "tool_name": "undo_change",
+                    "ok": True,
+                    "summary": f"Undid change {step}",
+                    "preview": f"Diff preview:\n--- a/file.py\n+++ b/file.py\n+revision {step}",
+                },
+            )
+        )
+
+    snapshot = projection.snapshot
+    assert len(snapshot.workspace_changes) == dashboard_module.MAX_WORKSPACE_CHANGES
+    assert snapshot.workspace_changes[0].step == 3
+    assert snapshot.workspace_changes[-1].step == total_changes
+    assert snapshot.workspace_changes_complete is False
+    assert snapshot.omitted_change_count == 2
+    assert snapshot.latest_change == snapshot.workspace_changes[-1]
+
+
 def test_web_mutation_preview_expands_safely_without_growing_the_timeline() -> None:
     projection = DashboardProjection(
         max_timeline=5,
@@ -1520,6 +1632,9 @@ def test_web_mutation_preview_expands_safely_without_growing_the_timeline() -> N
     assert timeline_entry.expanded_preview == ()
     assert len(timeline_entry.preview) == 6
     assert latest_change is not None
+    assert projection.snapshot.workspace_changes == (latest_change,)
+    assert projection.snapshot.workspace_changes_complete is True
+    assert projection.snapshot.omitted_change_count == 0
     assert len(latest_change.expanded_preview) == 80
     assert latest_change.expanded_preview[0] == "--- a/pricing.py"
     assert latest_change.expanded_preview[-1] == "+new line 99"

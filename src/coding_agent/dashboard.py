@@ -62,6 +62,7 @@ _NO_CURRENT_EVIDENCE_STATUSES = {"pending", "missing", "stale", "unverified"}
 _MAX_PLAN_LINES = 8
 _MAX_EVIDENCE_LABELS = 8
 _MAX_CHANGED_FILES = 12
+MAX_WORKSPACE_CHANGES = 100
 MAX_EXPANDED_MUTATION_PREVIEW_LINES = 80
 _MAX_EXPANDED_DIFF_LINE_CHARS = 240
 _MAX_VISIBLE_RUNTIME_LIMIT = 1_000_000
@@ -133,6 +134,9 @@ class DashboardSnapshot:
     stop_reason: str | None
     plan_lines: tuple[str, ...]
     timeline: tuple[TimelineEntry, ...]
+    workspace_changes: tuple[TimelineEntry, ...]
+    workspace_changes_complete: bool
+    omitted_change_count: int
     latest_change: TimelineEntry | None
 
     @property
@@ -184,7 +188,8 @@ class DashboardProjection:
         self._run_failed = False
         self._stop_reason: str | None = None
         self._plan_lines: tuple[str, ...] = ()
-        self._latest_change: TimelineEntry | None = None
+        self._workspace_changes: deque[TimelineEntry] = deque(maxlen=MAX_WORKSPACE_CHANGES)
+        self._omitted_change_count = 0
 
     @property
     def snapshot(self) -> DashboardSnapshot:
@@ -210,7 +215,10 @@ class DashboardProjection:
             stop_reason=self._stop_reason,
             plan_lines=self._plan_lines,
             timeline=tuple(self._timeline),
-            latest_change=self._latest_change,
+            workspace_changes=tuple(self._workspace_changes),
+            workspace_changes_complete=self._omitted_change_count == 0,
+            omitted_change_count=self._omitted_change_count,
+            latest_change=(self._workspace_changes[-1] if self._workspace_changes else None),
         )
 
     def apply(self, event: RunEvent) -> TimelineEntry | None:
@@ -445,20 +453,22 @@ class DashboardProjection:
             # or malformed safe preview clears it rather than showing a stale plan.
             self._plan_lines = preview
         if successful_mutation and entry.preview:
-            latest_change = entry
+            workspace_change = entry
             if self._expanded_mutation_preview_lines:
                 expanded_preview, projection_complete = _expanded_mutation_preview(
                     data.get("preview"),
                     max_lines=self._expanded_mutation_preview_lines,
                 )
-                latest_change = replace(
+                workspace_change = replace(
                     entry,
                     expanded_preview=expanded_preview,
                     expanded_preview_complete=(
                         projection_complete and _mutation_preview_is_complete(data)
                     ),
                 )
-            self._latest_change = latest_change
+            if len(self._workspace_changes) == MAX_WORKSPACE_CHANGES:
+                self._omitted_change_count += 1
+            self._workspace_changes.append(workspace_change)
         if name in _MUTATION_TOOLS and explicit_ok is True:
             self._record_changed_file(data)
         return entry

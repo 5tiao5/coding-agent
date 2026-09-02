@@ -2,6 +2,19 @@
 
 export const COLLAPSED_DIFF_LINES = 8;
 
+function recordValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function scalarText(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function finiteNumber(value, fallback = -1) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function stringLines(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -47,4 +60,38 @@ export function diffPreviewView(rawChange, expanded = false) {
     totalLines,
     visibleLines,
   };
+}
+
+export function workspaceChangeKey(rawChange, runId) {
+  const change = recordValue(rawChange) || {};
+  return JSON.stringify([
+    scalarText(runId),
+    scalarText(change.activity_id),
+    finiteNumber(change.step),
+    finiteNumber(change.offset_seconds),
+    scalarText(change.headline),
+    scalarText(change.detail),
+  ]);
+}
+
+export function workspaceChangeLedgerView(rawSnapshot) {
+  const snapshot = recordValue(rawSnapshot) || {};
+  const known = Array.isArray(snapshot.workspace_changes);
+  const latest = recordValue(snapshot.latest_change);
+  const changes = known
+    ? snapshot.workspace_changes.filter((change) => recordValue(change) !== null)
+    : latest
+      ? [latest]
+      : [];
+  const rawOmitted = finiteNumber(snapshot.omitted_change_count, 0);
+  const omittedCount = Math.max(0, Math.floor(rawOmitted));
+
+  let note = "";
+  if (known && snapshot.workspace_changes_complete === false) {
+    note = omittedCount
+      ? `较早的 ${omittedCount} 次工作区变更因展示上限未加载；当前显示最近 ${changes.length} 次。`
+      : "较早的工作区变更因展示上限未加载。";
+  }
+
+  return { changes, known, note, omittedCount };
 }

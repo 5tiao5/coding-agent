@@ -79,8 +79,14 @@
 
         <form class="run-form" id="run-form">
           <div class="run-heading">
-            <label for="task-input">新任务</label>
+            <label id="task-input-label" for="task-input">新任务</label>
             <span>Ctrl / ⌘ + ↵</span>
+          </div>
+          <div class="follow-up-context" id="follow-up-context" hidden>
+            <span>
+              继续任务 <strong id="follow-up-run-label"></strong>
+            </span>
+            <button id="follow-up-cancel" type="button">取消</button>
           </div>
           <textarea
             id="task-input"
@@ -90,6 +96,14 @@
             placeholder="先选择项目，再描述一个明确的编程任务…"
             required
           ></textarea>
+          <label class="memory-option" id="memory-option" hidden>
+            <input id="use-project-memory" name="use_project_memory" type="checkbox" checked>
+            <span class="memory-option-toggle" aria-hidden="true"></span>
+            <span class="memory-option-copy">
+              <strong>使用项目记忆</strong>
+              <small id="memory-option-detail">控制本轮读取；摘要仅存本机，测试与验证仍会重跑</small>
+            </span>
+          </label>
           <button class="run-button" id="run-button" type="submit">
             <span class="run-button-icon" aria-hidden="true"></span>
             <span id="run-button-label">启动智能体</span>
@@ -309,6 +323,47 @@
           <button class="dialog-button dialog-button-primary" id="project-dialog-submit" type="submit">
             打开项目
           </button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog
+      class="project-dialog project-remove-dialog"
+      id="project-remove-dialog"
+      aria-labelledby="project-remove-title"
+      aria-describedby="project-remove-copy project-remove-name project-remove-root project-remove-message"
+      aria-busy="false"
+    >
+      <form class="project-dialog-form" id="project-remove-form">
+        <header class="project-dialog-heading">
+          <div>
+            <p class="section-kicker">项目管理</p>
+            <h2 id="project-remove-title">从列表移除项目</h2>
+          </div>
+          <button
+            class="dialog-close"
+            id="project-remove-close"
+            type="button"
+            aria-label="关闭"
+          >×</button>
+        </header>
+
+        <p class="project-dialog-copy" id="project-remove-copy">
+          仅从 Relay 项目列表隐藏。不会删除本地目录；重新打开同一路径，可恢复历史与项目记忆。
+        </p>
+        <div class="project-remove-summary">
+          <strong id="project-remove-name">未命名项目</strong>
+          <span id="project-remove-root">本地目录</span>
+        </div>
+
+        <p class="dialog-message" id="project-remove-message" aria-live="polite"></p>
+        <footer class="project-dialog-actions">
+          <button class="dialog-button" id="project-remove-cancel" type="button">取消</button>
+          <button
+            class="dialog-button dialog-button-danger"
+            id="project-remove-submit"
+            type="submit"
+          >确认移除</button>
         </footer>
       </form>
     </dialog>

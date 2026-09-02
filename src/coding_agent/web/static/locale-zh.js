@@ -16,6 +16,16 @@ const PHASE_LABELS = {
   WAITING: "等待任务",
 };
 
+const RESUME_REASON_LABELS = {
+  budget_exhausted: "本次任务已经用完运行预算",
+  checkpoint_invalid: "恢复检查点不可用",
+  checkpoint_missing: "没有可恢复的检查点",
+  run_active: "已有任务正在运行",
+  terminal: "任务已经正常结束",
+  trace_completed: "运行轨迹显示任务已经完成",
+  workspace_changed: "项目目录身份已经变化",
+};
+
 const TIMELINE_HEADLINES = {
   "Action selected": "下一步已确定",
   "Checkpoint not saved": "检查点未保存",
@@ -355,4 +365,9 @@ export function translateServerDetail(value) {
     return "此本地界面仅允许运行预设任务。";
   }
   return text;
+}
+
+export function translateResumeReason(value) {
+  const text = asText(value).trim();
+  return RESUME_REASON_LABELS[text] || text || "该任务当前不能继续";
 }

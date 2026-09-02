@@ -46,6 +46,10 @@ class StatePaths:
     def runs(self) -> Path:
         return self.root / "runs"
 
+    @property
+    def project_memories(self) -> Path:
+        return self.root / "project-memories"
+
 
 def default_state_paths(environment: dict[str, str] | None = None) -> StatePaths:
     """Resolve an explicit override or the native per-user state directory."""

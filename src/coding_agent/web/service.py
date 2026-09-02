@@ -20,6 +20,7 @@ from coding_agent.errors import CodedError
 from coding_agent.events import EventSink, RunEvent
 from coding_agent.models import AgentResult, AgentState
 from coding_agent.public_errors import public_coded_error, public_result_error
+from coding_agent.run_id import require_run_id
 
 WebRunStatus = Literal["idle", "running", "completed", "completed_unverified", "failed"]
 DEFAULT_CANCELLATION_GRACE_SECONDS = 0.25
@@ -86,6 +87,24 @@ class RunLimitsPayload(TypedDict):
     max_total_tool_calls: int
 
 
+class ProjectMemorySourcePayload(TypedDict):
+    """One immutable run attribution shown for injected project memory."""
+
+    run_id: str
+    task: str
+    completed_at: str | None
+
+
+class ProjectMemoryContextPayload(TypedDict):
+    """Auditable provenance for the historical context selected at run start."""
+
+    requested: bool
+    applied: bool
+    source_run_ids: list[str]
+    sources: list[ProjectMemorySourcePayload]
+    error: str | None
+
+
 class SnapshotPayload(TypedDict):
     """Browser-safe subset of :class:`DashboardSnapshot`."""
 
@@ -106,6 +125,9 @@ class SnapshotPayload(TypedDict):
     outcome: str
     plan_lines: list[str]
     timeline: list[TimelinePayload]
+    workspace_changes: list[LatestChangePayload]
+    workspace_changes_complete: bool
+    omitted_change_count: int
     latest_change: LatestChangePayload | None
 
 
@@ -118,6 +140,7 @@ class WebRunStatePayload(TypedDict):
     final_text: str | None
     error: str | None
     snapshot: SnapshotPayload | None
+    memory_context: ProjectMemoryContextPayload | None
 
 
 class WebRunner(Protocol):
@@ -150,6 +173,10 @@ class WebRunStartError(RuntimeError):
     """The operating system refused to start the background worker."""
 
 
+class WebResumeUnsupportedError(RuntimeError):
+    """This Web host was not configured with an explicit resume runner."""
+
+
 class _ProjectionSink:
     """Fold events into the service without retaining raw event records."""
 
@@ -177,6 +204,7 @@ class WebRunService:
         max_timeline: int = 10,
         cancellation_source: None = None,
         cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
+        resume_runner: WebRunner | Callable[[str, str, EventSink], AgentResult] | None = None,
     ) -> None: ...
 
     @overload
@@ -188,6 +216,9 @@ class WebRunService:
         max_timeline: int = 10,
         cancellation_source: CancellationSource,
         cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
+        resume_runner: CancellableWebRunner
+        | Callable[[str, str, EventSink, CancellationToken], AgentResult]
+        | None = None,
     ) -> None: ...
 
     def __init__(
@@ -200,6 +231,11 @@ class WebRunService:
         max_timeline: int = 10,
         cancellation_source: CancellationSource | None = None,
         cancellation_grace_seconds: float = DEFAULT_CANCELLATION_GRACE_SECONDS,
+        resume_runner: WebRunner
+        | CancellableWebRunner
+        | Callable[[str, str, EventSink], AgentResult]
+        | Callable[[str, str, EventSink, CancellationToken], AgentResult]
+        | None = None,
     ) -> None:
         if max_timeline < 1:
             raise ValueError("max_timeline must be at least 1")
@@ -212,6 +248,7 @@ class WebRunService:
                 f"cancellation_grace_seconds must be between 0 and {MAX_CANCELLATION_GRACE_SECONDS}"
             )
         self._runner = runner
+        self._resume_runner = resume_runner
         self._max_timeline = max_timeline
         self._cancellation_source = cancellation_source
         self._cancellation_grace_seconds = cancellation_grace_seconds
@@ -228,6 +265,22 @@ class WebRunService:
 
     def start(self, task: str) -> WebRunStatePayload:
         """Start one run immediately and reject overlap with the active worker."""
+        return self._start_worker(uuid4().hex, task, resume=False)
+
+    def resume(self, run_id: str, task: str) -> WebRunStatePayload:
+        """Continue one host-validated checkpoint under its original run ID."""
+        if self._resume_runner is None:
+            raise WebResumeUnsupportedError("此本地 Agent 服务不支持继续旧任务")
+        return self._start_worker(require_run_id(run_id), task, resume=True)
+
+    def _start_worker(
+        self,
+        run_id: str,
+        task: str,
+        *,
+        resume: bool,
+    ) -> WebRunStatePayload:
+        """Install one fresh projection before launching a new or resumed segment."""
         normalized_task = task.strip()
         if not normalized_task:
             raise ValueError("task cannot be blank")
@@ -237,7 +290,6 @@ class WebRunService:
                 raise WebServiceClosedError("本地 Agent 服务正在关闭")
             if self._worker is not None and self._worker.is_alive():
                 raise RunAlreadyActiveError("已有任务正在运行")
-            run_id = uuid4().hex
             self._status = "running"
             self._run_id = run_id
             self._task = normalized_task
@@ -251,8 +303,8 @@ class WebRunService:
             self._cancellation_requested = False
             worker = Thread(
                 target=self._run,
-                args=(run_id, normalized_task),
-                name=f"coding-agent-web-{run_id[:8]}",
+                args=(run_id, normalized_task, resume),
+                name=f"coding-agent-web-{'resume-' if resume else ''}{run_id[:8]}",
                 daemon=True,
             )
             self._worker = worker
@@ -315,14 +367,17 @@ class WebRunService:
         worker.join(self._cancellation_grace_seconds)
         return not worker.is_alive()
 
-    def _run(self, run_id: str, task: str) -> None:
+    def _run(self, run_id: str, task: str, resume: bool) -> None:
         try:
             sink = _ProjectionSink(self, run_id)
+            selected_runner = self._resume_runner if resume else self._runner
+            if selected_runner is None:  # ``resume`` checks this before starting the worker.
+                raise WebResumeUnsupportedError("此本地 Agent 服务不支持继续旧任务")
             if self._cancellation_source is None:
-                runner = cast(WebRunner, self._runner)
+                runner = cast(WebRunner, selected_runner)
                 result = runner(run_id, task, sink)
             else:
-                cancellable_runner = cast(CancellableWebRunner, self._runner)
+                cancellable_runner = cast(CancellableWebRunner, selected_runner)
                 result = cancellable_runner(
                     run_id,
                     task,
@@ -365,6 +420,7 @@ class WebRunService:
             "final_text": self._final_text,
             "error": self._error,
             "snapshot": _snapshot_payload(snapshot) if snapshot is not None else None,
+            "memory_context": None,
         }
 
 
@@ -421,6 +477,11 @@ def _snapshot_payload(snapshot: DashboardSnapshot) -> SnapshotPayload:
         "outcome": snapshot.outcome,
         "plan_lines": _plan_lines(snapshot),
         "timeline": [_timeline_payload(entry) for entry in snapshot.timeline],
+        "workspace_changes": [
+            _latest_change_payload(entry) for entry in snapshot.workspace_changes
+        ],
+        "workspace_changes_complete": snapshot.workspace_changes_complete,
+        "omitted_change_count": snapshot.omitted_change_count,
         "latest_change": (
             _latest_change_payload(snapshot.latest_change)
             if snapshot.latest_change is not None
