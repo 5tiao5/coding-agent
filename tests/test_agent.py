@@ -1275,6 +1275,201 @@ def test_early_final_correction_consumes_a_turn_and_survives_resume(tmp_path: Pa
     )
 
 
+def test_verification_closeout_retries_one_premature_final_before_verifying() -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=(ToolCall(id="write-before-closeout", name="write_file"),)),
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-before-late-change", name="verification_marker"),)
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="late-general-command",
+                        name="run_command",
+                        arguments={"argv": ["python", "-c", "print('diagnostic')"]},
+                    ),
+                )
+            ),
+            ModelResponse(content="Done after stale verification."),
+            ModelResponse(content="I still need to request the verifier."),
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-after-retry", name="verification_marker"),)
+            ),
+            ModelResponse(content="Now verified and complete."),
+        ]
+    )
+    events = MemoryEventSink()
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([MemoryWriteTool(), CommandProbeTool(), VerificationMarkerTool()]),
+        event_sink=events,
+        max_steps=8,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Retry a premature closeout response")
+
+    assert result.state is AgentState.COMPLETED
+    assert result.steps == 7
+    assert (
+        sum(EARLY_FINAL_CORRECTION_MARKER in (message.content or "") for message in result.messages)
+        == 2
+    )
+    assert "verification calls only" in (model.requests[4].messages[0].content or "")
+    assert "verification calls only" in (model.requests[5].messages[0].content or "")
+    recorded = [event for event in events.events if event.kind is EventKind.VERIFICATION_RECORDED]
+    invalidated = [
+        event for event in events.events if event.kind is EventKind.VERIFICATION_INVALIDATED
+    ]
+    assert [event.data["epoch"] for event in recorded] == [1, 2]
+    assert [event.data["epoch"] for event in invalidated] == [1, 2]
+
+
+def test_verification_closeout_correction_is_bounded() -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="write-before-bounded-closeout", name="write_file"),)
+            ),
+            ModelResponse(content="Done before verification."),
+            ModelResponse(content="Still no verifier call."),
+            ModelResponse(content="Still refusing to call the verifier."),
+            ModelResponse(content="Cannot verify."),
+        ]
+    )
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([MemoryWriteTool(), VerificationMarkerTool()]),
+        max_steps=6,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Bound repeated premature closeout responses")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.steps == 5
+    assert (
+        sum(EARLY_FINAL_CORRECTION_MARKER in (message.content or "") for message in result.messages)
+        == 3
+    )
+
+
+def test_failed_closeout_verifier_returns_to_work_before_reverification() -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    write = MemoryWriteTool()
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=(ToolCall(id="write-broken-change", name="write_file"),)),
+            ModelResponse(content="Done before verification."),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="verify-broken-change",
+                        name="verification_marker",
+                        arguments={"passed": False},
+                    ),
+                )
+            ),
+            ModelResponse(tool_calls=(ToolCall(id="repair-after-failure", name="write_file"),)),
+            ModelResponse(tool_calls=(ToolCall(id="verify-repair", name="verification_marker"),)),
+            ModelResponse(content="The repaired workspace is verified."),
+        ]
+    )
+
+    result = AgentRunner(
+        model,
+        ToolRegistry([write, VerificationMarkerTool()]),
+        max_steps=7,
+        verification_profile=profile,
+        completion_contract=CompletionContract(required_scopes=("tests",)),
+    ).run("Repair after a closeout verifier fails")
+
+    assert result.state is AgentState.COMPLETED
+    assert result.steps == 6
+    assert write.calls == 2
+    assert "[CODING_AGENT_CLOSEOUT]" not in (model.requests[3].messages[0].content or "")
+
+
+def test_resume_after_failed_closeout_verifier_does_not_restore_verifier_only_mode(
+    tmp_path: Path,
+) -> None:
+    profile = VerificationProfile(
+        checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),
+        required_labels=("test-suite",),
+        target_runtime=TargetRuntime("configured-python", True),
+    )
+    contract = CompletionContract(required_scopes=("tests",))
+    store = SessionStore((tmp_path / "state").resolve())
+    write = MemoryWriteTool()
+    initial = AgentRunner(
+        ScriptedModel(
+            [
+                ModelResponse(
+                    tool_calls=(ToolCall(id="write-before-failed-resume", name="write_file"),)
+                ),
+                ModelResponse(content="Done before verification."),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            id="failed-verifier-before-resume",
+                            name="verification_marker",
+                            arguments={"passed": False},
+                        ),
+                    )
+                ),
+            ]
+        ),
+        ToolRegistry([write, VerificationMarkerTool()]),
+        session_store=store,
+        max_steps=7,
+        verification_profile=profile,
+        completion_contract=contract,
+    ).run("Resume and repair after a failed closeout verifier")
+
+    checkpoint = store.load(initial.run_id)
+    assert initial.state is AgentState.FAILED
+    assert checkpoint.checkpoint.stop_boundary is SessionBoundary.READY_FOR_MODEL
+    assert checkpoint.checkpoint.completed_steps == 3
+
+    resumed_model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=(ToolCall(id="repair-after-resume", name="write_file"),)),
+            ModelResponse(
+                tool_calls=(ToolCall(id="verify-after-resume-repair", name="verification_marker"),)
+            ),
+            ModelResponse(content="The resumed repair is verified."),
+        ]
+    )
+    resumed = AgentRunner(
+        resumed_model,
+        ToolRegistry([write, VerificationMarkerTool()]),
+        session_store=store,
+        max_steps=7,
+        verification_profile=profile,
+        completion_contract=contract,
+    ).resume(checkpoint)
+
+    assert resumed.state is AgentState.COMPLETED
+    assert resumed.steps == 6
+    assert write.calls == 2
+    assert "[CODING_AGENT_CLOSEOUT]" not in (resumed_model.requests[0].messages[0].content or "")
+
+
 def test_early_final_correction_requires_a_workspace_mutation() -> None:
     profile = VerificationProfile(
         checks=(VerificationCheck("test-suite", VerificationKind.TEST, ("tests",)),),

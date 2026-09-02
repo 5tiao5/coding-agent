@@ -41,6 +41,7 @@ Runtime evidence, not your textual claim, determines whether the result is verif
 RUNTIME_LIMITS_MARKER = "[CODING_AGENT_RUNTIME_LIMITS]"
 RUNTIME_LIMITS_END_MARKER = "[/CODING_AGENT_RUNTIME_LIMITS]"
 MAX_CONSECUTIVE_TOOL_BATCH_REJECTIONS = 3
+MAX_EARLY_FINAL_CORRECTIONS = 3
 TOOL_BATCH_REJECTED_ERROR_CODE = "tool_batch_rejected"
 PROTOCOL_CORRECTION_MARKER = "[CODING_AGENT_PROTOCOL_CORRECTION]"
 PROTOCOL_CORRECTION_INSTRUCTION = (
@@ -53,9 +54,10 @@ EARLY_FINAL_CORRECTION_MARKER = "[CODING_AGENT_EARLY_FINAL_CORRECTION]"
 EARLY_FINAL_CORRECTION = (
     f"{EARLY_FINAL_CORRECTION_MARKER}\n"
     "Host correction: workspace files changed, but the completion contract still lacks "
-    "current verification. On the next turn, request only the smallest registered verifier "
-    "batch needed for the current workspace. Do not inspect or modify files, and do not "
-    "return another final answer before requesting those checks."
+    "current verification. On the next turn, respond with tool calls for only the smallest "
+    "registered verifier batch needed for the current workspace, not with explanatory text. "
+    "Do not inspect or modify files, and do not return another final answer before requesting "
+    "those checks."
 )
 
 PRESENTATION_PREVIEW_TOOLS = frozenset({"replace_text", "undo_change", "update_plan", "write_file"})
@@ -282,9 +284,9 @@ def with_closeout_instruction(
     assert system.content is not None
     if purpose == "verification":
         instruction = (
-            "The work-turn budget is exhausted. This turn is reserved for recognized "
-            "verification calls only; do not inspect or modify files. Request the smallest "
-            "registered verification batch needed to validate the current workspace."
+            "This turn is reserved for recognized verification calls only; do not inspect or "
+            "modify files. Respond with tool calls for the smallest registered verification "
+            "batch needed to validate the current workspace, not with explanatory text."
         )
     else:
         instruction = (
@@ -302,7 +304,7 @@ def append_early_final_correction(
     messages: list[ChatMessage],
     response: ModelResponse,
 ) -> None:
-    """Close a premature textual answer with one provider-valid host user correction."""
+    """Close a premature textual answer with a provider-valid host user correction."""
 
     assert not response.tool_calls
     assert response.content is not None
@@ -315,7 +317,7 @@ def append_early_final_correction(
 
 
 def early_final_correction_event_data(*, remaining_model_turns: int) -> dict[str, object]:
-    """Describe the one host-scheduled verification closeout without model text."""
+    """Describe a host-scheduled verification closeout without model text."""
 
     return {
         "retry_kind": "verification_closeout",
@@ -331,9 +333,30 @@ def is_early_final_correction(message: ChatMessage) -> bool:
 
 
 def has_early_final_correction(messages: Sequence[ChatMessage]) -> bool:
-    """Recover the once-only correction flag from a canonical transcript."""
+    """Return whether a canonical transcript contains a verification-closeout correction."""
 
-    return any(is_early_final_correction(message) for message in messages[2:])
+    return count_early_final_corrections(messages) > 0
+
+
+def count_early_final_corrections(messages: Sequence[ChatMessage]) -> int:
+    """Count every verification-closeout correction in a canonical transcript."""
+
+    return sum(is_early_final_correction(message) for message in messages[2:])
+
+
+def trailing_early_final_corrections(messages: Sequence[ChatMessage]) -> int:
+    """Count corrections since the latest executed tool result.
+
+    A successful tool batch starts a new closeout episode.  Keeping this count
+    episode-local means an earlier verify/retry cycle cannot consume the retry
+    allowance for a later workspace invalidation, including after resume.
+    """
+
+    last_tool_index = max(
+        (index for index, message in enumerate(messages) if message.role is MessageRole.TOOL),
+        default=1,
+    )
+    return sum(is_early_final_correction(message) for message in messages[last_tool_index + 1 :])
 
 
 def should_append_early_final_correction(
@@ -343,13 +366,13 @@ def should_append_early_final_correction(
     ledger: VerificationLedger,
     profile: VerificationProfile | None,
     contract: CompletionContract | None,
-    already_corrected: bool,
+    correction_count: int,
     remaining_model_turns: int,
 ) -> bool:
-    """Require one normal verifier turn after a changed workspace closes too early."""
+    """Require a bounded verifier retry after a changed workspace closes too early."""
 
     if (
-        already_corrected
+        correction_count >= MAX_EARLY_FINAL_CORRECTIONS
         or response.tool_calls
         or profile is None
         or contract is None
@@ -417,6 +440,22 @@ def requires_current_verification(
         return False
     assert contract is not None
     return not evaluate_completion(profile, contract, ledger.report()).task_validated
+
+
+def verification_closeout_failed(
+    ledger: VerificationLedger,
+    profile: VerificationProfile | None,
+    contract: CompletionContract | None,
+) -> bool:
+    """Return whether a reserved verifier turn proved that repair work is needed."""
+
+    if profile is None:
+        return False
+    assert contract is not None
+    return (
+        evaluate_completion(profile, contract, ledger.report()).completion_status
+        is CompletionStatus.FAILED
+    )
 
 
 def closeout_turn_purpose(

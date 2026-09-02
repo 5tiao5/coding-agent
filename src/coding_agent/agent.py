@@ -297,8 +297,8 @@ class AgentRunner:
             for call in message.tool_calls
         }
         consecutive_batch_rejections = protocol.trailing_tool_batch_rejections(messages)
-        early_final_corrected = protocol.has_early_final_correction(messages)
-        closeout_mode = early_final_corrected
+        early_final_correction_count = protocol.trailing_early_final_corrections(messages)
+        closeout_mode = early_final_correction_count > 0
 
         for step in range(first_step, policy.max_model_turns + 1):
             turn_purpose: BudgetPurpose = (
@@ -516,11 +516,11 @@ class AgentRunner:
                 ledger=verification,
                 profile=self._verification_profile,
                 contract=self._completion_contract,
-                already_corrected=early_final_corrected,
+                correction_count=early_final_correction_count,
                 remaining_model_turns=budget_state.remaining_model_turns,
             ):
                 protocol.append_early_final_correction(messages, response)
-                early_final_corrected = True
+                early_final_correction_count += 1
                 closeout_mode = True
                 consecutive_batch_rejections = 0
                 self._emit(
@@ -808,6 +808,17 @@ class AgentRunner:
                             "The same tool call produced the same observation "
                             f"{repeated.streak} consecutive times",
                         )
+                if turn_purpose == "verification" and protocol.verification_closeout_failed(
+                    verification,
+                    self._verification_profile,
+                    self._completion_contract,
+                ):
+                    # A failing verifier is evidence that more work is required, not a
+                    # reason to trap the model in verifier-only closeout turns.  The next
+                    # turn may inspect or repair the workspace; fresh verification remains
+                    # mandatory before completion can become trusted.
+                    closeout_mode = False
+                early_final_correction_count = 0
                 self._save_checkpoint(
                     run_id,
                     task,
