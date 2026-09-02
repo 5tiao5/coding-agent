@@ -1,108 +1,180 @@
-# Coding Agent
+# Relay Coding Agent
 
 [![CI](https://github.com/5tiao5/coding-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/5tiao5/coding-agent/actions/workflows/ci.yml)
 
-A small, observable coding agent built from first principles for the NJU software engineering recommendation assessment.
+> 一个从核心循环开始自行实现、可观察、可恢复、可验证的本地编程智能体。
 
-第一次阅读代码库，建议先看 [中文工作原理与源码导览](docs/HOW_IT_WORKS.md)：它用 RouteForge
-任务解释模型、工具、验证、上下文、恢复与 Web 界面之间的完整因果链。
+本项目面向南京大学软件工程推免考核。Relay 能在指定项目目录中阅读与搜索代码、制定计划、修改文件、运行命令，并根据结果继续迭代。它同时提供终端界面和中文 Web 工作台，但两种界面共用同一套 Agent 内核、工具系统、权限策略与可信验证逻辑。
 
-The M4 core and M5 reliability/evaluation slice are complete. **M5.5** adds a bounded local project workbench around the same Agent runtime: choose or create a project, run one task, and replay that project's validated trace projection from a Codex-style sidebar. **M5.6** turns the timeline into a compact audit view: paired tool start/finish events collapse into one card, while credential-redacted command and verification facts can be expanded on demand. **M5.7** separates same-run checkpoint recovery from completed-run follow-up: the former resumes in place, while the latter creates a child run with `parent_run_id` and bounded `ProjectMemory`. Both demos tell one complete repair story:
+一次完整任务的主线是：
 
-`plan → failing pytest → search/read → revision-checked diff → passing pytest → VERIFIED`
+~~~text
+任务 → 计划 → 读取/搜索 → 修改与 Diff → 执行检查 → 可信验证 → 最终回复
+~~~
 
-`VERIFIED` is not model prose. The runtime grants it only when a host-registered exact test/build/check command passes after the latest known workspace mutation.
+其中 **VERIFIED（已验证）不是模型自己说了算**。只有宿主在最新文件变更之后运行登记过的精确检查，并确认项目策略与受保护内容没有漂移，Verification Gate 才会授予这一状态。
 
-## Quick start
+第一次了解项目，推荐先阅读 [工作原理与源码导览](docs/HOW_IT_WORKS.md)。
 
-Prerequisites: Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). Install exactly the
-locked development environment before running the checks:
+## 核心特色
 
-```powershell
+- **核心机制自行实现**：自行实现 Model–Tool–Observation 循环、上下文选择、工具调度、停止条件、重试、检查点和验证判定，不依赖 LangChain、OpenAI Agents SDK 等 Agent 框架。
+- **CLI 与 Web 双界面**：Rich 终端适合开发与调试；中文 Web 工作台适合项目管理、过程观察与视频演示。
+- **全过程可观察**：展示结构化计划、工具调用、命令参数、工作目录、输出、耗时、跨恢复阶段的有界变更账本、可展开 Diff 和验证证据；超限会明确标注。
+- **可信验证**：模型文本、命令退出码和“任务已验证”三者分离，旧证据在文件变化后立即失效。
+- **任务连续性**：支持恢复中断运行、继续已完成任务，以及项目级轻量记忆 ProjectMemory。
+- **独立评测**：在临时仓库运行真实模型，再由工作区外 sibling oracle 独立检查结果，统计假阳性。
+- **有界且诚实**：模型轮次、工具调用、上下文、输出和历史展示都有明确上限；发生裁剪、过期或缺失时会直接标注。
+
+## 快速开始
+
+需要 Python 3.11 或更高版本，以及 [uv](https://docs.astral.sh/uv/)。
+
+~~~powershell
+git clone https://github.com/5tiao5/coding-agent.git
+cd coding-agent
 uv sync --locked --all-groups
+~~~
+
+### 离线终端演示
+
+~~~powershell
 uv run coding-agent demo
+~~~
+
+### 离线 Web 演示
+
+~~~powershell
 uv run coding-agent web --demo
-uv run coding-agent evaluate --help
-uv run ruff check src tests
-uv run mypy src tests
-node --test tests/js/*.test.mjs
-uv run pytest
-```
+~~~
 
-Neither demo needs an API key or network. `coding-agent demo` uses the Rich terminal dashboard;
-`coding-agent web --demo` binds only to `127.0.0.1:8765`, opens the browser, and starts the same
-fixed repair scenario in an ephemeral fixture. `ScriptedModel` supplies deterministic decisions while
-the real Agent loop, tools, subprocess, diff, verification gate, and events still execute. Use
-`--no-open-browser` or `--port <port>` when needed.
+浏览器将打开 http://127.0.0.1:8765。两个离线演示都不需要 API Key 或网络；ScriptedModel 只提供确定性的模型决策，真实的 Agent 循环、工具、子进程、Diff、事件与 Verification Gate 仍会完整执行。
 
-For a real repository run, provide the API key through the process environment or the fixed,
-untracked `.env.local` file and select the model explicitly:
+如不希望自动打开浏览器：
 
-```powershell
-$env:OPENAI_API_KEY = "..."
-$env:CODING_AGENT_MODEL = "<responses-compatible-model>"
-uv run coding-agent run "Fix the failing tests and verify the repair" --root . --mode safe
-```
+~~~powershell
+uv run coding-agent web --demo --no-open-browser
+~~~
 
-For repeat local runs, copy the committed placeholder file once, edit the copy, and keep it private:
+## 使用真实模型
 
-```powershell
+### 配置 API
+
+Relay 只从进程环境或启动目录中的未跟踪文件 .env.local 读取模型配置。推荐先复制模板：
+
+~~~powershell
 Copy-Item .env.example .env.local
 notepad .env.local
-uv run coding-agent evaluate --live --allow-paid-api --case single-file --format json
-```
+~~~
 
-Only `.env.local` in the launch directory is read; parent directories are never searched. The
-loader accepts only the four model settings shown in `.env.example`, disables value interpolation,
-and never replaces a value already present in the process environment. The file is Git-ignored but
-is still plaintext on disk, so do not display it in a recording or reuse a key that was committed.
+配置项如下：
 
-For DeepSeek's Responses-compatible endpoint, use its currently supported Responses model and
-explicitly disable reasoning for the stateless tool loop:
+~~~dotenv
+OPENAI_API_KEY=你的密钥
+OPENAI_BASE_URL=Responses API 兼容端点
+CODING_AGENT_MODEL=模型名称
+CODING_AGENT_REASONING_EFFORT=none
+~~~
 
-```powershell
-$env:OPENAI_API_KEY = "<DeepSeek API key>"
-$env:OPENAI_BASE_URL = "https://api.deepseek.com"
-$env:CODING_AGENT_MODEL = "deepseek-v4-flash"
-$env:CODING_AGENT_REASONING_EFFORT = "none"
-uv run coding-agent run "Inspect this repository and report one verified improvement" --root . --mode safe
-```
+**OPENAI_API_KEY 只是统一变量名，并不限制密钥厂商或前缀。** 当前适配器调用 OpenAI Responses API，并使用 function_call / function_call_output 工具语义，因此服务端必须真正兼容 Responses API。仅支持 Chat Completions，或只提供 Claude、Gemini 原生协议的服务不能直接接入。
 
-The optional live Web workbench uses the same environment and repository-owned application service:
+- 使用 OpenAI 官方服务时，删除 OPENAI_BASE_URL，并选择支持 Responses 与函数工具调用的模型。
+- DeepSeek 已通过本项目真实评测；无状态工具循环应将推理强度设为 none。
+- 其他网关或本地模型服务只有完整兼容 Responses API 和工具调用时才可能使用，不能只凭“OpenAI-compatible”字样判断。
+- 远程端点必须使用 HTTPS；只有 localhost 或回环地址允许 HTTP。URL 不能包含凭据、查询参数或 fragment。
 
-```powershell
-# Start at the project chooser. The model may also come from .env.local.
-uv run coding-agent web --model <model> --mode safe
+DeepSeek 配置示例：
 
-# Optional shortcut: register and select this directory immediately.
-uv run coding-agent web --root . --model <model> --mode safe
+~~~dotenv
+OPENAI_API_KEY=<DeepSeek API Key>
+OPENAI_BASE_URL=https://api.deepseek.com
+CODING_AGENT_MODEL=deepseek-v4-flash
+CODING_AGENT_REASONING_EFFORT=none
+~~~
 
-# The ceiling also applies cumulatively when Web resumes a ready checkpoint.
-uv run coding-agent web --root . --model <model> --mode auto --max-steps 50
-```
+.env.local 只会从命令启动目录读取，不向父目录搜索；进程环境中已有的值优先。该文件已被 Git 忽略，但仍是磁盘明文，请勿在录屏中展示，也不要提交真实密钥。
 
-服务器重启后重新打开同一项目，仍有 `READY_FOR_MODEL` 检查点、目录指纹一致且尚未完成
-的历史项会提供“恢复”：它沿用原 `run-id`、canonical transcript 和已消费预算，并重新
-取得同一 per-run lease；`--max-steps` 是累计上限。已完成历史项提供“继续”：用户输入后创建新 `run-id`，并以
-`parent_run_id` 记录父任务；父运行及其轨迹保持只读，新运行重新读取、修改和验证。
+### 启动 Web 工作台
 
-### Trusted project verification
+~~~powershell
+# 进入项目选择页
+uv run coding-agent web --mode auto --max-steps 50
 
-A repository without `.coding-agent/project.toml` can still run the default pytest check, but that
-check is deliberately reported as `checks_only`: the host Python is not assumed to be the project's
-real runtime, so CLI completion exits `3` instead of showing `VERIFIED`. To opt into task validation,
-declare the exact project interpreter and typed checks. The Agent's workspace file tools cannot read or
-change this metadata. Ordinary commands are not an OS sandbox, so every configured verifier rechecks
-the policy and protected paths immediately before and after it runs.
+# 启动时直接选择当前项目
+uv run coding-agent web --root . --mode auto --max-steps 50
+~~~
 
-```toml
+Web 工作台支持：
+
+- 使用 Windows 原生文件夹选择器打开项目，也可手动填写绝对路径；
+- 创建一个此前不存在的空目录作为新项目；
+- 在左侧边栏切换项目、查看历史、继续任务或移除项目；
+- 实时查看计划、工具、命令、验证、文件变更、可展开 Diff 和最终回复；
+- 回放历史运行，并汇总该 run-id 跨恢复阶段最近 100 次文件变更；若更早记录被省略，界面会明确显示数量；
+- 一次只运行一个后台任务，避免两个 Agent 同时修改工作区。
+
+“移除项目”只会从 Relay 边栏隐藏登记项，不会删除磁盘目录和私有历史；重新打开相同目录即可恢复其身份、历史与项目记忆。
+
+### 使用 CLI
+
+~~~powershell
+# safe 是默认模式，普通命令会请求确认
+uv run coding-agent run "修复失败测试并验证修改" --root . --mode safe
+
+# 不传任务字符串时进入交互输入
+uv run coding-agent run --root . --mode safe
+
+# auto 跳过普通命令确认，但仍受拒绝规则约束
+uv run coding-agent run "完成项目并运行测试" --root . --mode auto --max-steps 50
+~~~
+
+CLI 的任务结果使用稳定退出码：
+
+| 退出码 | 含义 |
+|---:|---|
+| 0 | 任务完成，且当前修订获得可信验证 |
+| 1 | 运行或初始化失败，或恢复被拒绝 |
+| 2 | CLI 用法或参数校验错误 |
+| 3 | 已生成最终回复，但验证缺失、失败或已经过期 |
+
+## Agent 如何工作
+
+Relay 不把大模型当作“拥有电脑的程序”，而把它当作可替换的决策器。真正的执行权始终属于宿主。
+
+1. 宿主固定项目根目录、权限模式、预算、工具清单和项目验证策略。
+2. ContextManager 从规范 transcript 与 RunMemory 中选择有界上下文。
+3. ModelAdapter 请求模型，让模型返回自然语言回复或结构化工具调用。
+4. ToolRegistry 校验参数、路径、版本和命令能力后执行工具。
+5. 工具结果以 Observation 返回模型；文件写入同时产生变更记录和 Diff。
+6. 文件变化会让旧验证证据失效；Agent 必须在当前修订上重新运行登记检查。
+7. Stop Policy 与 Verification Gate 根据宿主事实决定任务终态，而不是相信模型的自我声明。
+8. JsonlEventSink、终端和 Web 分别保存或展示同一批事件的不同投影。
+
+~~~text
+CREATED → PLANNING → ACTING ↔ OBSERVING → VERIFYING
+                                      ├→ COMPLETED
+                                      ├→ COMPLETED_UNVERIFIED
+                                      └→ FAILED
+~~~
+
+文件工具默认采用顺序执行，因为修改通常具有先后依赖。单轮可以声明多个独立工具，但最多八个；超大批次会在任何调用执行前整体拒绝，并让模型拆分后重试。
+
+## 可信验证
+
+### 为什么 pytest 返回 0 还不一定算 VERIFIED
+
+未配置项目可以运行默认 pytest，但结果只记为 checks_only。原因是 Relay 无法凭空知道宿主 Python 是否就是项目真实运行环境，也不知道哪些测试、构建或入口检查足以证明任务完成。
+
+要启用可信项目验证，请在仓库根目录创建 .coding-agent/project.toml：
+
+~~~toml
 schema_version = 1
 protected_paths = ["tests/", "conftest.py", "pyproject.toml"]
 
 [python]
-# Windows (forward slashes avoid TOML backslash escaping):
+# Windows；使用正斜杠可避免 TOML 反斜杠转义
 executable = ".venv/Scripts/python.exe"
-# macOS/Linux: replace the line above with executable = ".venv/bin/python"
+# macOS/Linux 可使用：executable = ".venv/bin/python"
 
 [[verifiers]]
 label = "pytest"
@@ -113,259 +185,81 @@ required = true
 
 [completion]
 required_scopes = ["tests"]
-```
+~~~
 
-Create the environment first (`uv sync` is sufficient for this repository) and make the configured
-path match the interpreter you actually intend to demonstrate; no interpreter is auto-discovered or
-silently upgraded to trusted status. A runnable package may add a second verifier with
-`type = "python-module"`, `module = "your_package"`, and a scope such as `runtime:entrypoint`.
-That form always means the fixed no-argument smoke command `python -B -m your_package`; arbitrary
-shell text, argv, or module arguments are not supported.
+可信验证同时绑定：
 
-For a quick manual check, run the same task once without the file and observe `checks_only`/exit `3`,
-then add the file and rerun `uv run coding-agent run ... --root .` or the Web workbench. A configured
-run reaches `VERIFIED` only after every required typed verifier passes and the configuration,
-interpreter hash, and protected paths remain unchanged. Resume also binds to this policy fingerprint;
-a changed policy requires a fresh run.
+- 明确声明的解释器及其文件哈希；
+- verifier 的类型、工作目录和作用域；
+- 项目策略指纹；
+- protected_paths 的前后内容；
+- 最近一次工作区修改之后的新鲜检查证据。
 
-On Windows, “打开项目” first opens the native folder chooser; manual absolute-path input remains as
-a fallback. “新建项目” can browse for its parent and then creates exactly one previously absent empty
-leaf directory; it does not initialize Git, add a template, or overwrite a directory. Project,
-run-catalog, and project-memory data live in the private state directory, not inside the repository. The sidebar
-lists bounded metadata; opening a completed run replays its trace projection and, when a matching
-terminal checkpoint exists, its bounded final reply. Older runs that predate M5.5 metadata are not
-retroactively catalogued, and old or invalid checkpoints fall back to trace-only replay.
+Agent 的工作区文件工具不能读取或修改 .coding-agent/project.toml。每次 verifier 执行前后，宿主都会重新检查策略与受保护内容；任何漂移都会使证据无效。
 
-“移除” only hides a project from Relay's sidebar. It never deletes the workspace or private run
-history; opening the same directory again restores its stable project identity, history, and project
-memory. Removal is rejected while a task is running.
+可运行包还可以增加 type = "python-module" 的入口冒烟检查。该类型固定执行无参数命令 python -B -m your_package，不接受任意 shell 文本或额外参数。
 
-### Run budgets
+## 恢复、继续与 ProjectMemory
 
-`--max-steps` limits model-decision turns, not files. Increasing it also scales the cumulative tool
-capacity to `max(8, 2 × max-steps)`, while the atomic per-turn ceiling remains eight calls. When a
-completion contract is active, the host protects closing capacity for registered verification and
-one honest final response.
+这三个概念解决不同层次的问题：
 
-| Host | Model-turn budget | Tool-call budget |
-|---|---|---|
-| `run` / live `web` | 20 by default; `--max-steps` accepts 1–100 | 8 per turn; `max(8, 2 × turns)` cumulative |
-| CLI / Web `resume` | 20 cumulative turns by default; `--max-steps` accepts 1–100 | same formula, including restored calls |
-| live `evaluate` | 12 per case by default; `--max-steps` accepts 1–20 | 8 per turn; 24 cumulative by default |
-| deterministic CLI/Web demo | 13 turns | 8 per turn; 26 cumulative |
+- **恢复中断任务**：只接受停在 READY_FOR_MODEL 边界、工作区和策略指纹仍匹配的检查点；沿用原 run-id、transcript 和累计预算，但不会恢复旧验证证据。
+- **继续已完成任务**：创建新的子运行，通过 parent_run_id 指向只读父运行；子任务获得父摘要，但会重新读取当前代码并重新验证。
+- **ProjectMemory**：为普通新任务选择少量同项目历史摘要，包括目标、结果、变更统计、验证结果和未解决项。它不保存源码、完整 Diff、命令输出、provider payload 或隐式推理。
 
-One model turn may declare several independent tools, which the Agent executes sequentially. If a
-model proposes more than eight at once, the Agent rejects the whole oversized batch before any of
-its calls execute, returns bounded feedback, and lets the model automatically resubmit the work in
-smaller batches. Cumulative exhaustion is also recoverable: the model receives bounded feedback and
-can close honestly instead of losing the whole run after an already useful batch. For Web,
-`--max-steps` is selected when the local server starts and applies to its live runs; the browser
-cannot override it per task.
+历史内容始终是不可信参考，不能授权工具，也不能替代当前验证。Web 中可以关闭普通项目记忆；显式“继续”仍必须使用父任务摘要，否则操作会失败而不是悄悄退化成无关的新任务。
 
-### Opt-in live evaluation
+CLI 也提供只读历史与同运行恢复：
 
-The evaluation command is network-disabled by default. A real-model run requires both explicit
-consent flags; there is no API-key argument:
-
-```powershell
-# One isolated case (recommended first smoke)
-uv run coding-agent evaluate --live --allow-paid-api --case single-file
-
-# Five categories, stable JSON, and a new report file
-uv run coding-agent evaluate --live --allow-paid-api --case all `
-  --format json --output evaluation.json
-```
-
-The command prints the endpoint host and the maximum request-attempt budget before starting. Each
-case begins with a known-red public test in a fresh temporary repository. After the Agent stops, the
-host copies only allowlisted source files into a sibling directory and runs separate regression tests
-with credentials removed. Public tests and pytest control files must remain byte-identical, while a
-whole-repository before/after manifest rejects every change outside the scenario's
-explicit path allowlist. A zero exit without a completed, non-empty all-passing oracle is rejected.
-Reports omit raw test output,
-commands, provider details, credentials, run IDs, and base URLs, and existing report files are never
-overwritten. This is an independent scoring path, not a secrecy boundary: the built-in scenario and
-oracle definitions ship with the project and code executing in the same environment could inspect
-them. Use an external container or service for a genuinely private benchmark.
-
-Evaluation exits `0` when every attempted case passes, `3` for a genuine task/oracle failure, `1`
-for a runner/provider/harness error, and `2` for invalid configuration. A suite stops after the first
-`error` to limit paid requests. Unit tests exercise the same harness with injected deterministic
-models; they are not presented as evidence of real-model intelligence.
-
-The browser can select a locally registered project, submit one task, and observe its bounded plan, timeline, latest Diff, structured
-file-change-to-verifier evidence chain, and final response. In this first slice, Web `safe` mode has no browser approval broker:
-registered verification commands may run, while ordinary commands fail closed. Select `--mode auto`
-only when that broader local command authority is intentional; it remains subject to the command
-deny rules and is not an OS sandbox. “使用项目记忆”默认开启；关闭它会禁止普通新任务的
-环境式历史选择，但显式“继续”仍需要父摘要。该开关不会阻止任务结束后以 best-effort
-方式保存经脱敏、白名单化的结构化摘要。
-
-Empty projects are supported without weakening `write_file`: the Agent must call
-`create_directory` once for each missing directory level, then write files beneath those explicit
-parents. Directory creation is no-clobber, rejects links and policy-protected paths, and is available
-in both `safe` and `auto` modes because it stays inside the Workspace boundary.
-
-Omit the task string for a `prompt-toolkit` input prompt. No `--api-key` option exists, so the key
-never enters the Agent argv/process list. Prefer a secret manager or session-scoped environment for
-stronger protection; `.env.local` is the convenient untracked development option, and a shell may
-still record a literal environment-assignment command in its own history.
-
-Useful commands:
-
-```powershell
+~~~powershell
 uv run coding-agent runs
 uv run coding-agent inspect <run-id>
 uv run coding-agent resume <run-id> --root . --model <model>
-```
+~~~
 
-`safe` is the default. The CLI offers an exact-argv confirmation for ordinary commands and denies
-non-interactive input; the Web view currently denies those commands because it has no approval
-broker. `auto` skips confirmation in either host but keeps the destructive-command deny rules; it is
-not an OS sandbox.
+## 权限模式与运行预算
 
-For `run` and `resume`, exit codes distinguish control outcomes:
+| 宿主 | 模型轮次 | 工具调用预算 |
+|---|---|---|
+| run / live web | 默认 20；max-steps 可设 1–100 | 单轮最多 8；累计 max(8, 2 × 轮次) |
+| CLI / Web resume | 默认累计 20；max-steps 可设 1–100 | 包含恢复前已消费调用 |
+| live evaluate | 每案例默认 12；可设 1–20 | 单轮最多 8；默认累计 24 |
+| 离线 CLI/Web demo | 13 | 单轮最多 8；累计 26 |
 
-| Code | Meaning |
-|---:|---|
-| `0` | `COMPLETED` with current trusted verification |
-| `1` | runtime/setup failure or refused resume |
-| `2` | CLI usage or argument validation error |
-| `3` | final response exists, but verification is missing, failed, or stale |
+- safe：CLI 会对普通命令展示精确 argv 并请求确认；当前 Web 没有审批 broker，因此会拒绝普通命令，但登记 verifier 仍可执行。
+- auto：跳过普通命令确认，仍保留破坏性命令拒绝、路径边界、超时与资源限制。
 
-## What M4 adds
+safe 和 auto 都不是操作系统沙箱。命令从项目目录启动，只能说明起始 cwd 受控，不能隔离恶意代码；不可信仓库必须放入容器、虚拟机或低权限账户。
 
-- A raw OpenAI Responses adapter that maps the project-owned transcript and custom function tools without an Agent SDK, hosted tools, automatic tool execution, or provider-managed conversation state.
-- A real `run` command, interactive task entry, `safe`/`auto` selection, exact-argv approval panel, and environment-only credential flow.
-- A passive Rich dashboard with plan/diff previews, tool durations, verification evidence, and an explicit `VERIFIED`/`UNVERIFIED` final card.
-- A Web activity timeline whose completed command, recorded-verification, and Verification Gate cards
-  reveal bounded structured facts on demand. Command cards show the direct argv token vector,
-  workspace-relative `cwd`, timeout, result, and bounded captured combined stdout/stderr. Recognized
-  credential values are replaced in place rather than hiding ordinary arguments or output. If the
-  aggregate observation budget further compresses what the model receives, the card identifies that
-  model-observation boundary separately.
-- Bounded per-run JSONL traces plus read-only `runs` and `inspect` commands.
-- Schema-v3 checkpoints with conservative v2 migration, opaque workspace binding, bounded RunMemory, completed-trace rejection, and a cross-process lease held by both the original run and same-ID resume.
-- A deployment-safe pytest capability: if Python itself lives inside the repository, its exact executable hash is bound before it may issue verification evidence.
+## 真实模型评测
 
-The unconfigured live runtime registers only the exact current-Python
-`-I -B -m pytest -q -p no:cacheprovider` check. The bytecode and cache-provider flags keep it
-observational: running it does not create Python or pytest cache files in the workspace. It can
-produce `checks_only`, but only the explicit project policy above makes its interpreter eligible for
-task validation. Other
-commands may run under the selected permission mode, but their output cannot manufacture
-verification evidence.
+评测默认断网。真实模型评测必须同时显式提供 live 和 allow-paid-api，不存在接收密钥的 CLI 参数：
 
-## M5.5 local project workbench
+~~~powershell
+# 先运行一个案例
+uv run coding-agent evaluate --live --allow-paid-api --case single-file
 
-- CLI and Web both call the same repository application service and therefore share the Agent loop,
-  tools, permission policy, trace-first event ordering, checkpoints, and Verification Gate.
-- The token-protected local host may open a native Windows folder chooser and return its selection to
-  the page; manual absolute-path registration remains available. Both paths enter the same server
-  validation. After selection, the server resolves and fingerprints that project; a run captures an
-  immutable project context and never accepts a root from the task request.
-- A private project registry and immutable per-run catalog power the left sidebar. History is rebuilt
-  from the latest validated trace segment through the same dashboard whitelist and remains read-only.
-  A completed-run detail may additionally show only the bounded final Assistant reply from its
-  validated terminal checkpoint; project lists and all other canonical messages stay private. Each
-  run is bound to the directory fingerprint captured at start, so replacing a directory cannot
-  inherit its old history; an unterminated trace from an earlier process is labeled `interrupted`.
-  Ordinary status/timeline cards describe the latest run/resume segment, while the file-change ledger
-  scans every segment of that immutable `run-id`. It keeps the newest 100 mutations and reports the
-  exact number of older entries omitted. Each Diff shows eight lines by default and can expand to an
-  80-line safe preview; completeness and preview truncation are reported separately.
-- Live and historical timelines use the same versioned projection. Correlated tool-start/tool-finish
-  events render as one completed card; expanding a command shows its credential-redacted argv,
-  workspace-relative `cwd`, timeout, exit status, duration, bounded captured output, and typed
-  verification scopes. Runner capture truncation, projection truncation, credential redaction, and
-  aggregate model-observation compression are distinct labels rather than one ambiguous safety note.
-  Traces written before these audit fields existed cannot recover argv or output and are explicitly
-  labeled as legacy data that was not recorded; history never guesses from a checkpoint.
-- At most one background run is active across all projects, and project changes are locked while it
-  runs. Graceful server shutdown stops accepting tasks and attempts
-  a bounded drain before process exit. Browser state is a whitelist projection, not raw events,
-  canonical messages, arbitrary raw tool objects, raw provider response objects, or hidden reasoning;
-  the bounded credential-redacted command audit above is an explicit exception.
-- Backend API keys, environment values, provider payloads, and hidden reasoning remain outside the
-  browser projection. Credential redaction recognizes configured names and common token shapes; it is
-  not a promise to identify every arbitrary secret, so secrets must still not be placed in argv,
-  repository files, or program output.
-- This is a loopback presentation slice, not a remote or multi-user Web product, packaged desktop
-  shell, Git clone/template service, browser terminal, editor, or alternate Agent implementation.
-- Transient connection, timeout, throttling, and selected server failures are retried by the
-  project-owned loop, not invisibly by the SDK. Retry scheduling is visible in both event projections
-  without exposing provider exception text.
+# 运行全部案例并输出稳定 JSON
+uv run coding-agent evaluate --live --allow-paid-api --case all --format json --output evaluation.json
+~~~
 
-## M5.7 Web 任务连续性与 ProjectMemory
+五类案例覆盖：
 
-- **恢复中断任务**沿用同一运行：Web 只接受仍处于 `READY_FOR_MODEL` 边界的检查点，校验
-  当前项目、工作区指纹、运行目录、trace 终态与独占 lease 后，使用原 `run-id` 继续。
-  canonical transcript、`RunMemory` 和预算来自检查点，但验证证据不会恢复，Agent 必须
-  重新执行当前修订上的检查。
-- **继续已完成任务**会派生新运行：父运行不可变，子运行获得新 `run-id`，在 immutable
-  catalog 中保存 `parent_run_id`，并强制把父任务摘要作为显式上下文来源。它不会向旧
-  transcript 追加消息，也不会继承旧预算、lease 或验证证据。
-- 普通新任务默认从 `ProjectMemory` 按相关性与时间挑选少量历史摘要；关闭“使用项目记忆”
-  会禁用这种环境式选择。但显式点击“继续”时，父摘要是必需依赖，即使关闭该开关也会
-  注入；父摘要不可用时请求会失败，而不是静默退化为无关的新任务。
-- `ProjectMemory` 是工作区外的版本化有界 JSON，并同时绑定项目 ID 与物理目录指纹。它只
-  保存任务目标、终态、自然语言总结、文件变更统计、历史验证结果和未解决项；不保存
-  transcript、源码/Diff、命令输出、provider payload 或隐式推理。任务结束后的摘要保存是
-  best-effort，失败不会改变 Agent 结果；开关只控制下一轮上下文注入。
-- 历史文本一律作为不可信参考。Agent 仍需重新读取当前文件并执行新验证；历史中的
-  `passed` 只能说明过去发生过什么，绝不能满足当前 `Verification Gate`。
+- single-file：单文件故障修复；
+- cross-file：跨文件修改；
+- new-feature：新增功能；
+- indirect-debug：间接故障定位；
+- runtime-integration：公开浅层测试难以发现的运行时集成问题。
 
-## M5 reliability and evaluation slice
+每个案例都会在新的临时仓库中放置已知失败的公开测试。Agent 停止后，宿主只把白名单源文件复制到相邻目录，再运行独立 regression oracle；同时检查公开测试与 pytest 控制文件字节未变、必需文件和修改存在、全仓没有越界变更。仅退出码为 0 不足以通过，没有完整、非空、全绿的 oracle 也会失败。oracle 是与 Agent 运行分离的评分路径，但其定义随仓库发布，并非隐藏测试或保密边界。
 
-- SDK retries remain disabled; the Agent owns every bounded retry. Connection/timeouts and
-  `408/409/429/5xx` use `0.5s → 1s` backoff, while malformed function-argument JSON is discarded
-  before tool execution and retried immediately with a fixed, sanitized protocol-correction
-  instruction. Both paths share the configured attempt ceiling and are distinguished in events.
-- Five stable categories cover a single-file repair, cross-file change, new feature, indirect fault,
-  and a runtime integration failure that a shallow public test cannot detect. Success requires
-  `AgentState.COMPLETED`, unchanged public-test controls, required source changes, no workspace
-  change outside the scenario allowlist, and a separate sibling regression oracle. JSON reports
-  expose the bounded scope proof as `coding-agent.eval.v2` and count
-  `verified_but_oracle_failed` false-green claims explicitly.
-- Every evaluation repository receives hidden host-authored trusted policy. All five require pytest;
-  the runtime-integration case additionally requires the typed module smoke check. The separate
-  sibling oracle remains the final independent judge and receives only allowlisted source files.
-- Case results distinguish `passed`, `failed`, and `error`; aggregate metrics include success rate,
-  steps, duration, and tool failures.
-- On 2026-08-29, `deepseek-v4-flash` passed the original four categories individually and again in
-  one continuous suite: 8/8 historical case runs, five steps per case, zero tool errors; the full
-  suite took 43.05s. The newer runtime-integration case still requires a fresh live measurement.
+评测退出码为：0 全部通过，3 真实任务或 oracle 失败，1 runner/provider/harness 错误，2 配置错误。套件遇到首个 error 后会停止，避免继续消耗付费请求。
 
-## Important limits
+2026-08-29 的历史实测中，deepseek-v4-flash 对原四类案例逐项运行及整套连续运行均通过，共 8/8 次、每案例 5 个模型步骤、0 个工具错误；四案例连续运行耗时 43.05 秒。随后新增的 runtime-integration 案例也完成一次 live 评测：1/1 通过、6 个模型步骤、0 个工具错误，耗时 38.90 秒。
 
-- The Responses adapter uses `store=False` and explicitly sends a bounded context projection derived
-  from the canonical transcript. It currently rejects a response that combines a reasoning item with
-  function calls because safely continuing that turn requires encrypted provider state that this
-  provider-neutral checkpoint deliberately does not persist. Use a Responses-compatible model that
-  does not emit reasoning items during tool turns.
-- Resume restores the canonical transcript plus bounded RunMemory such as the structured plan,
-  change summaries, and failure facts. It does not restore the in-memory undo journal, approval
-  decisions, provider-private state, or fresh verification evidence; every resume must verify again.
-- `ProjectMemory` is not a larger checkpoint. It connects separate tasks with a small historical
-  summary, is bound to one registered project/workspace identity, and never authorizes tools,
-  checkpoint resume, or verification. Continuing a completed task creates a new catalog record with
-  `parent_run_id`; the parent record and trace remain immutable.
-- Resume is not crash-safe exactly-once execution: if a process dies after a tool changes disk but before the next checkpoint, the checkpoint can lag behind the workspace.
-- A workspace-relative command `cwd` is containment for starting location, not malicious-code isolation. Run untrusted repositories in a container, VM, or low-privilege account.
-- The local Web view is not authenticated for hostile same-machine users. It binds to loopback,
-  requires a per-process control token for mutations, and applies Host/Origin/header restrictions,
-  but it is not intended for port forwarding or remote exposure.
-- Graceful Web shutdown first gives an active run five seconds to drain, then requests cooperative
-  cancellation and waits briefly for a safe model/tool boundary. It never force-kills a blocking
-  model or command call; a forced process kill or machine failure can still interrupt final
-  trace/checkpoint persistence, so this is not crash-safe execution.
-- Final delivery still needs a clean-environment rehearsal, three runs of the frozen demo task, and final video freeze.
+## 架构
 
-## Design boundary
-
-Generic libraries handle HTTP transport, validation, terminal rendering, input editing, process enumeration, ignore matching, and tests. Agent orchestration, context selection, tool definitions and dispatch, command launch/capability policy, stopping rules, checkpoint semantics, verification, and error semantics remain project-owned code.
-
-```text
+~~~text
 CLI ───────────────────────────────────────────────┐
 loopback Web ─ WebWorkbench                        │
                  ├─ ProjectRegistry + RunCatalog   │
@@ -376,15 +270,73 @@ loopback Web ─ WebWorkbench                        │
                                   Repository application service
                                     ├─ OpenAIResponsesModel / ScriptedModel
                                     ├─ AgentRunner ─ Context + Stop + Verification
-                                    │   └─ ToolRegistry ─ Workspace + CommandPolicy + MutationSession
+                                    │   └─ ToolRegistry
+                                    │       ├─ Workspace file/search tools
+                                    │       ├─ CommandPolicy + process runner
+                                    │       └─ MutationSession
                                     ├─ SessionStore + RunLease
                                     └─ CompositeEventSink
-                                        ├─ JsonlEventSink       durable audit facts
-                                        └─ DashboardProjection  bounded live/history presentation
+                                        ├─ JsonlEventSink
+                                        └─ DashboardProjection
 
 evaluate CLI
  └─ isolated public fixture → same application service
      └─ allowlisted source copy → sibling regression oracle
-```
+~~~
 
-The runtime result, resumable checkpoint, audit trace, project memory, and dashboard are deliberately separate kinds of truth; none may authorize another. See [PLAN.md](PLAN.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), and [docs/REFERENCES.md](docs/REFERENCES.md).
+几个容易混淆的数据层被刻意分开：
+
+| 数据 | 作用 | 不能做什么 |
+|---|---|---|
+| AgentResult | 描述本次执行结果 | 不能用模型文字伪造验证 |
+| SessionStore | 保存可恢复 transcript 检查点 | 不能重放工具或恢复验证证据 |
+| JSONL trace | 保存可审计事实 | 不能授权命令或验证 |
+| DashboardProjection | 生成终端/Web 的有界视图 | 不能影响运行控制流 |
+| RunMemory | 压缩同一运行的计划、变更与失败事实 | 不能跨项目授权 |
+| ProjectMemory | 连接同项目的不同任务 | 不是检查点，也不能恢复可信状态 |
+
+这种设计的核心原则是：**事实记录、模型上下文、恢复状态、项目记忆和界面展示互不冒充权威。**
+
+## 可观察性与安全边界
+
+Web 和终端只呈现模型的显式计划、外部动作和验证证据，不保存或展示隐式思维链。命令卡片可展开查看经过凭据值脱敏的 argv、工作目录、超时、退出状态、耗时和有界 stdout/stderr；运行历史会分别标注工具捕获截断、Web 投影截断和模型观察压缩。
+
+需要注意：
+
+- 密钥、完整环境变量、原始 provider payload 和隐式推理不会进入浏览器投影；
+- 通用模式脱敏无法保证识别任意秘密，不要把密钥写入参数、仓库文件或程序输出；
+- Web 仅监听 loopback，并使用进程级控制 token、Host/Origin/header 检查，但它不是远程或多用户产品；
+- 强制结束进程或机器断电可能发生在工具修改之后、下一检查点写入之前，因此恢复不是 crash-safe exactly-once；
+- Responses 适配器使用 store=False；当前不支持在工具调用轮同时依赖 provider 私有 reasoning state 的模型。
+
+## 空仓库支持
+
+Relay 可以在空目录中工作。模型需要逐层调用 create_directory，再通过 write_file 创建代码、测试与说明文件。目录创建不会覆盖已有路径，也不能越过工作区或策略保护范围。
+
+空仓库没有天然的可信标准：模型可以自行补充测试并运行，但“自己写的测试通过”只能说明获得了检查证据。若普通任务需要 VERIFIED，用户必须预先提供不可被 Agent 修改的项目策略与登记 verifier；外部 oracle 只能在 evaluate 流程中独立评分，不能为普通运行授予 VERIFIED。
+
+## 开发与质量检查
+
+~~~powershell
+uv run ruff check src tests
+uv run mypy src tests
+node --test tests/js/*.test.mjs
+uv run pytest
+~~~
+
+pytest 配置要求分支覆盖率不低于 90%。CI 徽章反映 GitHub 上当前提交的自动检查结果。
+
+## 文档索引
+
+- [工作原理与源码导览](docs/HOW_IT_WORKS.md)：用完整任务解释模型、工具、上下文、验证、恢复与 Web 的因果链。
+- [架构说明](docs/ARCHITECTURE.md)：模块职责、稳定接口与数据权威边界。
+- [安全说明](docs/SECURITY.md)：威胁模型、命令权限、工作区边界与密钥处理。
+- [项目计划](PLAN.md)：阶段目标、合规边界和演示策略。
+- [参考资料](docs/REFERENCES.md)：协议与第三方库依据。
+- [千字项目简介](README.txt)：提交材料所需的精简版说明。
+
+## 实现边界
+
+项目复用 openai、FastAPI、Pydantic、Rich、Typer、prompt-toolkit、python-dotenv、pathspec、psutil 与 pytest，分别承担 HTTP 传输、Web、数据校验、界面、输入、配置解析、忽略规则、进程枚举和测试等通用能力。
+
+Agent 编排、上下文选择、工具定义与调度、命令策略、停止规则、检查点、运行记忆、项目记忆、可信验证、事件语义及独立评测流程均为项目自行实现。这样既避免重复制造通用基础设施，也确保考核要求中的核心 Agent 逻辑清晰、可读、可解释。
